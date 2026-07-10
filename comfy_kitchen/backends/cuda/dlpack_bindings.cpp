@@ -109,6 +109,28 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_fused_moe_nvfp4(
+        const void* input_bf16,
+        const int32_t* expert_ids,
+        const float* router_weights,
+        const void* fc1_qdata,
+        const void* fc1_block_scales,
+        const void* fc2_qdata,
+        const void* fc2_block_scales,
+        const float* input_decode_scale,
+        const float* intermediate_decode_scale,
+        const float* alpha1,
+        const float* alpha2,
+        void* output_bf16,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     void launch_apply_rope_kernel(
         const void* xq,
         const void* xk,
@@ -485,6 +507,75 @@ void cutlass_grouped_gemm_nvfp4_variable(
             m_indptr.data(), num_groups, scale_group_m, n, k, out_dtype_code, workspace.data(),
             workspace.size(), stream)) {
         throw std::runtime_error("CUTLASS variable grouped NVFP4 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_fused_moe_nvfp4(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> router_weights,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_block_scales,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
+    nb::ndarray<float, nb::device::cuda> input_decode_scale,
+    nb::ndarray<float, nb::device::cuda> intermediate_decode_scale,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha1,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha2,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_tokens = input.shape(0);
+    const int64_t hidden_size = input.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t fc1_output = fc1_qdata.shape(1);
+    const int64_t intermediate_size = fc1_output / 2;
+    const int64_t input_scale_cols = ((hidden_size / 16) + 3) / 4 * 4;
+    const int64_t intermediate_scale_cols = ((intermediate_size / 16) + 3) / 4 * 4;
+    const int64_t fc1_scale_rows = ((fc1_output + 127) / 128) * 128;
+    const int64_t fc2_scale_rows = ((hidden_size + 127) / 128) * 128;
+
+    if (map_dtype_to_code(input.dtype()) != 2 || map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("fused NVFP4 MoE input and output must be bfloat16");
+    }
+    if (expert_ids.shape(0) != num_tokens || router_weights.shape(0) != num_tokens ||
+        router_weights.shape(1) != top_k) {
+        throw std::runtime_error("fused NVFP4 MoE routing shape mismatch");
+    }
+    if (fc1_output <= 0 || fc1_output % 2 != 0 || fc1_qdata.shape(2) * 2 != hidden_size) {
+        throw std::runtime_error("fused NVFP4 MoE gate/up weight shape mismatch");
+    }
+    if (fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) * 2 != intermediate_size) {
+        throw std::runtime_error("fused NVFP4 MoE down weight shape mismatch");
+    }
+    if (fc1_block_scales.shape(0) != num_experts ||
+        fc1_block_scales.shape(1) != fc1_scale_rows ||
+        fc1_block_scales.shape(2) != input_scale_cols ||
+        fc2_block_scales.shape(0) != num_experts ||
+        fc2_block_scales.shape(1) != fc2_scale_rows ||
+        fc2_block_scales.shape(2) != intermediate_scale_cols) {
+        throw std::runtime_error("fused NVFP4 MoE weight scale shape mismatch");
+    }
+    if (input_decode_scale.size() != 1 || intermediate_decode_scale.size() != 1 ||
+        alpha1.shape(0) != num_experts || alpha2.shape(0) != num_experts) {
+        throw std::runtime_error("fused NVFP4 MoE global scale shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size) {
+        throw std::runtime_error("fused NVFP4 MoE output shape mismatch");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_nvfp4(
+            input.data(), expert_ids.data(), router_weights.data(), fc1_qdata.data(),
+            fc1_block_scales.data(), fc2_qdata.data(), fc2_block_scales.data(),
+            input_decode_scale.data(), intermediate_decode_scale.data(), alpha1.data(),
+            alpha2.data(), output.data(), num_tokens, hidden_size, intermediate_size,
+            num_experts, top_k, workspace.data(), static_cast<int64_t>(workspace.size()),
+            stream)) {
+        throw std::runtime_error("native CUTLASS fused NVFP4 MoE is unavailable for this configuration");
     }
 }
 
@@ -2109,6 +2200,23 @@ NB_MODULE(_C, m) {
           nb::arg("alpha"),
           nb::arg("workspace"),
           nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_nvfp4", &cutlass_fused_moe_nvfp4,
+          "Native SM120 routed NVFP4 MoE with GEGLU and weighted reduction",
+          nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("router_weights"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_block_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_block_scales"),
+          nb::arg("input_decode_scale"),
+          nb::arg("intermediate_decode_scale"),
+          nb::arg("alpha1"),
+          nb::arg("alpha2"),
+          nb::arg("output"),
+          nb::arg("workspace"),
           nb::arg("stream_ptr"));
 
     m.def("cublas_gemm_int8", &cublas_gemm_int8,
