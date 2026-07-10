@@ -378,7 +378,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         fc1_qdata == nullptr || fc1_block_scales == nullptr || fc2_qdata == nullptr ||
         fc2_block_scales == nullptr || input_decode_scale == nullptr ||
         intermediate_decode_scale == nullptr || alpha1 == nullptr || alpha2 == nullptr ||
-        output_bf16 == nullptr || workspace_ptr == nullptr || stream == nullptr) {
+        output_bf16 == nullptr || workspace_ptr == nullptr) {
         return false;
     }
 
