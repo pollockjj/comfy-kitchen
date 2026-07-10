@@ -170,7 +170,7 @@ __global__ void prepare_grouped_nvfp4_args(
     }
 }
 
-template <class ElementD, int TileN, bool SwapAB>
+template <class ElementD, int TileN, int TileK, bool SwapAB>
 bool run_grouped_nvfp4(
     const void* a_raw,
     const void* scale_a_raw,
@@ -199,7 +199,7 @@ bool run_grouped_nvfp4(
     using LayoutD =
         std::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
     using ClusterShape = Shape<_1, _1, _1>;
-    using ThreadBlockShape = Shape<_128, Int<TileN>, _256>;
+    using ThreadBlockShape = Shape<_128, Int<TileN>, Int<TileK>>;
 
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementInput>::value;
     constexpr int AlignmentB = AlignmentA;
@@ -390,14 +390,14 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_nvfp4<cutlass::half_t, 64, false>(
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 64, 256, false>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64, false>(
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64, 256, false>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
@@ -443,14 +443,14 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4_variable(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_nvfp4<cutlass::half_t, 32, true>(
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 32, 64, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 32, true>(
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 32, 64, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
