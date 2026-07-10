@@ -340,7 +340,8 @@ __global__ void weighted_route_reduction(
                 routed_output[static_cast<size_t>(dest) * hidden_size + col]);
             sum = fmaf(router_weights[route], value, sum);
         }
-        output[linear] = __float2bfloat16_rn(invalid_route ? CUDART_NAN_F : sum);
+        output[linear] =
+            __float2bfloat16_rn(invalid_route ? __int_as_float(0x7fc00000) : sum);
     }
 }
 
