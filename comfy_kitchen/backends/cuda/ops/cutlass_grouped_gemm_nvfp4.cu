@@ -443,14 +443,14 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4_variable(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_nvfp4<cutlass::half_t, 32, 64, true>(
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 32, 128, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 32, 64, true>(
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 32, 128, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
