@@ -1657,6 +1657,8 @@ def gemma4_fused_routing(
     per_expert_scale = per_expert_scale.contiguous()
     weights = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.float32)
     ids = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.int32)
+    if logits.shape[0] == 0:
+        return weights, ids
     stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
     _C.gemma4_fused_routing(
         _wrap_for_dlpack(logits),
