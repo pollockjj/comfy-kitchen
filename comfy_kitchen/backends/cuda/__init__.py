@@ -157,6 +157,7 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 )
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
+_CUTLASS_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUTLASS", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
@@ -2682,6 +2683,8 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(10, 0),
         )
+
+    if _CUTLASS_AVAILABLE:
         constraints["grouped_scaled_mm_nvfp4"] = FunctionConstraints(
             params={
                 "a": ParamConstraint(

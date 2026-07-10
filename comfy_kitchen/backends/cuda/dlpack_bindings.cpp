@@ -2530,6 +2530,11 @@ NB_MODULE(_C, m) {
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
+#ifdef COMFY_HAVE_CUTLASS
+    m.attr("HAS_CUTLASS") = true;
+#else
+    m.attr("HAS_CUTLASS") = false;
+#endif
 
     // Add version info
     m.attr("__version__") = "0.1.0";
