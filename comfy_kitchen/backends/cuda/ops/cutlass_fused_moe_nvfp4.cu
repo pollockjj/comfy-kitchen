@@ -19,6 +19,7 @@
  * NVIDIA implementation already used by Comfy Kitchen's quantize_nvfp4 op.
  */
 
+#include "utils.cuh"
 #include "float_utils.cuh"
 
 #include <cuda_bf16.h>
