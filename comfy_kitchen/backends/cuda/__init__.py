@@ -158,7 +158,6 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
-_fused_moe_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
@@ -322,18 +321,6 @@ def get_cublas_workspace() -> torch.Tensor:
             device=device_index,
         )
         _cublas_workspaces[device_index] = workspace
-    return workspace
-
-
-def _get_fused_moe_workspace(device: torch.device) -> torch.Tensor:
-    """Return one 64 MiB routed-MoE workspace per CUDA stream."""
-    device_index = device.index if device.index is not None else torch.cuda.current_device()
-    stream_ptr = torch.cuda.current_stream(device).cuda_stream
-    key = (device_index, stream_ptr)
-    workspace = _fused_moe_workspaces.get(key)
-    if workspace is None:
-        workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=device)
-        _fused_moe_workspaces[key] = workspace
     return workspace
 
 
@@ -1624,7 +1611,7 @@ def fused_moe_nvfp4(
         else expert_ids.to(dtype=torch.int32).contiguous()
     )
     output = torch.empty_like(x)
-    workspace = _get_fused_moe_workspace(x.device)
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.cutlass_fused_moe_nvfp4(
         _wrap_for_dlpack(x),
