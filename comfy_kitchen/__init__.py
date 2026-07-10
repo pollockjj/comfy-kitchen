@@ -44,7 +44,6 @@ __all__ = [
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
     "fused_moe_nvfp4",
-    "gemma4_fused_routing",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -311,21 +310,6 @@ def fused_moe_nvfp4(
         "alpha2": alpha2,
     }
     impl = registry.get_implementation("fused_moe_nvfp4", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-def gemma4_fused_routing(
-    logits: torch.Tensor,
-    per_expert_scale: torch.Tensor,
-    top_k: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select and scale the top Gemma4 experts with a capable backend."""
-    kwargs = {
-        "logits": logits,
-        "per_expert_scale": per_expert_scale,
-        "top_k": top_k,
-    }
-    impl = registry.get_implementation("gemma4_fused_routing", kwargs=kwargs)
     return impl(**kwargs)
 
 

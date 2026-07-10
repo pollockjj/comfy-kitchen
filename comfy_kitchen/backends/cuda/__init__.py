@@ -54,7 +54,6 @@ __all__ = [
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
     "fused_moe_nvfp4",
-    "gemma4_fused_routing",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
 ]
@@ -1634,43 +1633,6 @@ def fused_moe_nvfp4(
     return output
 
 
-def gemma4_fused_routing(
-    logits: torch.Tensor,
-    per_expert_scale: torch.Tensor,
-    top_k: int = 8,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select Gemma4 experts with torch ordering, then normalize and scale them."""
-    if logits.dtype != torch.bfloat16 or logits.ndim != 2 or logits.shape[1] != 128:
-        raise ValueError("Gemma4 fused routing logits must be bfloat16 [N, 128]")
-    if not logits.is_cuda:
-        raise ValueError("Gemma4 fused routing logits must be on CUDA")
-    if (
-        per_expert_scale.dtype != torch.bfloat16
-        or tuple(per_expert_scale.shape) != (128,)
-        or per_expert_scale.device != logits.device
-    ):
-        raise ValueError("Gemma4 fused routing scales must be bfloat16 [128] on the logits device")
-    if top_k != 8:
-        raise ValueError("Gemma4 fused routing currently requires top_k=8")
-
-    logits = logits.contiguous()
-    per_expert_scale = per_expert_scale.contiguous()
-    probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
-    weights, selected_ids = torch.topk(probabilities, top_k, dim=-1)
-    ids = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.int32)
-    if logits.shape[0] == 0:
-        return weights, ids
-    stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
-    _C.gemma4_fused_routing(
-        _wrap_for_dlpack(weights),
-        _wrap_for_dlpack(selected_ids),
-        _wrap_for_dlpack(per_expert_scale),
-        _wrap_for_dlpack(ids),
-        stream_ptr,
-    )
-    return weights, ids
-
-
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2721,22 +2683,6 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(10, 0),
         )
-
-    constraints["gemma4_fused_routing"] = FunctionConstraints(
-        params={
-            "logits": ParamConstraint(
-                dtypes=frozenset({torch.bfloat16}),
-                shape_rules=(ExactDims(2),),
-            ),
-            "per_expert_scale": ParamConstraint(
-                dtypes=frozenset({torch.bfloat16}),
-                shape_rules=(ExactDims(1),),
-            ),
-            "top_k": ParamConstraint(dtypes=frozenset({int})),
-        },
-        default_devices=cuda_devices,
-        min_compute_capability=(8, 0),
-    )
 
     if _CUTLASS_AVAILABLE:
         constraints["grouped_scaled_mm_nvfp4"] = FunctionConstraints(
