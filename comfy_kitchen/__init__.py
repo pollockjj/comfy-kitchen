@@ -43,6 +43,7 @@ __all__ = [
     # Fused matmul
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
+    "fused_moe_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -273,6 +274,43 @@ def grouped_scaled_mm_nvfp4(
         DTYPE_TO_CODE[out_dtype],
         alpha,
     )
+
+
+def fused_moe_nvfp4(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+    input_decode_scale: torch.Tensor,
+    intermediate_decode_scale: torch.Tensor,
+    alpha1: torch.Tensor,
+    alpha2: torch.Tensor,
+) -> torch.Tensor:
+    """Run a routed NVFP4 MoE layer entirely inside the Kitchen backend.
+
+    The current SM120 specialization applies ``GELU_tanh(gate) * up`` between
+    two compact expert GEMMs and returns the FP32 router-weighted BF16 sum.
+    Packed weights use low-first NVFP4 nibbles and CUTLASS-swizzled E4M3 block
+    scales. ``alpha1`` and ``alpha2`` contain one decode alpha per expert.
+    """
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+        "input_decode_scale": input_decode_scale,
+        "intermediate_decode_scale": intermediate_decode_scale,
+        "alpha1": alpha1,
+        "alpha2": alpha2,
+    }
+    impl = registry.get_implementation("fused_moe_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def quantize_mxfp8(
