@@ -18,6 +18,7 @@
 #include <nanobind/ndarray.h>
 #include <cuda_runtime.h>
 #include <cstring>
+#include <string>
 
 #include "cublaslt_runtime.h"
 
@@ -130,6 +131,8 @@ extern "C" {
         void* workspace_ptr,
         int64_t workspace_size,
         cudaStream_t stream);
+
+    int cutlass_fused_moe_nvfp4_last_error_stage();
 
     void launch_apply_rope_kernel(
         const void* xq,
@@ -575,7 +578,9 @@ void cutlass_fused_moe_nvfp4(
             alpha2.data(), output.data(), num_tokens, hidden_size, intermediate_size,
             num_experts, top_k, workspace.data(), static_cast<int64_t>(workspace.size()),
             stream)) {
-        throw std::runtime_error("native CUTLASS fused NVFP4 MoE is unavailable for this configuration");
+        throw std::runtime_error(
+            "native CUTLASS fused NVFP4 MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_nvfp4_last_error_stage()));
     }
 }
 

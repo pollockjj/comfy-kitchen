@@ -50,6 +50,8 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4_variable(
 namespace comfy {
 namespace fused_moe_nvfp4 {
 
+thread_local int last_error_stage = 0;
+
 #if CUDA_VERSION >= 12080
 
 constexpr int kNvfp4BlockSize = 16;
@@ -373,6 +375,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
     cudaStream_t stream) {
 #if CUDA_VERSION >= 12080
     using namespace comfy::fused_moe_nvfp4;
+    last_error_stage = 1;
 
     if (input_bf16 == nullptr || expert_ids == nullptr || router_weights == nullptr ||
         fc1_qdata == nullptr || fc1_block_scales == nullptr || fc2_qdata == nullptr ||
@@ -410,6 +413,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
     const int input_scale_cols = h / kNvfp4BlockSize;
     const int intermediate_scale_cols = i / kNvfp4BlockSize;
 
+    last_error_stage = 2;
     WorkspaceArena arena(workspace_ptr, static_cast<size_t>(workspace_size));
     // Persistent workspace layout. Every allocation is complete before the
     // tail is handed to either grouped GEMM, so CUTLASS cannot overlap any
@@ -438,22 +442,26 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         return false;
     }
 
+    last_error_stage = 3;
     if (cudaMemsetAsync(counts, 0, static_cast<size_t>(e) * sizeof(int32_t), stream) !=
         cudaSuccess) {
         return false;
     }
     const int route_blocks = (routes + 255) / 256;
+    last_error_stage = 4;
     count_and_rank_routes<<<route_blocks, 256, 0, stream>>>(
         expert_ids, counts, route_rank, routes, e);
     if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
+    last_error_stage = 5;
     prefix_and_place_routes<<<1, 256, 0, stream>>>(
         expert_ids, counts, indptr, route_rank, route_dest, routes, e, scale_group_m);
     if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
 
+    last_error_stage = 6;
     gather_and_quantize_input<<<routes, kQuantThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input_bf16), expert_ids, route_rank, route_dest,
         input_decode_scale, reinterpret_cast<__nv_fp4x2_e2m1*>(qx),
@@ -463,6 +471,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         return false;
     }
 
+    last_error_stage = 7;
     try {
         if (!launch_cutlass_grouped_gemm_nvfp4_variable(
                 qx, input_block_scales, fc1_qdata, fc1_block_scales, gate_up, alpha1,
@@ -474,6 +483,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         return false;
     }
 
+    last_error_stage = 8;
     activate_and_quantize_intermediate<<<routes, kQuantThreads, 0, stream>>>(
         gate_up, expert_ids, route_rank, route_dest, intermediate_decode_scale,
         reinterpret_cast<__nv_fp4x2_e2m1*>(qi),
@@ -483,6 +493,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         return false;
     }
 
+    last_error_stage = 9;
     try {
         if (!launch_cutlass_grouped_gemm_nvfp4_variable(
                 qi, intermediate_block_scales, fc2_qdata, fc2_block_scales, routed_down,
@@ -496,10 +507,15 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
 
     const int64_t output_elements = num_tokens * hidden_size;
     const int reduction_blocks = static_cast<int>((output_elements + 255) / 256);
+    last_error_stage = 10;
     weighted_route_reduction<<<reduction_blocks, 256, 0, stream>>>(
         routed_down, route_dest, router_weights, static_cast<__nv_bfloat16*>(output_bf16),
         n, h, k);
-    return cudaPeekAtLastError() == cudaSuccess;
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        return false;
+    }
+    last_error_stage = 0;
+    return true;
 #else
     (void)input_bf16;
     (void)expert_ids;
@@ -523,4 +539,8 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
     (void)stream;
     return false;
 #endif
+}
+
+extern "C" int cutlass_fused_moe_nvfp4_last_error_stage() {
+    return comfy::fused_moe_nvfp4::last_error_stage;
 }
