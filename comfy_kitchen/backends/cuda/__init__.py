@@ -1639,7 +1639,7 @@ def gemma4_fused_routing(
     per_expert_scale: torch.Tensor,
     top_k: int = 8,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Select and scale the top Gemma4 experts in one CUDA kernel."""
+    """Select Gemma4 experts with torch ordering, then normalize and scale them."""
     if logits.dtype != torch.bfloat16 or logits.ndim != 2 or logits.shape[1] != 128:
         raise ValueError("Gemma4 fused routing logits must be bfloat16 [N, 128]")
     if not logits.is_cuda:
@@ -1655,15 +1655,16 @@ def gemma4_fused_routing(
 
     logits = logits.contiguous()
     per_expert_scale = per_expert_scale.contiguous()
-    weights = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.float32)
+    probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    weights, selected_ids = torch.topk(probabilities, top_k, dim=-1)
     ids = torch.empty((logits.shape[0], top_k), device=logits.device, dtype=torch.int32)
     if logits.shape[0] == 0:
         return weights, ids
     stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
     _C.gemma4_fused_routing(
-        _wrap_for_dlpack(logits),
-        _wrap_for_dlpack(per_expert_scale),
         _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(selected_ids),
+        _wrap_for_dlpack(per_expert_scale),
         _wrap_for_dlpack(ids),
         stream_ptr,
     )

@@ -135,9 +135,9 @@ extern "C" {
     int cutlass_fused_moe_nvfp4_last_error_stage();
 
     bool launch_gemma4_fused_routing(
-        const void* logits_bf16,
-        const void* per_expert_scale_bf16,
         float* topk_weights,
+        const int64_t* selected_ids,
+        const void* per_expert_scale_bf16,
         int32_t* topk_ids,
         int64_t num_tokens,
         int64_t num_experts,
@@ -595,27 +595,26 @@ void cutlass_fused_moe_nvfp4(
 }
 
 void gemma4_fused_routing(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> logits,
-    nb::ndarray<nb::ndim<1>, nb::device::cuda> per_expert_scale,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> topk_weights,
+    nb::ndarray<int64_t, nb::ndim<2>, nb::device::cuda> selected_ids,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> per_expert_scale,
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> topk_ids,
     uintptr_t stream_ptr) {
-    const int64_t num_tokens = logits.shape(0);
-    const int64_t num_experts = logits.shape(1);
+    const int64_t num_tokens = topk_weights.shape(0);
+    const int64_t num_experts = per_expert_scale.shape(0);
     const int64_t top_k = topk_weights.shape(1);
-    if (map_dtype_to_code(logits.dtype()) != 2 ||
-        map_dtype_to_code(per_expert_scale.dtype()) != 2) {
-        throw std::runtime_error("Gemma4 fused routing requires bfloat16 logits and scales");
+    if (map_dtype_to_code(per_expert_scale.dtype()) != 2) {
+        throw std::runtime_error("Gemma4 fused routing requires bfloat16 scales");
     }
-    if (num_experts != 128 || per_expert_scale.shape(0) != num_experts ||
-        topk_weights.shape(0) != num_tokens || top_k != 8 ||
+    if (num_experts != 128 || top_k != 8 ||
+        selected_ids.shape(0) != num_tokens || selected_ids.shape(1) != top_k ||
         topk_ids.shape(0) != num_tokens || topk_ids.shape(1) != top_k) {
-        throw std::runtime_error("Gemma4 fused routing requires logits [N, 128] and outputs [N, 8]");
+        throw std::runtime_error("Gemma4 fused routing requires selected weights and ids [N, 8]");
     }
     const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_gemma4_fused_routing(
-            logits.data(), per_expert_scale.data(), topk_weights.data(), topk_ids.data(),
-            num_tokens, num_experts, top_k, stream)) {
+            topk_weights.data(), selected_ids.data(), per_expert_scale.data(),
+            topk_ids.data(), num_tokens, num_experts, top_k, stream)) {
         throw std::runtime_error("Gemma4 fused routing kernel launch failed");
     }
 }
@@ -2261,10 +2260,10 @@ NB_MODULE(_C, m) {
           nb::arg("stream_ptr"));
 
     m.def("gemma4_fused_routing", &gemma4_fused_routing,
-          "Fused Gemma4 softmax, top-k renormalization, and expert scaling",
-          nb::arg("logits"),
-          nb::arg("per_expert_scale"),
+          "Fused Gemma4 top-k normalization and expert scaling",
           nb::arg("topk_weights"),
+          nb::arg("selected_ids"),
+          nb::arg("per_expert_scale"),
           nb::arg("topk_ids"),
           nb::arg("stream_ptr"));
 

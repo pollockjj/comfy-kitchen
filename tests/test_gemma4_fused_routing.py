@@ -17,9 +17,10 @@ pytestmark = pytest.mark.skipif(
 
 
 def _reference(logits, scales):
-    ids = torch.argsort(logits.float(), dim=-1, descending=True, stable=True)[:, :8]
-    selected = torch.gather(logits.float(), 1, ids)
-    weights = torch.softmax(selected, dim=-1) * scales[ids]
+    probabilities = torch.softmax(logits, dim=-1, dtype=torch.float32)
+    weights, ids = torch.topk(probabilities, k=8, dim=-1)
+    weights = weights / weights.sum(dim=-1, keepdim=True)
+    weights = weights * scales[ids]
     return weights, ids
 
 
@@ -38,14 +39,18 @@ def test_gemma4_fused_routing_matches_deterministic_reference(tokens):
     torch.testing.assert_close(weights, reference_weights, rtol=2e-6, atol=2e-7)
 
 
-def test_gemma4_fused_routing_breaks_ties_by_expert_id():
-    logits = torch.zeros(1, 128, device="cuda", dtype=torch.bfloat16)
+def test_gemma4_fused_routing_matches_softmax_tie_order():
+    logits = -torch.arange(128, device="cuda", dtype=torch.bfloat16).unsqueeze(0)
+    logits[0, 0] = 1000
     scales = torch.arange(1, 129, device="cuda", dtype=torch.bfloat16)
 
     weights, ids = ck.gemma4_fused_routing(logits, scales)
+    reference_weights, reference_ids = _reference(logits, scales)
+    raw_ids = torch.topk(logits, k=8, dim=-1).indices
 
-    assert torch.equal(ids.cpu(), torch.arange(8, dtype=torch.int32).unsqueeze(0))
-    torch.testing.assert_close(weights.cpu(), scales[:8].float().cpu().unsqueeze(0) / 8)
+    assert torch.equal(ids.to(torch.int64), reference_ids)
+    assert not torch.equal(raw_ids, reference_ids)
+    torch.testing.assert_close(weights, reference_weights, rtol=2e-6, atol=2e-7)
 
 
 def test_gemma4_fused_routing_accepts_empty_batch():
