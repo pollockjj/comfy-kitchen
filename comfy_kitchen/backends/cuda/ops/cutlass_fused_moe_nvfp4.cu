@@ -88,8 +88,17 @@ public:
         return result;
     }
 
-    void* tail() {
-        return allocate_bytes(0);
+    void* tail(size_t alignment) {
+        if (alignment == 0 || (alignment & (alignment - 1)) != 0 ||
+            offset_ > SIZE_MAX - (alignment - 1)) {
+            return nullptr;
+        }
+        const size_t aligned = (offset_ + alignment - 1) & ~(alignment - 1);
+        if (aligned > size_) {
+            return nullptr;
+        }
+        offset_ = aligned;
+        return base_ + aligned;
     }
 
     size_t remaining() const {
@@ -434,7 +443,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
         static_cast<size_t>(e) * scale_group_m * intermediate_scale_cols);
     __nv_bfloat16* routed_down =
         arena.allocate<__nv_bfloat16>(static_cast<size_t>(routes) * h);
-    void* gemm_workspace = arena.tail();
+    void* gemm_workspace = arena.tail(256);
     const size_t gemm_workspace_size = arena.remaining();
     if (counts == nullptr || indptr == nullptr || route_rank == nullptr ||
         route_dest == nullptr || qx == nullptr || input_block_scales == nullptr ||
