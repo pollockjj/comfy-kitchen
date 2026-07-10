@@ -92,6 +92,23 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_grouped_gemm_nvfp4_variable(
+        const void* a_ptr,
+        const void* block_scale_a_ptr,
+        const void* b_ptr,
+        const void* block_scale_b_ptr,
+        void* d_ptr,
+        const float* alpha_ptr,
+        const int32_t* m_indptr_ptr,
+        int64_t num_groups,
+        int64_t scale_group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     void launch_apply_rope_kernel(
         const void* xq,
         const void* xk,
@@ -413,6 +430,61 @@ void cutlass_grouped_gemm_nvfp4(
             a.data(), block_scale_a.data(), b.data(), block_scale_b.data(), out.data(), alpha.data(),
             num_groups, group_m, n, k, out_dtype_code, workspace.data(), workspace.size(), stream)) {
         throw std::runtime_error("CUTLASS grouped NVFP4 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_grouped_gemm_nvfp4_variable(
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> a,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> block_scale_a,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> b,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> block_scale_b,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> m_indptr,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_groups = b.shape(0);
+    const int64_t n = b.shape(1);
+    const int64_t packed_k = b.shape(2);
+    const int64_t k = packed_k * 2;
+    const int64_t scale_k = ((k / 16) + 3) / 4 * 4;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+    const int64_t scale_group_m = block_scale_a.shape(1);
+
+    if (scale_group_m <= 0 || scale_group_m % 128 != 0) {
+        throw std::runtime_error("variable grouped NVFP4 scale bucket must be a positive multiple of 128");
+    }
+    if (a.shape(1) != packed_k) {
+        throw std::runtime_error("variable grouped NVFP4 activation shape mismatch");
+    }
+    if (block_scale_a.shape(0) != num_groups || block_scale_a.shape(2) != scale_k) {
+        throw std::runtime_error("variable grouped NVFP4 activation scale shape mismatch");
+    }
+    if (block_scale_b.shape(0) != num_groups || block_scale_b.shape(1) != scale_n ||
+        block_scale_b.shape(2) != scale_k) {
+        throw std::runtime_error("variable grouped NVFP4 weight scale shape mismatch");
+    }
+    if (m_indptr.shape(0) != num_groups + 1) {
+        throw std::runtime_error("variable grouped NVFP4 indptr shape mismatch");
+    }
+    if (out.shape(0) != a.shape(0) || out.shape(1) != n) {
+        throw std::runtime_error("variable grouped NVFP4 output shape mismatch");
+    }
+    if (alpha.shape(0) != num_groups) {
+        throw std::runtime_error("variable grouped NVFP4 alpha must contain one value per group");
+    }
+    if (out_dtype_code != 1 && out_dtype_code != 2) {
+        throw std::runtime_error("variable grouped NVFP4 output must be float16 or bfloat16");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_grouped_gemm_nvfp4_variable(
+            a.data(), block_scale_a.data(), b.data(), block_scale_b.data(), out.data(), alpha.data(),
+            m_indptr.data(), num_groups, scale_group_m, n, k, out_dtype_code, workspace.data(),
+            workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS variable grouped NVFP4 GEMM is unavailable for this configuration");
     }
 }
 
@@ -2023,6 +2095,19 @@ NB_MODULE(_C, m) {
           nb::arg("alpha"),
           nb::arg("workspace"),
           nb::arg("group_m"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_gemm_nvfp4_variable", &cutlass_grouped_gemm_nvfp4_variable,
+          "CUTLASS SM120 grouped NVFP4 GEMM with per-expert activation row counts",
+          nb::arg("a"),
+          nb::arg("block_scale_a"),
+          nb::arg("b"),
+          nb::arg("block_scale_b"),
+          nb::arg("m_indptr"),
+          nb::arg("out"),
+          nb::arg("alpha"),
+          nb::arg("workspace"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 

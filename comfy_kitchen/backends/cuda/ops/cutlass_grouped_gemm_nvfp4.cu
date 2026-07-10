@@ -100,6 +100,8 @@ __global__ void prepare_grouped_nvfp4_args(
     int n,
     int k,
     int num_groups,
+    const int32_t* m_indptr,
+    int scale_group_m,
     ProblemShape* problem_sizes,
     const ElementA** a_ptr,
     const ElementB** b_ptr,
@@ -126,18 +128,27 @@ __global__ void prepare_grouped_nvfp4_args(
         scale_k_alignment;
     const size_t scale_k = swizzled_k / static_cast<size_t>(ScaleGranularity);
 
-    problem_sizes[group] = ProblemShape(group_m, n, k);
-    stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {group_m, k, 1});
+    int m = group_m;
+    size_t row_offset = static_cast<size_t>(group) * static_cast<size_t>(group_m);
+    if (m_indptr != nullptr) {
+        const int32_t start = m_indptr[group];
+        const int32_t end = m_indptr[group + 1];
+        m = end - start;
+        row_offset = static_cast<size_t>(start);
+    }
+
+    problem_sizes[group] = ProblemShape(m, n, k);
+    stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
     stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-    stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {group_m, n, 1});
-    a_ptr[group] = safe_inc_ptr(a, static_cast<size_t>(group) * group_m * k);
+    stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+    a_ptr[group] = safe_inc_ptr(a, row_offset * static_cast<size_t>(k));
     b_ptr[group] = safe_inc_ptr(b, static_cast<size_t>(group) * n * k);
-    out_ptr[group] = out + static_cast<size_t>(group) * group_m * n;
+    out_ptr[group] = out + row_offset * static_cast<size_t>(n);
     layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
-        make_shape(group_m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
-    scale_a_ptr[group] = scale_a + static_cast<size_t>(group) * group_m * scale_k;
+        make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
+    scale_a_ptr[group] = scale_a + static_cast<size_t>(group) * scale_group_m * scale_k;
     layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
-        make_shape(group_m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
+        make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
     scale_b_ptr[group] = scale_b + static_cast<size_t>(group) * scale_n * scale_k;
 }
 
@@ -151,6 +162,8 @@ bool run_grouped_nvfp4(
     const float* alpha,
     int num_groups,
     int group_m,
+    const int32_t* m_indptr,
+    int scale_group_m,
     int n,
     int k,
     void* workspace,
@@ -259,6 +272,8 @@ bool run_grouped_nvfp4(
         n,
         k,
         num_groups,
+        m_indptr,
+        scale_group_m,
         problem_sizes,
         a_ptr,
         b_ptr,
@@ -319,6 +334,8 @@ bool run_grouped_nvfp4(
     (void)alpha;
     (void)num_groups;
     (void)group_m;
+    (void)m_indptr;
+    (void)scale_group_m;
     (void)n;
     (void)k;
     (void)workspace;
@@ -355,14 +372,16 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4(
     if (out_dtype_code == 1) {
         return comfy::run_grouped_nvfp4<cutlass::half_t, 64>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
-            static_cast<int>(num_groups), static_cast<int>(group_m), static_cast<int>(n),
-            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size), stream);
+            static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
+            static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
         return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
-            static_cast<int>(num_groups), static_cast<int>(group_m), static_cast<int>(n),
-            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size), stream);
+            static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
+            static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
     }
 #else
     (void)a_ptr;
@@ -373,6 +392,60 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4(
     (void)alpha_ptr;
     (void)num_groups;
     (void)group_m;
+    (void)n;
+    (void)k;
+    (void)out_dtype_code;
+    (void)workspace_ptr;
+    (void)workspace_size;
+    (void)stream;
+#endif
+    return false;
+}
+
+extern "C" bool launch_cutlass_grouped_gemm_nvfp4_variable(
+    const void* a_ptr,
+    const void* block_scale_a_ptr,
+    const void* b_ptr,
+    const void* block_scale_b_ptr,
+    void* d_ptr,
+    const float* alpha_ptr,
+    const int32_t* m_indptr_ptr,
+    int64_t num_groups,
+    int64_t scale_group_m,
+    int64_t n,
+    int64_t k,
+    int out_dtype_code,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream) {
+#ifdef COMFY_HAVE_CUTLASS
+    if (num_groups <= 0) {
+        return true;
+    }
+    if (out_dtype_code == 1) {
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 64>(
+            a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
+            static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
+            static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
+    }
+    if (out_dtype_code == 2) {
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64>(
+            a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
+            static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
+            static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
+    }
+#else
+    (void)a_ptr;
+    (void)block_scale_a_ptr;
+    (void)b_ptr;
+    (void)block_scale_b_ptr;
+    (void)d_ptr;
+    (void)alpha_ptr;
+    (void)m_indptr_ptr;
+    (void)num_groups;
+    (void)scale_group_m;
     (void)n;
     (void)k;
     (void)out_dtype_code;
