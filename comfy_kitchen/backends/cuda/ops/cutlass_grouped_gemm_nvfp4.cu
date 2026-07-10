@@ -22,6 +22,7 @@
 #include <cuda_runtime.h>
 #include <cstdint>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
 #include "cute/tensor.hpp"
@@ -77,6 +78,7 @@ private:
 };
 
 template <
+    bool SwapAB,
     int ScaleGranularity,
     class ScaleConfig,
     class ElementA,
@@ -137,22 +139,38 @@ __global__ void prepare_grouped_nvfp4_args(
         row_offset = static_cast<size_t>(start);
     }
 
-    problem_sizes[group] = ProblemShape(m, n, k);
-    stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
-    stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
-    stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
-    a_ptr[group] = safe_inc_ptr(a, row_offset * static_cast<size_t>(k));
-    b_ptr[group] = safe_inc_ptr(b, static_cast<size_t>(group) * n * k);
-    out_ptr[group] = out + row_offset * static_cast<size_t>(n);
-    layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
-        make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
-    scale_a_ptr[group] = scale_a + static_cast<size_t>(group) * scale_group_m * scale_k;
-    layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
-        make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
-    scale_b_ptr[group] = scale_b + static_cast<size_t>(group) * scale_n * scale_k;
+    if constexpr (SwapAB) {
+        problem_sizes[group] = ProblemShape(n, m, k);
+        stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {n, k, 1});
+        stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {m, k, 1});
+        stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {n, m, 1});
+        a_ptr[group] = safe_inc_ptr(b, static_cast<size_t>(group) * n * k);
+        b_ptr[group] = safe_inc_ptr(a, row_offset * static_cast<size_t>(k));
+        out_ptr[group] = out + row_offset * static_cast<size_t>(n);
+        layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
+            make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
+        scale_a_ptr[group] = scale_b + static_cast<size_t>(group) * scale_n * scale_k;
+        layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
+            make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
+        scale_b_ptr[group] = scale_a + static_cast<size_t>(group) * scale_group_m * scale_k;
+    } else {
+        problem_sizes[group] = ProblemShape(m, n, k);
+        stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {m, k, 1});
+        stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {n, k, 1});
+        stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {m, n, 1});
+        a_ptr[group] = safe_inc_ptr(a, row_offset * static_cast<size_t>(k));
+        b_ptr[group] = safe_inc_ptr(b, static_cast<size_t>(group) * n * k);
+        out_ptr[group] = out + row_offset * static_cast<size_t>(n);
+        layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
+            make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
+        scale_a_ptr[group] = scale_a + static_cast<size_t>(group) * scale_group_m * scale_k;
+        layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
+            make_shape(m, static_cast<int>(scale_n), static_cast<int>(swizzled_k), 1));
+        scale_b_ptr[group] = scale_b + static_cast<size_t>(group) * scale_n * scale_k;
+    }
 }
 
-template <class ElementD, int TileN>
+template <class ElementD, int TileN, bool SwapAB>
 bool run_grouped_nvfp4(
     const void* a_raw,
     const void* scale_a_raw,
@@ -178,7 +196,8 @@ bool run_grouped_nvfp4(
     using ElementC = void;
     using LayoutA = cutlass::layout::RowMajor;
     using LayoutB = cutlass::layout::ColumnMajor;
-    using LayoutD = cutlass::layout::RowMajor;
+    using LayoutD =
+        std::conditional_t<SwapAB, cutlass::layout::ColumnMajor, cutlass::layout::RowMajor>;
     using ClusterShape = Shape<_1, _1, _1>;
     using ThreadBlockShape = Shape<_128, Int<TileN>, _256>;
 
@@ -250,6 +269,7 @@ bool run_grouped_nvfp4(
     const int threads = num_groups < 256 ? num_groups : 256;
     const int blocks = (num_groups + threads - 1) / threads;
     prepare_grouped_nvfp4_args<
+        SwapAB,
         ScaleGranularity,
         ScaleConfig,
         typename Gemm::ElementA,
@@ -370,14 +390,14 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_nvfp4<cutlass::half_t, 64>(
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 64, false>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64>(
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64, false>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
@@ -423,14 +443,14 @@ extern "C" bool launch_cutlass_grouped_gemm_nvfp4_variable(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_nvfp4<cutlass::half_t, 64>(
+        return comfy::run_grouped_nvfp4<cutlass::half_t, 32, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 64>(
+        return comfy::run_grouped_nvfp4<cutlass::bfloat16_t, 32, true>(
             a_ptr, block_scale_a_ptr, b_ptr, block_scale_b_ptr, d_ptr, alpha_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
