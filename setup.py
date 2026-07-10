@@ -152,6 +152,7 @@ class CMakeBuildExt(build_ext):
         # Run CMake build
         print(f"Building {ext.name} with CMake...")
         build_cmd = ["cmake", "--build", ".", *build_args]
+        print(f"  Build command: {' '.join(build_cmd)}")
         try:
             subprocess.run(
                 build_cmd,
