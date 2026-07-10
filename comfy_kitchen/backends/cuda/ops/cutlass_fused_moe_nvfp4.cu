@@ -60,6 +60,7 @@ constexpr int kValuesPerThread = 4;
 constexpr int kThreadsPerQuantGroup = kNvfp4BlockSize / kValuesPerThread;
 constexpr int kQuantThreads = 256;
 constexpr int kScaleRowAlignment = 128;
+constexpr int kMaxTopK = 8;
 
 class WorkspaceArena {
 public:
@@ -213,7 +214,51 @@ __device__ __forceinline__ void quantize_four_low_first(
                                         v3 * encode_scale);
 }
 
-__global__ void gather_and_quantize_input(
+struct PackedNvfp4x4 {
+    uint16_t values;
+    __nv_fp8_e4m3 scale;
+};
+
+__device__ __forceinline__ PackedNvfp4x4 quantize_four_low_first_packed(
+    float v0,
+    float v1,
+    float v2,
+    float v3,
+    float global_decode_scale) {
+    float block_absmax = fmaxf(fmaxf(fabsf(v0), fabsf(v1)), fmaxf(fabsf(v2), fabsf(v3)));
+#pragma unroll
+    for (int offset = kThreadsPerQuantGroup / 2; offset >= 1; offset /= 2) {
+        block_absmax =
+            fmaxf(block_absmax, __shfl_down_sync(0xffffffffu, block_absmax, offset,
+                                                kThreadsPerQuantGroup));
+    }
+    block_absmax =
+        __shfl_sync(0xffffffffu, block_absmax, 0, kThreadsPerQuantGroup);
+
+    if (block_absmax == 0.0f) {
+        return {0, static_cast<__nv_fp8_e4m3>(0.0f)};
+    }
+
+    float block_decode_scale = block_absmax * FP4LimitsTrait<__nv_fp4x2_storage_t>::max_inverse;
+    block_decode_scale /= global_decode_scale;
+    block_decode_scale = fminf(block_decode_scale, FP8LimitsTrait<__nv_fp8_e4m3>::max);
+    const __nv_fp8_e4m3 scale_fp8 = static_cast<__nv_fp8_e4m3>(block_decode_scale);
+    const float rounded_block_decode_scale = static_cast<float>(scale_fp8);
+    const float encode_scale =
+        fminf(1.0f / (rounded_block_decode_scale * global_decode_scale), FLT_MAX);
+
+    union {
+        uint16_t u16;
+        __nv_fp4x2_storage_t fp4x2[2];
+    } packed;
+    packed.fp4x2[0] = __nv_cvt_float2_to_fp4x2(
+        float2{v0 * encode_scale, v1 * encode_scale}, __NV_E2M1, cudaRoundNearest);
+    packed.fp4x2[1] = __nv_cvt_float2_to_fp4x2(
+        float2{v2 * encode_scale, v3 * encode_scale}, __NV_E2M1, cudaRoundNearest);
+    return {packed.u16, scale_fp8};
+}
+
+__global__ void quantize_and_route_input(
     const __nv_bfloat16* input,
     const int32_t* expert_ids,
     const int32_t* route_rank,
@@ -225,19 +270,8 @@ __global__ void gather_and_quantize_input(
     int top_k,
     int scale_group_m,
     int scale_cols) {
-    const int route = blockIdx.x;
-    const int dest = route_dest[route];
-    if (dest < 0) {
-        return;
-    }
-
-    const int expert = expert_ids[route];
-    const int rank = route_rank[route];
-    const int token = route / top_k;
+    const int token = blockIdx.x;
     const __nv_bfloat16* input_row = input + static_cast<size_t>(token) * hidden_size;
-    __nv_fp4x2_e2m1* qrow = qdata + static_cast<size_t>(dest) * (hidden_size / 2);
-    __nv_fp8_e4m3* scale_base =
-        block_scales + static_cast<size_t>(expert) * scale_group_m * scale_cols;
 
     constexpr int groups_per_block = kQuantThreads / kThreadsPerQuantGroup;
     const int group_in_block = threadIdx.x / kThreadsPerQuantGroup;
@@ -251,8 +285,32 @@ __global__ void gather_and_quantize_input(
         const float v2 = __bfloat162float(input_row[col + 2]);
         const float v3 = __bfloat162float(input_row[col + 3]);
         const size_t q_group_index = static_cast<size_t>(block_col) * 4 + lane_in_group;
-        quantize_four_low_first(v0, v1, v2, v3, global_decode_scale, qrow,
-                                q_group_index, scale_base, rank, block_col, scale_cols);
+        const PackedNvfp4x4 packed =
+            quantize_four_low_first_packed(v0, v1, v2, v3, global_decode_scale);
+
+#pragma unroll
+        for (int position = 0; position < kMaxTopK; ++position) {
+            if (position >= top_k) {
+                break;
+            }
+            const int route = token * top_k + position;
+            const int dest = route_dest[route];
+            if (dest < 0) {
+                continue;
+            }
+            __nv_fp4x2_e2m1* qrow =
+                qdata + static_cast<size_t>(dest) * (hidden_size / 2);
+            *reinterpret_cast<uint16_t*>(qrow + 2 * q_group_index) = packed.values;
+            if (lane_in_group == 0) {
+                const int expert = expert_ids[route];
+                const int rank = route_rank[route];
+                __nv_fp8_e4m3* scale_base =
+                    block_scales + static_cast<size_t>(expert) * scale_group_m * scale_cols;
+                const size_t scale_offset =
+                    scale_factor_swizzled_offset(rank, block_col, scale_cols);
+                scale_base[scale_offset] = packed.scale;
+            }
+        }
     }
 }
 
@@ -400,7 +458,8 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
     // DiffusionGemma text-only and visual-token workflows.
     if ((num_tokens != 256 && num_tokens != 340) || hidden_size != 2816 ||
         intermediate_size != 704 || num_experts != 128 || top_k != 8 ||
-        workspace_size <= 0 || hidden_size % 64 != 0 || intermediate_size % 64 != 0) {
+        workspace_size <= 0 || hidden_size % 64 != 0 || intermediate_size % 64 != 0 ||
+        top_k <= 0 || top_k > kMaxTopK) {
         return false;
     }
     if (!is_aligned(input_bf16, 2) || !is_aligned(expert_ids, 4) ||
@@ -473,7 +532,7 @@ extern "C" bool launch_cutlass_fused_moe_nvfp4(
     }
 
     last_error_stage = 6;
-    gather_and_quantize_input<<<routes, kQuantThreads, 0, stream>>>(
+    quantize_and_route_input<<<n, kQuantThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(input_bf16), expert_ids, route_rank, route_dest,
         input_decode_scale, reinterpret_cast<__nv_fp4x2_e2m1*>(qx),
         reinterpret_cast<__nv_fp8_e4m3*>(input_block_scales), h, k, scale_group_m,
