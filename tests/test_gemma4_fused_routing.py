@@ -7,7 +7,7 @@ import comfy_kitchen as ck
 def _cuda_routing_available():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() < (8, 0):
         return False
-    backend = next(item for item in ck.list_backends() if item["name"] == "cuda")
+    backend = ck.list_backends()["cuda"]
     return "gemma4_fused_routing" in backend["capabilities"]
 
 
