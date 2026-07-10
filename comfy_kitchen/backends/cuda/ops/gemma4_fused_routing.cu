@@ -66,7 +66,7 @@ __global__ void gemma4_fused_routing_kernel(
     if (threadIdx.x < 32) {
         const float max_logit = __shfl_sync(0xffffffffu, sorted_logit, 0);
         float weight = threadIdx.x < kTopK
-            ? __exp2f((sorted_logit - max_logit) * kLog2E)
+            ? exp2f((sorted_logit - max_logit) * kLog2E)
             : 0.0f;
         float denominator = weight;
 #pragma unroll
