@@ -52,6 +52,7 @@ __all__ = [
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
     "scaled_mm_nvfp4",
+    "grouped_scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
 ]
@@ -1498,6 +1499,57 @@ def scaled_mm_nvfp4(
     return out
 
 
+def grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one SM120 CUTLASS NVFP4 GEMM for a fixed token bucket per expert."""
+    if torch.cuda.get_device_capability(a.device) != (12, 0):
+        raise RuntimeError("grouped NVFP4 GEMM currently requires SM120")
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError("a must be 2D and b must be a 3D expert bank")
+    groups, n, packed_k = b.shape
+    if a.shape != (groups * group_size, packed_k):
+        raise ValueError("activation shape must be [groups * group_size, packed_k]")
+    if group_size <= 0 or group_size % 128:
+        raise ValueError("group_size must be a positive multiple of 128")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("grouped NVFP4 output must be float16 or bfloat16")
+
+    if alpha is None:
+        alpha = tensor_scale_a * tensor_scale_b
+    alpha = alpha.to(device=a.device, dtype=torch.float32).reshape(-1)
+    if alpha.numel() == 1:
+        alpha = alpha.expand(groups).contiguous()
+    elif alpha.numel() != groups:
+        raise ValueError("alpha must be scalar or contain one value per group")
+    elif not alpha.is_contiguous():
+        alpha = alpha.contiguous()
+
+    out = torch.empty((groups, group_size, n), device=a.device, dtype=out_dtype)
+    stream_ptr = torch.cuda.current_stream(a.device).cuda_stream
+    _C.cutlass_grouped_gemm_nvfp4(
+        _wrap_for_dlpack(a),
+        _wrap_for_dlpack(block_scale_a.view(torch.uint8)),
+        _wrap_for_dlpack(b),
+        _wrap_for_dlpack(block_scale_b.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(alpha),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2547,6 +2599,26 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(10, 0),
+        )
+        constraints["grouped_scaled_mm_nvfp4"] = FunctionConstraints(
+            params={
+                "a": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=16)),
+                ),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(3), DivisibleBy(dim=2, factor=16)),
+                ),
+                "tensor_scale_a": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "tensor_scale_b": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scale_a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "block_scale_b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(12, 0),
         )
 
     return constraints

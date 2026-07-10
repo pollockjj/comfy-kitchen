@@ -42,6 +42,7 @@ __all__ = [
     "dequantize_int8_simple",
     # Fused matmul
     "scaled_mm_nvfp4",
+    "grouped_scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -239,6 +240,38 @@ def scaled_mm_nvfp4(
     return torch.ops.comfy_kitchen.scaled_mm_nvfp4(
         a, b, tensor_scale_a, tensor_scale_b,
         block_scale_a, block_scale_b, bias, dtype_code, alpha
+    )
+
+
+def grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Grouped NVFP4 linear over a fixed-size activation bucket for each expert.
+
+    ``a`` stores all expert activation buckets flattened as
+    ``[num_experts * group_size, K // 2]``. ``b`` stores the expert weight bank as
+    ``[num_experts, N, K // 2]``. The result is ``[num_experts, group_size, N]``.
+    ``group_size`` must be a multiple of 128 so each expert's activation scales are
+    independently aligned in the SM120 block-scale layout.
+    """
+    return torch.ops.comfy_kitchen.grouped_scaled_mm_nvfp4(
+        a,
+        b,
+        tensor_scale_a,
+        tensor_scale_b,
+        block_scale_a,
+        block_scale_b,
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        alpha,
     )
 
 

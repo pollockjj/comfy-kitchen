@@ -55,6 +55,17 @@ Portions of the following files are derived from PyTorch AO:
 - comfy_kitchen/float_utils.py (_f32_to_floatx_unpacked, _floatx_unpacked_to_f32)
   Source: https://github.com/pytorch/ao/blob/main/torchao/prototype/mx_formats/custom_cast.py
 
+--------------------------------------------------------------------------------
+FlashInfer
+--------------------------------------------------------------------------------
+Copyright (c) 2026 by FlashInfer team.
+License: Apache-2.0
+Website: https://github.com/flashinfer-ai/flashinfer
+
+The SM120 grouped NVFP4 GEMM construction in
+comfy_kitchen/backends/cuda/ops/cutlass_grouped_gemm_nvfp4.cu is adapted from
+FlashInfer's group_gemm_nvfp4_groupwise_sm120 implementation.
+
 BSD 3-Clause License:
 
 Redistribution and use in source and binary forms, with or without modification,
@@ -86,4 +97,3 @@ SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 For full license texts of these dependencies, please refer to their respective
 project repositories or installation directories.
-

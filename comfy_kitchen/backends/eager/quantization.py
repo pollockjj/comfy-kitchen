@@ -598,6 +598,43 @@ def _op_scaled_mm_nvfp4_fake(
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
 
 
+@torch.library.custom_op("comfy_kitchen::grouped_scaled_mm_nvfp4", mutates_args=())
+def _op_grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+    alpha: torch.Tensor | None,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a": a,
+        "b": b,
+        "tensor_scale_a": tensor_scale_a,
+        "tensor_scale_b": tensor_scale_b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "group_size": group_size,
+        "out_dtype": out_dtype,
+        "alpha": alpha,
+    }
+    impl = registry.get_implementation("grouped_scaled_mm_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_grouped_scaled_mm_nvfp4.register_fake
+def _op_grouped_scaled_mm_nvfp4_fake(
+    a, b, tensor_scale_a, tensor_scale_b, block_scale_a, block_scale_b,
+    group_size, output_dtype_code, alpha
+):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty((b.shape[0], group_size, b.shape[1]), dtype=out_dtype, device=a.device)
+
+
 # =============================================================================
 # MXFP8 Custom Ops
 # =============================================================================
