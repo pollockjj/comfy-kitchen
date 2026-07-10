@@ -160,7 +160,11 @@ if(NOT DEFINED COMFY_CUTLASS_DIR)
 endif()
 if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
     message(STATUS "CUTLASS found: ${COMFY_CUTLASS_DIR}")
-    target_include_directories(_C PRIVATE ${COMFY_CUTLASS_DIR})
+    get_filename_component(COMFY_CUTLASS_ROOT "${COMFY_CUTLASS_DIR}" DIRECTORY)
+    target_include_directories(_C PRIVATE
+        ${COMFY_CUTLASS_DIR}
+        ${COMFY_CUTLASS_ROOT}/tools/util/include
+    )
     target_compile_definitions(_C PRIVATE COMFY_HAVE_CUTLASS)
 else()
     message(STATUS "CUTLASS not found at ${COMFY_CUTLASS_DIR} - int8 GEMM uses cuBLAS only")
