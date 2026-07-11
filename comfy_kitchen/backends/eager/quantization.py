@@ -6,6 +6,8 @@
 #   Copyright (c) Meta Platforms, Inc. and affiliates.
 #   Licensed under the BSD 3-Clause License (see NOTICE file for details)
 
+import itertools
+
 import torch
 
 from comfy_kitchen.float_utils import (
@@ -1151,7 +1153,7 @@ def grouped_int8_convrot_linear_packed(
 
     offsets = expert_indptr.tolist()
     if offsets[0] != 0 or offsets[-1] != x.shape[0] or any(
-        start > end for start, end in zip(offsets, offsets[1:])
+        start > end for start, end in itertools.pairwise(offsets)
     ):
         raise ValueError("Packed grouped INT8 ConvRot indptr must be monotonic from 0 through R")
     outputs = [
