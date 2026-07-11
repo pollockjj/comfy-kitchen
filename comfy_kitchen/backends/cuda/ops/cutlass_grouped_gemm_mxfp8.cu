@@ -17,8 +17,10 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
+#include <string>
 
 #ifdef COMFY_HAVE_CUTLASS
 #include "cute/tensor.hpp"
@@ -38,6 +40,65 @@ namespace {
 #ifdef COMFY_HAVE_CUTLASS
 
 using namespace cute;
+
+enum class DgMxfp8CtaShape {
+    k128x32x128,
+    k128x64x128,
+    k128x128x128,
+    k256x128x128,
+    k128x256x128,
+};
+
+constexpr char kDgMxfp8Fc1CtaShapeEnv[] =
+    "COMFY_KITCHEN_DG_MXFP8_FC1_CTA_SHAPE";
+constexpr char kDgMxfp8Fc2CtaShapeEnv[] =
+    "COMFY_KITCHEN_DG_MXFP8_FC2_CTA_SHAPE";
+
+DgMxfp8CtaShape parse_dg_mxfp8_cta_shape(const char* name) {
+    const char* value = std::getenv(name);
+    if (value == nullptr || value[0] == '\0' || std::string(value) == "128x32x128") {
+        return DgMxfp8CtaShape::k128x32x128;
+    }
+    if (std::string(value) == "128x64x128") {
+        return DgMxfp8CtaShape::k128x64x128;
+    }
+    if (std::string(value) == "128x128x128") {
+        return DgMxfp8CtaShape::k128x128x128;
+    }
+    if (std::string(value) == "256x128x128") {
+        return DgMxfp8CtaShape::k256x128x128;
+    }
+    if (std::string(value) == "128x256x128") {
+        return DgMxfp8CtaShape::k128x256x128;
+    }
+    throw std::invalid_argument(
+        std::string(name) + "='" + value +
+        "' is invalid; expected one of 128x32x128, 128x64x128, 128x128x128, "
+        "256x128x128, or 128x256x128");
+}
+
+struct DgMxfp8CtaConfig {
+    DgMxfp8CtaShape fc1;
+    DgMxfp8CtaShape fc2;
+};
+
+const DgMxfp8CtaConfig& dg_mxfp8_cta_config() {
+    static const DgMxfp8CtaConfig config{
+        parse_dg_mxfp8_cta_shape(kDgMxfp8Fc1CtaShapeEnv),
+        parse_dg_mxfp8_cta_shape(kDgMxfp8Fc2CtaShapeEnv),
+    };
+    return config;
+}
+
+DgMxfp8CtaShape select_grouped_mxfp8_cta_shape(int n, int k) {
+    if (n == 1408 && k == 2816) {
+        return dg_mxfp8_cta_config().fc1;
+    }
+    if (n == 2816 && k == 704) {
+        return dg_mxfp8_cta_config().fc2;
+    }
+    return DgMxfp8CtaShape::k128x32x128;
+}
 
 class WorkspaceArena {
 public:
@@ -146,7 +207,7 @@ __global__ void prepare_grouped_mxfp8_args(
         activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
 }
 
-template <class ElementD>
+template <int TileM, int TileN, int TileK, class ElementD>
 bool run_grouped_mxfp8(
     const void* activations_raw,
     const void* activation_scales_raw,
@@ -173,7 +234,9 @@ bool run_grouped_mxfp8(
     using LayoutB = cutlass::layout::ColumnMajor;
     using LayoutD = cutlass::layout::ColumnMajor;
     using ClusterShape = Shape<_1, _1, _1>;
-    using ThreadBlockShape = Shape<_128, _32, _128>;
+    // The grouped problem swaps A/B so TileM spans the expert output and
+    // TileN spans the routed-token bucket.
+    using ThreadBlockShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
 
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementInput>::value;
     constexpr int AlignmentB = AlignmentA;
@@ -338,6 +401,53 @@ bool run_grouped_mxfp8(
 #endif
 }
 
+template <class ElementD>
+bool run_selected_grouped_mxfp8(
+    const void* activations_raw,
+    const void* activation_scales_raw,
+    const void* weights_raw,
+    const void* weight_scales_raw,
+    void* output_raw,
+    int num_groups,
+    int group_m,
+    const int32_t* m_indptr,
+    int scale_group_m,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+    const DgMxfp8CtaShape shape = select_grouped_mxfp8_cta_shape(n, k);
+    switch (shape) {
+        case DgMxfp8CtaShape::k128x32x128:
+            return run_grouped_mxfp8<128, 32, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+                workspace_size, stream);
+        case DgMxfp8CtaShape::k128x64x128:
+            return run_grouped_mxfp8<128, 64, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+                workspace_size, stream);
+        case DgMxfp8CtaShape::k128x128x128:
+            return run_grouped_mxfp8<128, 128, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+                workspace_size, stream);
+        case DgMxfp8CtaShape::k256x128x128:
+            return run_grouped_mxfp8<256, 128, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+                workspace_size, stream);
+        case DgMxfp8CtaShape::k128x256x128:
+            return run_grouped_mxfp8<128, 256, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+                workspace_size, stream);
+    }
+    throw std::logic_error("unhandled DG MXFP8 CTA shape");
+}
+
 #endif
 
 }  // namespace
@@ -362,14 +472,14 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_mxfp8<cutlass::half_t>(
+        return comfy::run_selected_grouped_mxfp8<cutlass::half_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_mxfp8<cutlass::bfloat16_t>(
+        return comfy::run_selected_grouped_mxfp8<cutlass::bfloat16_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
             static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
             static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
@@ -413,14 +523,14 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8_variable(
         return true;
     }
     if (out_dtype_code == 1) {
-        return comfy::run_grouped_mxfp8<cutlass::half_t>(
+        return comfy::run_selected_grouped_mxfp8<cutlass::half_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
             static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
-        return comfy::run_grouped_mxfp8<cutlass::bfloat16_t>(
+        return comfy::run_selected_grouped_mxfp8<cutlass::bfloat16_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
             static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
             static_cast<int>(n), static_cast<int>(k), workspace_ptr,
