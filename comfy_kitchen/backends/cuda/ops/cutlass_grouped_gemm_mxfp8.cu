@@ -111,8 +111,6 @@ struct DgNarrowMxfp8MainloopBuilder {
     using ElementAccumulator = float;
     using GmemLayoutATag = cutlass::layout::RowMajor*;
     using GmemLayoutBTag = cutlass::layout::ColumnMajor*;
-    static constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementA>::value;
-    static constexpr int AlignmentB = AlignmentA;
     static constexpr int SFVectorSize =
         cutlass_collective_detail::blockscaled::blockscaled_type<
             cutlass_collective::KernelScheduleAuto, ElementPair>::SfVectorSize;
@@ -140,8 +138,10 @@ struct DgNarrowMxfp8MainloopBuilder {
     static_assert(UseMxf8f6f4);
 
     using PermTileM = decltype(cute::min(cute::size<0>(TileShapeMNK{}), cute::_128{}));
-    using PermTileN = decltype(
-        cutlass_collective_detail::sm120_tile_n_permute_selector<SFVectorSize>());
+    // CUTLASS's generic block-scaled builder uses a 32-column permutation tile
+    // and therefore rejects CTA N=16.  The SM120 MMA atom is 8 columns wide;
+    // the cooperative 2-way N layout natively covers this 16-column tile.
+    using PermTileN = cute::_16;
     using PermTileK = cute::_32;
     using AtomLayoutMNK = cute::Layout<cute::Shape<cute::_4, cute::_2, cute::_1>>;
     using TiledMma = decltype(cute::make_tiled_mma(
@@ -426,7 +426,6 @@ bool run_grouped_mxfp8(
         cutlass::epilogue::collective::EpilogueTileAuto>;
 
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementInput>::value;
-    constexpr int AlignmentB = AlignmentA;
     constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
     if (k % AlignmentA || n % AlignmentD) {
         return false;
