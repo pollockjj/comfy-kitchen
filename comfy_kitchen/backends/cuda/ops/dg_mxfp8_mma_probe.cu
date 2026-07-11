@@ -15,10 +15,10 @@
  * limitations under the License.
  */
 
-#include "float_utils.cuh"
-
 #include <cuda_bf16.h>
 #include <cuda_runtime.h>
+
+#include "float_utils.cuh"
 
 #include <cstdint>
 
