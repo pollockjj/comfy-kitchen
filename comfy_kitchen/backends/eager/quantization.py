@@ -373,7 +373,7 @@ def mxfp8_embedding(
     output_type: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dequantize only the requested MXFP8 rows using native swizzled scales."""
-    rows, cols = qweight.shape
+    cols = qweight.shape[1]
     block_cols = cols // MXFP8_BLOCK_SIZE
     selected = qweight.index_select(0, indices).to(torch.float32)
 
