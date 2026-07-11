@@ -43,6 +43,21 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8_variable(
     int64_t workspace_size,
     cudaStream_t stream);
 
+extern "C" bool launch_dg_mxfp8_fc2_routed(
+    const void* activations,
+    const void* activation_scales,
+    const void* weights,
+    const void* weight_scales,
+    void* output,
+    const int32_t* indptr,
+    int64_t routes,
+    int64_t scale_group_m,
+    int64_t num_experts,
+    int out_dtype_code,
+    void* workspace,
+    int64_t workspace_size,
+    cudaStream_t stream);
+
 namespace comfy {
 namespace fused_moe_mxfp8 {
 
@@ -386,6 +401,7 @@ bool run_fused_moe_mxfp8(
     void* workspace_ptr,
     size_t workspace_size,
     int out_dtype_code,
+    bool use_dg_fc2,
     cudaStream_t stream) {
     const int routes = n * top_k;
     const int scale_group_m =
@@ -478,15 +494,24 @@ bool run_fused_moe_mxfp8(
     }
 
     last_error_stage = 9;
-    try {
-        if (!launch_cutlass_grouped_gemm_mxfp8_variable(
-                qi, intermediate_block_scales, fc2_qdata, fc2_block_scales, routed_down,
-                indptr, e, scale_group_m, h, i, out_dtype_code, gemm_workspace,
-                static_cast<int64_t>(gemm_workspace_size), stream)) {
+    if (use_dg_fc2) {
+        if (!launch_dg_mxfp8_fc2_routed(
+                qi, intermediate_block_scales, fc2_qdata, fc2_block_scales,
+                routed_down, indptr, routes, scale_group_m, e, out_dtype_code,
+                gemm_workspace, static_cast<int64_t>(gemm_workspace_size), stream)) {
             return false;
         }
-    } catch (...) {
-        return false;
+    } else {
+        try {
+            if (!launch_cutlass_grouped_gemm_mxfp8_variable(
+                    qi, intermediate_block_scales, fc2_qdata, fc2_block_scales,
+                    routed_down, indptr, e, scale_group_m, h, i, out_dtype_code,
+                    gemm_workspace, static_cast<int64_t>(gemm_workspace_size), stream)) {
+                return false;
+            }
+        } catch (...) {
+            return false;
+        }
     }
 
     const int64_t output_elements = static_cast<int64_t>(n) * h;
@@ -524,6 +549,7 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
     int input_dtype_code,
     void* workspace_ptr,
     int64_t workspace_size,
+    bool use_dg_fc2,
     cudaStream_t stream) {
 #if CUDA_VERSION >= 12080
     using namespace comfy::fused_moe_mxfp8;
@@ -553,14 +579,14 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
             fc2_block_scales, output, static_cast<int>(num_tokens),
             static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
             static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
-            static_cast<size_t>(workspace_size), input_dtype_code, stream);
+            static_cast<size_t>(workspace_size), input_dtype_code, use_dg_fc2, stream);
     }
     return run_fused_moe_mxfp8<__nv_bfloat16>(
         input, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
         fc2_block_scales, output, static_cast<int>(num_tokens),
         static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
         static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
-        static_cast<size_t>(workspace_size), input_dtype_code, stream);
+        static_cast<size_t>(workspace_size), input_dtype_code, use_dg_fc2, stream);
 #else
     (void)input;
     (void)expert_ids;
@@ -578,6 +604,7 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
     (void)input_dtype_code;
     (void)workspace_ptr;
     (void)workspace_size;
+    (void)use_dg_fc2;
     (void)stream;
     return false;
 #endif

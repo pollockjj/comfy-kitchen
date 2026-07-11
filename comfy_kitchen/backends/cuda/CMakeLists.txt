@@ -108,6 +108,7 @@ set(CUDA_SOURCES
     ops/cutlass_grouped_gemm_nvfp4.cu
     ops/cutlass_grouped_gemm_mxfp8.cu
     ops/dg_mxfp8_mma_probe.cu
+    ops/dg_mxfp8_fc2_routed.cu
     ops/cutlass_fused_moe_nvfp4.cu
     ops/cutlass_fused_moe_mxfp8.cu
     ops/cublas_gemm_int8.cu

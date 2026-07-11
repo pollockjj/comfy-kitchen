@@ -210,6 +210,7 @@ extern "C" {
         int input_dtype_code,
         void* workspace_ptr,
         int64_t workspace_size,
+        bool use_dg_fc2,
         cudaStream_t stream);
 
     bool launch_dg_mxfp8_mma_probe(
@@ -974,7 +975,8 @@ void cutlass_fused_moe_mxfp8(
     nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
-    uintptr_t stream_ptr) {
+    uintptr_t stream_ptr,
+    bool use_dg_fc2) {
 
     const int64_t num_tokens = input.shape(0);
     const int64_t hidden_size = input.shape(1);
@@ -1022,7 +1024,7 @@ void cutlass_fused_moe_mxfp8(
             fc1_block_scales.data(), fc2_qdata.data(), fc2_block_scales.data(),
             output.data(), num_tokens, hidden_size, intermediate_size, num_experts, top_k,
             input_dtype_code, workspace.data(), static_cast<int64_t>(workspace.size()),
-            stream)) {
+            use_dg_fc2, stream)) {
         throw std::runtime_error(
             "native CUTLASS fused MXFP8 MoE failed at stage " +
             std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
@@ -2792,7 +2794,8 @@ NB_MODULE(_C, m) {
           nb::arg("fc2_block_scales"),
           nb::arg("output"),
           nb::arg("workspace"),
-          nb::arg("stream_ptr"));
+          nb::arg("stream_ptr"),
+          nb::arg("_use_dg_fc2") = true);
 
     m.def("_dg_mxfp8_mma_probe", &dg_mxfp8_mma_probe,
           "Internal SM120 m16n8k32 MXFP8 instruction probe",
