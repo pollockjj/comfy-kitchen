@@ -70,6 +70,9 @@ class TestBackendSystem:
 
         assert ("grouped_scaled_mm_nvfp4" in capabilities) is available
         assert ("fused_moe_nvfp4" in capabilities) is available
+        assert ("scaled_mm_mxfp8" in capabilities) is (
+            available and hasattr(torch, "float8_e8m0fnu")
+        )
         assert ("grouped_scaled_mm_mxfp8" in capabilities) is (
             available and hasattr(torch, "float8_e8m0fnu")
         )

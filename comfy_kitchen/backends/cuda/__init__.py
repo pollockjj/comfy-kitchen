@@ -55,6 +55,7 @@ __all__ = [
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
     "scaled_mm_nvfp4",
+    "scaled_mm_mxfp8",
     "grouped_scaled_mm_nvfp4",
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
@@ -1730,6 +1731,65 @@ def grouped_scaled_mm_mxfp8(
     return out
 
 
+def scaled_mm_mxfp8(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Run the SM120 BF16 persistent CUTLASS MXFP8 dense fast path."""
+    if bias is not None:
+        raise ValueError("dense CUDA MXFP8 fast path is bias-free")
+    if out_dtype is not torch.bfloat16:
+        raise ValueError("dense CUDA MXFP8 fast path requires BF16 output")
+    if not a.is_cuda or torch.cuda.get_device_capability(a.device) != (12, 0):
+        raise RuntimeError("dense CUDA MXFP8 fast path requires SM120")
+    if a.dtype != torch.float8_e4m3fn or b.dtype != torch.float8_e4m3fn:
+        raise ValueError("dense MXFP8 qdata must be float8_e4m3fn")
+    if (
+        block_scale_a.dtype != torch.float8_e8m0fnu
+        or block_scale_b.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("dense MXFP8 block scales must be float8_e8m0fnu")
+    if a.ndim != 2 or b.ndim != 2:
+        raise ValueError("dense MXFP8 operands must be rank-2")
+
+    m, k = a.shape
+    n, weight_k = b.shape
+    if weight_k != k:
+        raise ValueError("dense MXFP8 operand K dimensions must match")
+    if m <= 0 or n <= 0 or k <= 0 or m % 32 or n % 32 or k % 32:
+        raise ValueError("dense MXFP8 M, N, and K must be positive multiples of 32")
+
+    tensors = (a, b, block_scale_a, block_scale_b)
+    if any(tensor.device != a.device for tensor in tensors):
+        raise ValueError("all dense MXFP8 tensors must be on the activation device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all dense MXFP8 tensors must be contiguous")
+
+    scale_k = roundup(k // 32, 4)
+    if block_scale_a.shape != (roundup(m, 128), scale_k):
+        raise ValueError("dense MXFP8 activation scale shape mismatch")
+    if block_scale_b.shape != (roundup(n, 128), scale_k):
+        raise ValueError("dense MXFP8 weight scale shape mismatch")
+
+    out = torch.empty((m, n), device=a.device, dtype=torch.bfloat16)
+    stream_ptr = torch.cuda.current_stream(a.device).cuda_stream
+    _C.cutlass_gemm_mxfp8(
+        _wrap_for_dlpack(a),
+        _wrap_for_dlpack(block_scale_a.view(torch.uint8)),
+        _wrap_for_dlpack(b),
+        _wrap_for_dlpack(block_scale_b.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        0,
+        stream_ptr,
+    )
+    return out
+
+
 def fused_moe_nvfp4(
     x: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -3019,6 +3079,38 @@ def _build_constraints() -> dict:
             min_compute_capability=(12, 0),
         )
         if hasattr(torch, "float8_e8m0fnu"):
+            constraints["scaled_mm_mxfp8"] = FunctionConstraints(
+                params={
+                    "a": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(
+                            ExactDims(2),
+                            DivisibleBy(dim=0, factor=32),
+                            DivisibleBy(dim=1, factor=32),
+                        ),
+                    ),
+                    "b": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(
+                            ExactDims(2),
+                            DivisibleBy(dim=0, factor=32),
+                            DivisibleBy(dim=1, factor=32),
+                        ),
+                    ),
+                    "block_scale_a": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scale_b": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "bias": ParamConstraint(dtypes=frozenset()),
+                    "out_dtype": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
             constraints["grouped_scaled_mm_mxfp8"] = FunctionConstraints(
                 params={
                     "a_qdata": ParamConstraint(

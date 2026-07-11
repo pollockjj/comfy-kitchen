@@ -5,6 +5,12 @@ from torch.nn import functional
 import comfy_kitchen as ck
 
 cuda_status = ck.list_backends().get("cuda", {})
+sm120_dense_mxfp8_available = (
+    hasattr(torch, "float8_e8m0fnu")
+    and torch.cuda.is_available()
+    and torch.cuda.get_device_capability(0) == (12, 0)
+    and "scaled_mm_mxfp8" in set(cuda_status.get("capabilities", ()))
+)
 sm120_grouped_mxfp8_available = (
     hasattr(torch, "float8_e8m0fnu")
     and torch.cuda.is_available()
@@ -123,6 +129,54 @@ def _grouped_mxfp8_reference(x, expert_ids, router_weights, expert_bank):
         .sum(dim=1)
         .to(x.dtype)
     )
+
+
+@pytest.mark.skipif(not sm120_dense_mxfp8_available, reason="SM120 dense MXFP8 required")
+@pytest.mark.parametrize("m,n,k", [(256, 2112, 2816), (256, 2816, 2112)])
+def test_dense_scaled_mm_mxfp8_matches_eager(m, n, k):
+    generator = torch.Generator(device="cuda:0").manual_seed(5770911)
+    activation = torch.randn(
+        m, k, generator=generator, dtype=torch.bfloat16, device="cuda:0"
+    ).mul_(2**-3)
+    weight = torch.randn(
+        n, k, generator=generator, dtype=torch.bfloat16, device="cuda:0"
+    ).mul_(2**-3)
+
+    with ck.use_backend("cuda"):
+        a_qdata, a_scales = ck.quantize_mxfp8(activation)
+        w_qdata, w_scales = ck.quantize_mxfp8(weight)
+        candidate = ck.scaled_mm_mxfp8(a_qdata, w_qdata, a_scales, w_scales)
+    with ck.use_backend("eager"):
+        reference = ck.scaled_mm_mxfp8(a_qdata, w_qdata, a_scales, w_scales)
+
+    delta = candidate.float() - reference.float()
+    relative_rmse = delta.square().mean().sqrt() / reference.float().square().mean().sqrt()
+    cosine = functional.cosine_similarity(
+        candidate.float().flatten(), reference.float().flatten(), dim=0
+    )
+    assert torch.isfinite(candidate).all()
+    assert delta.abs().max() <= 0.0625
+    assert relative_rmse <= 1.0e-3
+    assert cosine >= 0.99999
+
+
+@pytest.mark.skipif(not sm120_dense_mxfp8_available, reason="SM120 dense MXFP8 required")
+def test_dense_scaled_mm_mxfp8_bias_preserves_eager_fallback():
+    qdata = torch.empty((128, 128), dtype=torch.float8_e4m3fn, device="cuda:0")
+    scales = torch.empty((128, 4), dtype=torch.float8_e8m0fnu, device="cuda:0")
+    bias = torch.empty(128, dtype=torch.bfloat16, device="cuda:0")
+    backend = ck.registry.get_capable_backend(
+        "scaled_mm_mxfp8",
+        {
+            "a": qdata,
+            "b": qdata,
+            "block_scale_a": scales,
+            "block_scale_b": scales,
+            "bias": bias,
+            "out_dtype": torch.bfloat16,
+        },
+    )
+    assert backend == "eager"
 
 
 @pytest.mark.skipif(not sm120_grouped_mxfp8_available, reason="SM120 grouped MXFP8 required")

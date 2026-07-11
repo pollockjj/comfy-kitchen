@@ -156,6 +156,20 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_gemm_mxfp8(
+        const void* activation_ptr,
+        const void* activation_scale_ptr,
+        const void* weight_ptr,
+        const void* weight_scale_ptr,
+        void* output_ptr,
+        int64_t m,
+        int64_t n,
+        int64_t k,
+        int tactic,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     bool launch_cutlass_fused_moe_mxfp8(
         const void* input,
         const int32_t* expert_ids,
@@ -748,6 +762,50 @@ void cutlass_grouped_gemm_mxfp8(
             output.data(), num_groups, group_m, n, k, out_dtype_code, workspace.data(),
             workspace.size(), stream)) {
         throw std::runtime_error("CUTLASS grouped MXFP8 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_gemm_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activation,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> activation_scale,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> weight_scale,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int tactic,
+    uintptr_t stream_ptr) {
+
+    const int64_t m = activation.shape(0);
+    const int64_t k = activation.shape(1);
+    const int64_t n = weight.shape(0);
+    const int64_t scale_k = ((k / 32) + 3) / 4 * 4;
+    const int64_t scale_m = ((m + 127) / 128) * 128;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+
+    if (m <= 0 || n <= 0 || k <= 0 || m % 32 || n % 32 || k % 32) {
+        throw std::runtime_error("dense MXFP8 M, N, and K must be positive multiples of 32");
+    }
+    if (weight.shape(1) != k) {
+        throw std::runtime_error("dense MXFP8 operand K dimensions must match");
+    }
+    if (activation_scale.shape(0) != scale_m || activation_scale.shape(1) != scale_k) {
+        throw std::runtime_error("dense MXFP8 activation scale shape mismatch");
+    }
+    if (weight_scale.shape(0) != scale_n || weight_scale.shape(1) != scale_k) {
+        throw std::runtime_error("dense MXFP8 weight scale shape mismatch");
+    }
+    if (output.shape(0) != m || output.shape(1) != n || map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("dense MXFP8 output must be BF16 with shape [M, N]");
+    }
+    if (tactic != 0 && tactic != 1 && tactic != 4 && tactic != 5) {
+        throw std::runtime_error("dense MXFP8 tactic must be one of 0, 1, 4, or 5");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_gemm_mxfp8(
+            activation.data(), activation_scale.data(), weight.data(), weight_scale.data(),
+            output.data(), m, n, k, tactic, workspace.data(), workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS dense MXFP8 GEMM is unavailable for this configuration");
     }
 }
 
@@ -2551,6 +2609,17 @@ NB_MODULE(_C, m) {
           nb::arg("workspace"),
           nb::arg("group_m"),
           nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_gemm_mxfp8", &cutlass_gemm_mxfp8,
+          "CUTLASS SM120 persistent dense MXFP8 GEMM",
+          nb::arg("activation"),
+          nb::arg("activation_scale"),
+          nb::arg("weight"),
+          nb::arg("weight_scale"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("tactic"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_fused_moe_mxfp8", &cutlass_fused_moe_mxfp8,
