@@ -51,6 +51,7 @@ __all__ = [
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
+    "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -424,6 +425,11 @@ def fused_moe_mxfp8(
     }
     impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def release_cuda_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Release Kitchen workspaces after a caller has synchronized and retired a CUDA stream."""
+    return _cuda_backend.release_stream_workspaces(stream)
 
 
 def quantize_mxfp8(

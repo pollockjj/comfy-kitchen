@@ -59,6 +59,7 @@ __all__ = [
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
+    "release_stream_workspaces",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
 ]
@@ -339,6 +340,17 @@ def _get_fused_moe_workspace(x: torch.Tensor, stream_ptr: int) -> torch.Tensor:
         workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
         _fused_moe_workspaces[key] = workspace
     return workspace
+
+
+def release_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Release cached workspaces owned by a synchronized CUDA stream."""
+    if not isinstance(stream, torch.cuda.Stream):
+        raise TypeError("stream must be a torch.cuda.Stream")
+    device = stream.device
+    device_index = device.index if isinstance(device, torch.device) else int(device)
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return _fused_moe_workspaces.pop((device_index, int(stream.cuda_stream)), None) is not None
 
 
 def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
