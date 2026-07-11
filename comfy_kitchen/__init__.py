@@ -41,6 +41,7 @@ __all__ = [
     "dequantize_nvfp4",
     "quantize_mxfp8",
     "dequantize_mxfp8",
+    "mxfp8_embedding",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
@@ -521,6 +522,41 @@ def dequantize_mxfp8(
     """
     dtype_code = DTYPE_TO_CODE[output_type]
     return torch.ops.comfy_kitchen.dequantize_mxfp8(qx, block_scales, dtype_code)
+
+
+def mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Return selected rows from an MXFP8 embedding without full dequantization."""
+    if qweight.dtype != torch.float8_e4m3fn or qweight.ndim != 2:
+        raise ValueError("mxfp8_embedding requires a 2D float8_e4m3fn qweight")
+    if block_scales.dtype != torch.float8_e8m0fnu or block_scales.ndim != 2:
+        raise ValueError("mxfp8_embedding requires 2D float8_e8m0fnu block scales")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("mxfp8_embedding indices must be int32 or int64")
+    if indices.numel() == 0:
+        raise ValueError("mxfp8_embedding requires at least one index")
+    if qweight.device != block_scales.device or qweight.device != indices.device:
+        raise ValueError("mxfp8_embedding tensors must share one device")
+    if output_type not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("mxfp8_embedding output_type must be float32, float16, or bfloat16")
+
+    leading_shape = tuple(indices.shape)
+    flat_indices = indices.reshape(-1).contiguous()
+    output, invalid = torch.ops.comfy_kitchen.mxfp8_embedding(
+        qweight,
+        block_scales,
+        flat_indices,
+        DTYPE_TO_CODE[output_type],
+    )
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(invalid == 0, "mxfp8_embedding index out of range")
+    elif invalid.item() != 0:
+        raise IndexError("mxfp8_embedding index out of range")
+    return output.reshape(*leading_shape, qweight.shape[1])
 
 
 def scaled_mm_mxfp8(

@@ -17,6 +17,7 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
+    "mxfp8_embedding",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -61,6 +62,7 @@ from .quantization import (
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
     int8_linear,
+    mxfp8_embedding,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -417,6 +419,24 @@ def _build_constraints() -> dict:
                     ),
                     "block_scales": ParamConstraint(
                         dtypes=frozenset({torch.float8_e8m0fnu}),
+                    ),
+                    "output_type": ParamConstraint(dtypes=standard_floats),
+                },
+                default_devices=all_devices)
+
+        out["mxfp8_embedding"] = FunctionConstraints(
+                params={
+                    "qweight": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "indices": ParamConstraint(
+                        dtypes=frozenset({torch.int32, torch.int64}),
+                        shape_rules=(ExactDims(1),),
                     ),
                     "output_type": ParamConstraint(dtypes=standard_floats),
                 },

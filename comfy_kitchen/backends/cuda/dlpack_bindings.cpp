@@ -280,6 +280,19 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    void launch_mxfp8_embedding_kernel(
+        const void* qweight,
+        const void* block_scales,
+        const void* indices,
+        void* output,
+        int32_t* invalid,
+        int64_t num_embeddings,
+        int64_t embedding_dim,
+        int64_t num_indices,
+        int index_bits,
+        int output_dtype_code,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -1092,6 +1105,74 @@ void quantize_mxfp8(
         orig_rows,
         orig_cols,
         input_dtype_code,
+        stream);
+}
+
+void mxfp8_embedding(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> qweight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> block_scales,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> indices,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    int output_dtype_code,
+    uintptr_t stream_ptr)
+{
+    const int64_t num_embeddings = static_cast<int64_t>(qweight.shape(0));
+    const int64_t embedding_dim = static_cast<int64_t>(qweight.shape(1));
+    const int64_t num_indices = static_cast<int64_t>(indices.shape(0));
+    if (num_embeddings <= 0 || embedding_dim <= 0 || num_indices <= 0) {
+        throw std::runtime_error("mxfp8_embedding requires non-empty weights and indices");
+    }
+    if (embedding_dim % 32 != 0) {
+        throw std::runtime_error("mxfp8_embedding requires embedding_dim divisible by 32");
+    }
+    if (map_dtype_to_code(qweight.dtype()) != 5 || map_dtype_to_code(block_scales.dtype()) != 5) {
+        throw std::runtime_error("mxfp8_embedding requires E4M3 weights and E8M0 scales");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2
+        || map_dtype_to_code(output.dtype()) != output_dtype_code) {
+        throw std::runtime_error("mxfp8_embedding output dtype mismatch");
+    }
+
+    const nb::dlpack::dtype index_dtype = indices.dtype();
+    if (index_dtype.code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int)
+        || (index_dtype.bits != 32 && index_dtype.bits != 64)) {
+        throw std::runtime_error("mxfp8_embedding indices must be int32 or int64");
+    }
+    const int index_bits = static_cast<int>(index_dtype.bits);
+
+    const int64_t scale_rows = ((num_embeddings + 127) / 128) * 128;
+    const int64_t scale_block_cols = embedding_dim / 32;
+    const int64_t scale_cols = ((scale_block_cols + 3) / 4) * 4;
+    if (static_cast<int64_t>(block_scales.size()) < scale_rows * scale_cols) {
+        throw std::runtime_error("mxfp8_embedding block scale storage is too small");
+    }
+    if (static_cast<int64_t>(output.shape(0)) != num_indices
+        || static_cast<int64_t>(output.shape(1)) != embedding_dim
+        || static_cast<int64_t>(invalid.size()) != 1) {
+        throw std::runtime_error("mxfp8_embedding output shape mismatch");
+    }
+
+    const int device = qweight.device_id();
+    if (block_scales.device_id() != device
+        || indices.device_id() != device
+        || output.device_id() != device
+        || invalid.device_id() != device) {
+        throw std::runtime_error("mxfp8_embedding tensors must share one CUDA device");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_mxfp8_embedding_kernel(
+        qweight.data(),
+        block_scales.data(),
+        indices.data(),
+        output.data(),
+        invalid.data(),
+        num_embeddings,
+        embedding_dim,
+        num_indices,
+        index_bits,
+        output_dtype_code,
         stream);
 }
 
@@ -2933,6 +3014,16 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("mxfp8_embedding", &mxfp8_embedding,
+          "Dequantize selected MXFP8 embedding rows without materializing the full matrix",
+          nb::arg("qweight"),
+          nb::arg("block_scales"),
+          nb::arg("indices"),
+          nb::arg("output"),
+          nb::arg("invalid"),
+          nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,

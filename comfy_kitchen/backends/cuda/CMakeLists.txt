@@ -104,6 +104,7 @@ set(CUDA_SOURCES
     ops/per_tensor_quantize.cu
     ops/quantize_nvfp4.cu
     ops/quantize_mxfp8.cu
+    ops/mxfp8_embedding.cu
     ops/cublas_gemm_nvfp4.cu
     ops/cutlass_grouped_gemm_nvfp4.cu
     ops/cutlass_grouped_gemm_mxfp8.cu

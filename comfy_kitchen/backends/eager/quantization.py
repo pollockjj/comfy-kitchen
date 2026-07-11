@@ -366,6 +366,42 @@ def dequantize_mxfp8(
     return data_dequantized.reshape(orig_shape).to(output_type)
 
 
+def mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize only the requested MXFP8 rows using native swizzled scales."""
+    rows, cols = qweight.shape
+    block_cols = cols // MXFP8_BLOCK_SIZE
+    selected = qweight.index_select(0, indices).to(torch.float32)
+
+    row_ids = indices.to(torch.int64)
+    block_ids = torch.arange(block_cols, dtype=torch.int64, device=indices.device)
+    row_block = row_ids // 128
+    row_remainder = row_ids % 128
+    d4 = row_remainder // 32
+    d3 = row_remainder % 32
+    column_block_group = block_ids // 4
+    d5 = block_ids % 4
+    column_block_group_count = (block_cols + 3) // 4
+    offsets = (
+        ((row_block[:, None] * column_block_group_count + column_block_group[None, :]) * 32
+         + d3[:, None]) * 16
+        + d4[:, None] * 4
+        + d5[None, :]
+    )
+    scale_bytes = block_scales.view(torch.uint8).flatten()[offsets]
+    scales = e8m0_to_f32(scale_bytes)
+    output = (
+        selected.reshape(indices.numel(), block_cols, MXFP8_BLOCK_SIZE)
+        * scales.unsqueeze(-1)
+    ).reshape(indices.numel(), cols).to(output_type)
+    invalid = torch.zeros((), dtype=torch.int32, device=qweight.device)
+    return output, invalid
+
+
 def scaled_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -707,6 +743,36 @@ def _op_dequantize_mxfp8(
 def _op_dequantize_mxfp8_fake(qx, block_scales, output_dtype_code):
     output_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty_like(qx, dtype=output_dtype)
+
+
+@torch.library.custom_op("comfy_kitchen::mxfp8_embedding", mutates_args=())
+def _op_mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_dtype_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_type = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "qweight": qweight,
+        "block_scales": block_scales,
+        "indices": indices,
+        "output_type": output_type,
+    }
+    impl = registry.get_implementation("mxfp8_embedding", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_mxfp8_embedding.register_fake
+def _op_mxfp8_embedding_fake(qweight, block_scales, indices, output_dtype_code):
+    output_type = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    output = torch.empty(
+        (indices.numel(), qweight.shape[1]),
+        dtype=output_type,
+        device=qweight.device,
+    )
+    invalid = torch.empty((), dtype=torch.int32, device=qweight.device)
+    return output, invalid
 
 
 @torch.library.custom_op("comfy_kitchen::scaled_mm_mxfp8", mutates_args=())
