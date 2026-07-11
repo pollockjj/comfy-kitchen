@@ -1804,8 +1804,8 @@ def fused_moe_mxfp8(
         raise ValueError("fused MXFP8 MoE input must be contiguous 2D float16 or bfloat16")
     if x.shape[0] not in (256, 340) or x.shape[1] != 2816:
         raise ValueError("fused MXFP8 MoE input shape must be [256|340, 2816]")
-    if expert_ids.shape != (x.shape[0], 6):
-        raise ValueError("expert_ids must be [num_tokens, 6]")
+    if expert_ids.shape != (x.shape[0], 8):
+        raise ValueError("expert_ids must be [num_tokens, 8]")
     if (
         router_weights.dtype != torch.float32
         or router_weights.shape != expert_ids.shape

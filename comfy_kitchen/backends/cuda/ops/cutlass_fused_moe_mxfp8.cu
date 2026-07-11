@@ -53,7 +53,7 @@ constexpr int kValuesPerThread = 8;
 constexpr int kThreadsPerQuantGroup = kBlockSize / kValuesPerThread;
 constexpr int kQuantThreads = 256;
 constexpr int kScaleRowAlignment = 128;
-constexpr int kTopK = 6;
+constexpr int kTopK = 8;
 
 class WorkspaceArena {
 public:

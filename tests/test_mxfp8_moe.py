@@ -19,7 +19,7 @@ sm120_fused_mxfp8_available = (
 NUM_EXPERTS = 128
 HIDDEN_SIZE = 2816
 INTERMEDIATE_SIZE = 704
-TOP_K = 6
+TOP_K = 8
 
 
 def _quantize_expert_templates(templates):
