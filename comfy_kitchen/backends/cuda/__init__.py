@@ -1598,7 +1598,7 @@ def mxfp8_embedding(
     invalid = torch.empty((), dtype=torch.int32, device=qweight.device)
     stream_ptr = torch.cuda.current_stream(qweight.device).cuda_stream
     _C.mxfp8_embedding(
-        _wrap_for_dlpack(qweight),
+        _wrap_for_dlpack(qweight.view(torch.uint8)),
         _wrap_for_dlpack(block_scales.view(torch.uint8)),
         _wrap_for_dlpack(indices),
         _wrap_for_dlpack(output),
