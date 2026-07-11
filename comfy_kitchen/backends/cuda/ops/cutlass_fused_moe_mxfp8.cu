@@ -18,7 +18,6 @@
 #include "utils.cuh"
 #include "float_utils.cuh"
 
-#include <cooperative_groups.h>
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -108,6 +107,52 @@ private:
     size_t offset_;
 };
 
+__global__ void count_and_rank_routes(
+    const int32_t* expert_ids,
+    int32_t* counts,
+    int32_t* route_rank,
+    int routes,
+    int num_experts) {
+    for (int route = blockIdx.x * blockDim.x + threadIdx.x;
+         route < routes;
+         route += blockDim.x * gridDim.x) {
+        const int expert = expert_ids[route];
+        route_rank[route] =
+            expert >= 0 && expert < num_experts ? atomicAdd(counts + expert, 1) : -1;
+    }
+}
+
+__global__ void prefix_and_place_routes(
+    const int32_t* expert_ids,
+    int32_t* counts,
+    int32_t* indptr,
+    const int32_t* route_rank,
+    int32_t* route_dest,
+    int routes,
+    int num_experts,
+    int scale_group_m) {
+    if (threadIdx.x == 0) {
+        int running = 0;
+        for (int expert = 0; expert < num_experts; ++expert) {
+            const int count = counts[expert] < scale_group_m ? counts[expert] : scale_group_m;
+            counts[expert] = count;
+            indptr[expert] = running;
+            running += count;
+        }
+        indptr[num_experts] = running;
+    }
+    __syncthreads();
+
+    for (int route = threadIdx.x; route < routes; route += blockDim.x) {
+        const int expert = expert_ids[route];
+        const int rank = route_rank[route];
+        route_dest[route] =
+            expert >= 0 && expert < num_experts && rank >= 0 && rank < scale_group_m
+                ? indptr[expert] + rank
+                : -1;
+    }
+}
+
 template <class T>
 __device__ __forceinline__ float lowp_to_float(T value);
 
@@ -173,188 +218,52 @@ __device__ __forceinline__ PackedMxfp8x8 quantize_eight(const InputType* values)
 }
 
 template <class InputType>
-__global__ void prepare_routes_and_quantize_input(
+__global__ void quantize_and_route_input_ranked(
     const InputType* input,
     const int32_t* expert_ids,
-    int32_t* counts,
-    int32_t* indptr,
-    int32_t* route_rank,
-    int32_t* route_dest,
+    const int32_t* route_rank,
+    const int32_t* route_dest,
     uint8_t* qdata,
-    uint8_t* input_block_scales,
-    uint8_t* intermediate_block_scales,
-    size_t input_scale_bytes,
-    size_t intermediate_scale_bytes,
-    int num_tokens,
+    uint8_t* block_scales,
     int hidden_size,
     int top_k,
-    int num_experts,
     int scale_group_m,
     int block_cols,
     int scale_storage_cols) {
-    cooperative_groups::grid_group grid = cooperative_groups::this_grid();
-    const int global_thread = blockIdx.x * blockDim.x + threadIdx.x;
-    const int global_threads = blockDim.x * gridDim.x;
-    const int routes = num_tokens * top_k;
-
-    for (int expert = global_thread; expert < num_experts; expert += global_threads) {
-        counts[expert] = 0;
-    }
-    for (size_t offset = static_cast<size_t>(global_thread); offset < input_scale_bytes;
-         offset += static_cast<size_t>(global_threads)) {
-        input_block_scales[offset] = 0;
-    }
-    for (size_t offset = static_cast<size_t>(global_thread);
-         offset < intermediate_scale_bytes;
-         offset += static_cast<size_t>(global_threads)) {
-        intermediate_block_scales[offset] = 0;
-    }
-    grid.sync();
-
-    for (int route = global_thread; route < routes; route += global_threads) {
-        const int expert = expert_ids[route];
-        route_rank[route] =
-            expert >= 0 && expert < num_experts ? atomicAdd(counts + expert, 1) : -1;
-    }
-    grid.sync();
-
-    if (global_thread == 0) {
-        int running = 0;
-        for (int expert = 0; expert < num_experts; ++expert) {
-            const int count = counts[expert] < scale_group_m ? counts[expert] : scale_group_m;
-            counts[expert] = count;
-            indptr[expert] = running;
-            running += count;
-        }
-        indptr[num_experts] = running;
-    }
-    grid.sync();
-
-    for (int route = global_thread; route < routes; route += global_threads) {
-        const int expert = expert_ids[route];
-        const int rank = route_rank[route];
-        route_dest[route] =
-            expert >= 0 && expert < num_experts && rank >= 0 && rank < scale_group_m
-                ? indptr[expert] + rank
-                : -1;
-    }
-    grid.sync();
-
+    const int token = blockIdx.x;
+    const InputType* input_row = input + static_cast<size_t>(token) * hidden_size;
     constexpr int groups_per_block = kQuantThreads / kThreadsPerQuantGroup;
     const int group_in_block = threadIdx.x / kThreadsPerQuantGroup;
     const int lane_in_group = threadIdx.x & (kThreadsPerQuantGroup - 1);
 
-    for (int token = blockIdx.x; token < num_tokens; token += gridDim.x) {
-        const InputType* input_row = input + static_cast<size_t>(token) * hidden_size;
-        for (int block_col = group_in_block; block_col < block_cols;
-             block_col += groups_per_block) {
-            const int col = block_col * kBlockSize + lane_in_group * kValuesPerThread;
-            const PackedMxfp8x8 packed = quantize_eight(input_row + col);
+    for (int block_col = group_in_block; block_col < block_cols;
+         block_col += groups_per_block) {
+        const int col = block_col * kBlockSize + lane_in_group * kValuesPerThread;
+        const PackedMxfp8x8 packed = quantize_eight(input_row + col);
 #pragma unroll
-            for (int position = 0; position < kTopK; ++position) {
-                if (position >= top_k) {
-                    break;
-                }
-                const int route = token * top_k + position;
-                const int dest = route_dest[route];
-                if (dest < 0) {
-                    continue;
-                }
-                uint8_t* qrow = qdata + static_cast<size_t>(dest) * hidden_size;
-                *reinterpret_cast<uint64_t*>(qrow + col) = packed.values;
-                if (lane_in_group == 0) {
-                    const int expert = expert_ids[route];
-                    const int rank = route_rank[route];
-                    uint8_t* scale_base =
-                        input_block_scales + static_cast<size_t>(expert) * scale_group_m *
-                            scale_storage_cols;
-                    const size_t scale_offset =
-                        scale_factor_swizzled_offset(rank, block_col, block_cols);
-                    scale_base[scale_offset] = packed.scale;
-                }
+        for (int position = 0; position < kTopK; ++position) {
+            if (position >= top_k) {
+                break;
+            }
+            const int route = token * top_k + position;
+            const int dest = route_dest[route];
+            if (dest < 0) {
+                continue;
+            }
+            uint8_t* qrow = qdata + static_cast<size_t>(dest) * hidden_size;
+            *reinterpret_cast<uint64_t*>(qrow + col) = packed.values;
+            if (lane_in_group == 0) {
+                const int expert = expert_ids[route];
+                const int rank = route_rank[route];
+                uint8_t* scale_base =
+                    block_scales + static_cast<size_t>(expert) * scale_group_m *
+                        scale_storage_cols;
+                const size_t scale_offset =
+                    scale_factor_swizzled_offset(rank, block_col, block_cols);
+                scale_base[scale_offset] = packed.scale;
             }
         }
     }
-}
-
-template <class InputType>
-bool launch_prepare_routes_and_quantize_input(
-    const void* input_raw,
-    const int32_t* expert_ids,
-    int32_t* counts,
-    int32_t* indptr,
-    int32_t* route_rank,
-    int32_t* route_dest,
-    uint8_t* qdata,
-    uint8_t* input_block_scales,
-    uint8_t* intermediate_block_scales,
-    size_t input_scale_bytes,
-    size_t intermediate_scale_bytes,
-    int num_tokens,
-    int hidden_size,
-    int top_k,
-    int num_experts,
-    int scale_group_m,
-    int block_cols,
-    int scale_storage_cols,
-    cudaStream_t stream) {
-    int device = 0;
-    if (cudaGetDevice(&device) != cudaSuccess) {
-        return false;
-    }
-    thread_local int cached_device = -1;
-    thread_local int cached_resident_blocks = 0;
-    if (cached_device != device) {
-        int cooperative_launch = 0;
-        int multiprocessor_count = 0;
-        int active_blocks_per_multiprocessor = 0;
-        if (cudaDeviceGetAttribute(
-                &cooperative_launch, cudaDevAttrCooperativeLaunch, device) != cudaSuccess ||
-            cooperative_launch == 0 ||
-            cudaDeviceGetAttribute(
-                &multiprocessor_count, cudaDevAttrMultiProcessorCount, device) != cudaSuccess ||
-            cudaOccupancyMaxActiveBlocksPerMultiprocessor(
-                &active_blocks_per_multiprocessor,
-                prepare_routes_and_quantize_input<InputType>,
-                kQuantThreads,
-                0) != cudaSuccess ||
-            multiprocessor_count <= 0 || active_blocks_per_multiprocessor <= 0) {
-            return false;
-        }
-        cached_device = device;
-        cached_resident_blocks = multiprocessor_count * active_blocks_per_multiprocessor;
-    }
-
-    const int grid_blocks =
-        num_tokens < cached_resident_blocks ? num_tokens : cached_resident_blocks;
-    const InputType* input = static_cast<const InputType*>(input_raw);
-    void* arguments[] = {
-        &input,
-        &expert_ids,
-        &counts,
-        &indptr,
-        &route_rank,
-        &route_dest,
-        &qdata,
-        &input_block_scales,
-        &intermediate_block_scales,
-        &input_scale_bytes,
-        &intermediate_scale_bytes,
-        &num_tokens,
-        &hidden_size,
-        &top_k,
-        &num_experts,
-        &scale_group_m,
-        &block_cols,
-        &scale_storage_cols,
-    };
-    return cudaLaunchCooperativeKernel(
-               reinterpret_cast<const void*>(prepare_routes_and_quantize_input<InputType>),
-               dim3(grid_blocks),
-               dim3(kQuantThreads),
-               arguments,
-               0,
-               stream) == cudaSuccess;
 }
 
 template <class OutputType>
@@ -517,11 +426,34 @@ bool run_fused_moe_mxfp8(
         static_cast<size_t>(e) * scale_group_m * input_scale_cols;
     const size_t intermediate_scale_bytes =
         static_cast<size_t>(e) * scale_group_m * intermediate_scale_cols;
-    if (!launch_prepare_routes_and_quantize_input<OutputType>(
-            input, expert_ids, counts, indptr, route_rank, route_dest, qx,
-            input_block_scales, intermediate_block_scales, input_scale_bytes,
-            intermediate_scale_bytes, n, h, top_k, e, scale_group_m,
-            input_block_cols, input_scale_cols, stream)) {
+    if (cudaMemsetAsync(input_block_scales, 0, input_scale_bytes, stream) != cudaSuccess ||
+        cudaMemsetAsync(
+            intermediate_block_scales, 0, intermediate_scale_bytes, stream) != cudaSuccess) {
+        return false;
+    }
+    if (cudaMemsetAsync(counts, 0, static_cast<size_t>(e) * sizeof(int32_t), stream) !=
+        cudaSuccess) {
+        return false;
+    }
+    const int route_blocks = (routes + 255) / 256;
+    last_error_stage = 4;
+    count_and_rank_routes<<<route_blocks, 256, 0, stream>>>(
+        expert_ids, counts, route_rank, routes, e);
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        return false;
+    }
+    last_error_stage = 5;
+    prefix_and_place_routes<<<1, 256, 0, stream>>>(
+        expert_ids, counts, indptr, route_rank, route_dest, routes, e, scale_group_m);
+    if (cudaPeekAtLastError() != cudaSuccess) {
+        return false;
+    }
+
+    last_error_stage = 6;
+    quantize_and_route_input_ranked<OutputType><<<n, kQuantThreads, 0, stream>>>(
+        static_cast<const OutputType*>(input), expert_ids, route_rank, route_dest, qx,
+        input_block_scales, h, top_k, scale_group_m, input_block_cols, input_scale_cols);
+    if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
 
