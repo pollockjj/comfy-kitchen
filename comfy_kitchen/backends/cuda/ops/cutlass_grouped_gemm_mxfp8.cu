@@ -45,8 +45,6 @@ enum class DgMxfp8CtaShape {
     k128x32x128,
     k128x64x128,
     k128x128x128,
-    k256x128x128,
-    k128x256x128,
 };
 
 constexpr char kDgMxfp8Fc1CtaShapeEnv[] =
@@ -65,16 +63,9 @@ DgMxfp8CtaShape parse_dg_mxfp8_cta_shape(const char* name) {
     if (std::string(value) == "128x128x128") {
         return DgMxfp8CtaShape::k128x128x128;
     }
-    if (std::string(value) == "256x128x128") {
-        return DgMxfp8CtaShape::k256x128x128;
-    }
-    if (std::string(value) == "128x256x128") {
-        return DgMxfp8CtaShape::k128x256x128;
-    }
     throw std::invalid_argument(
         std::string(name) + "='" + value +
-        "' is invalid; expected one of 128x32x128, 128x64x128, 128x128x128, "
-        "256x128x128, or 128x256x128");
+        "' is invalid; expected one of 128x32x128, 128x64x128, or 128x128x128");
 }
 
 struct DgMxfp8CtaConfig {
@@ -431,16 +422,6 @@ bool run_selected_grouped_mxfp8(
                 workspace_size, stream);
         case DgMxfp8CtaShape::k128x128x128:
             return run_grouped_mxfp8<128, 128, 128, ElementD>(
-                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-                workspace_size, stream);
-        case DgMxfp8CtaShape::k256x128x128:
-            return run_grouped_mxfp8<256, 128, 128, ElementD>(
-                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-                workspace_size, stream);
-        case DgMxfp8CtaShape::k128x256x128:
-            return run_grouped_mxfp8<128, 256, 128, ElementD>(
                 activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
                 output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
                 workspace_size, stream);
