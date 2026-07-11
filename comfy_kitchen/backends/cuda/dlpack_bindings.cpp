@@ -171,6 +171,22 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_grouped_gemm_mxfp8_variable(
+        const void* activation_ptr,
+        const void* activation_scale_ptr,
+        const void* weight_ptr,
+        const void* weight_scale_ptr,
+        void* output_ptr,
+        const int32_t* m_indptr_ptr,
+        int64_t num_groups,
+        int64_t scale_group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     bool launch_cutlass_fused_moe_mxfp8(
         const void* input,
         const int32_t* expert_ids,
@@ -191,6 +207,14 @@ extern "C" {
         cudaStream_t stream);
 
     bool launch_dg_mxfp8_mma_probe(
+        const void* weights,
+        const uint8_t* weight_scales,
+        const void* activations,
+        const uint8_t* activation_scales,
+        void* output,
+        cudaStream_t stream);
+
+    bool launch_dg_mxfp8_fc2_n8(
         const void* weights,
         const uint8_t* weight_scales,
         const void* activations,
@@ -868,6 +892,60 @@ void dg_mxfp8_mma_probe(
             weights.data(), weight_scales.data(), activations.data(),
             activation_scales.data(), output.data(), stream)) {
         throw std::runtime_error("DG MXFP8 SM120 m16n8k32 probe is unavailable");
+    }
+}
+
+void dg_mxfp8_fc2_n8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    uintptr_t stream_ptr) {
+    if (weights.shape(0) != 2816 || weights.shape(1) != 704 ||
+        weight_scales.shape(0) != 2816 || weight_scales.shape(1) != 24 ||
+        activations.shape(0) != 8 || activations.shape(1) != 704 ||
+        activation_scales.shape(0) != 128 || activation_scales.shape(1) != 24 ||
+        output.shape(0) != 8 || output.shape(1) != 2816 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error(
+            "DG MXFP8 FC2 N8 requires weights [2816,704], weight scales "
+            "[2816,24], activations [8,704], activation scales [128,24], "
+            "and BF16 output [8,2816]");
+    }
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_dg_mxfp8_fc2_n8(
+            weights.data(), weight_scales.data(), activations.data(),
+            activation_scales.data(), output.data(), stream)) {
+        throw std::runtime_error("DG MXFP8 SM120 FC2 N8 kernel is unavailable");
+    }
+}
+
+void dg_mxfp8_fc2_n8_cutlass_control(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> weights,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> weight_scales,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> m_indptr,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+    if (activations.shape(0) != 8 || activations.shape(1) != 704 ||
+        activation_scales.shape(0) != 1 || activation_scales.shape(1) != 128 ||
+        activation_scales.shape(2) != 24 ||
+        weights.shape(0) != 1 || weights.shape(1) != 2816 || weights.shape(2) != 704 ||
+        weight_scales.shape(0) != 1 || weight_scales.shape(1) != 2816 ||
+        weight_scales.shape(2) != 24 || m_indptr.shape(0) != 2 ||
+        output.shape(0) != 8 || output.shape(1) != 2816 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control shape mismatch");
+    }
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_grouped_gemm_mxfp8_variable(
+            activations.data(), activation_scales.data(), weights.data(),
+            weight_scales.data(), output.data(), m_indptr.data(), 1, 128, 2816,
+            704, 2, workspace.data(), static_cast<int64_t>(workspace.size()), stream)) {
+        throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control failed");
     }
 }
 
@@ -2708,6 +2786,26 @@ NB_MODULE(_C, m) {
           nb::arg("activations"),
           nb::arg("activation_scales"),
           nb::arg("output"),
+          nb::arg("stream_ptr"));
+
+    m.def("_dg_mxfp8_fc2_n8", &dg_mxfp8_fc2_n8,
+          "Internal fixed-shape DG MXFP8 FC2 N8 kernel",
+          nb::arg("weights"),
+          nb::arg("weight_scales"),
+          nb::arg("activations"),
+          nb::arg("activation_scales"),
+          nb::arg("output"),
+          nb::arg("stream_ptr"));
+
+    m.def("_dg_mxfp8_fc2_n8_cutlass_control", &dg_mxfp8_fc2_n8_cutlass_control,
+          "Internal variable-group CUTLASS control for DG MXFP8 FC2 N8",
+          nb::arg("activations"),
+          nb::arg("activation_scales"),
+          nb::arg("weights"),
+          nb::arg("weight_scales"),
+          nb::arg("m_indptr"),
+          nb::arg("output"),
+          nb::arg("workspace"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_fused_moe_nvfp4", &cutlass_fused_moe_nvfp4,
