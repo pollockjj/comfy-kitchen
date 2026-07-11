@@ -17,10 +17,8 @@
 
 #include <cuda_runtime.h>
 
-#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
-#include <string>
 
 #ifdef COMFY_HAVE_CUTLASS
 #include "cute/tensor.hpp"
@@ -40,56 +38,6 @@ namespace {
 #ifdef COMFY_HAVE_CUTLASS
 
 using namespace cute;
-
-enum class DgMxfp8CtaShape {
-    k128x32x128,
-    k128x64x128,
-    k128x128x128,
-};
-
-constexpr char kDgMxfp8Fc1CtaShapeEnv[] =
-    "COMFY_KITCHEN_DG_MXFP8_FC1_CTA_SHAPE";
-constexpr char kDgMxfp8Fc2CtaShapeEnv[] =
-    "COMFY_KITCHEN_DG_MXFP8_FC2_CTA_SHAPE";
-
-DgMxfp8CtaShape parse_dg_mxfp8_cta_shape(const char* name) {
-    const char* value = std::getenv(name);
-    if (value == nullptr || value[0] == '\0' || std::string(value) == "128x32x128") {
-        return DgMxfp8CtaShape::k128x32x128;
-    }
-    if (std::string(value) == "128x64x128") {
-        return DgMxfp8CtaShape::k128x64x128;
-    }
-    if (std::string(value) == "128x128x128") {
-        return DgMxfp8CtaShape::k128x128x128;
-    }
-    throw std::invalid_argument(
-        std::string(name) + "='" + value +
-        "' is invalid; expected one of 128x32x128, 128x64x128, or 128x128x128");
-}
-
-struct DgMxfp8CtaConfig {
-    DgMxfp8CtaShape fc1;
-    DgMxfp8CtaShape fc2;
-};
-
-const DgMxfp8CtaConfig& dg_mxfp8_cta_config() {
-    static const DgMxfp8CtaConfig config{
-        parse_dg_mxfp8_cta_shape(kDgMxfp8Fc1CtaShapeEnv),
-        parse_dg_mxfp8_cta_shape(kDgMxfp8Fc2CtaShapeEnv),
-    };
-    return config;
-}
-
-DgMxfp8CtaShape select_grouped_mxfp8_cta_shape(int n, int k) {
-    if (n == 1408 && k == 2816) {
-        return dg_mxfp8_cta_config().fc1;
-    }
-    if (n == 2816 && k == 704) {
-        return dg_mxfp8_cta_config().fc2;
-    }
-    return DgMxfp8CtaShape::k128x32x128;
-}
 
 class WorkspaceArena {
 public:
@@ -408,25 +356,16 @@ bool run_selected_grouped_mxfp8(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
-    const DgMxfp8CtaShape shape = select_grouped_mxfp8_cta_shape(n, k);
-    switch (shape) {
-        case DgMxfp8CtaShape::k128x32x128:
-            return run_grouped_mxfp8<128, 32, 128, ElementD>(
-                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-                workspace_size, stream);
-        case DgMxfp8CtaShape::k128x64x128:
-            return run_grouped_mxfp8<128, 64, 128, ElementD>(
-                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-                workspace_size, stream);
-        case DgMxfp8CtaShape::k128x128x128:
-            return run_grouped_mxfp8<128, 128, 128, ElementD>(
-                activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-                output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-                workspace_size, stream);
+    if (n == 2816 && k == 704) {
+        return run_grouped_mxfp8<128, 64, 128, ElementD>(
+            activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+            workspace_size, stream);
     }
-    throw std::logic_error("unhandled DG MXFP8 CTA shape");
+    return run_grouped_mxfp8<128, 32, 128, ElementD>(
+        activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+        output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+        workspace_size, stream);
 }
 
 #endif

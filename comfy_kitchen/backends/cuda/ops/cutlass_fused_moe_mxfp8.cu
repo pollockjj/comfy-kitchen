@@ -465,8 +465,6 @@ bool run_fused_moe_mxfp8(
                 static_cast<int64_t>(gemm_workspace_size), stream)) {
             return false;
         }
-    } catch (const std::invalid_argument&) {
-        throw;
     } catch (...) {
         return false;
     }
@@ -487,8 +485,6 @@ bool run_fused_moe_mxfp8(
                 static_cast<int64_t>(gemm_workspace_size), stream)) {
             return false;
         }
-    } catch (const std::invalid_argument&) {
-        throw;
     } catch (...) {
         return false;
     }
