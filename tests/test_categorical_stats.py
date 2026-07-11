@@ -78,3 +78,31 @@ def test_softcap_scale_is_bit_exact(backend, cuda_available):
     assert output.dtype == torch.float32
     assert output.shape == raw_logits.shape
     assert torch.equal(output, reference)
+
+
+@pytest.mark.parametrize("backend", ["eager", "cuda"])
+def test_softcap_categorical_stats_sample_matches_composed_ops(backend, cuda_available):
+    device = "cuda" if backend == "cuda" else "cpu"
+    if backend == "cuda" and not cuda_available:
+        pytest.skip("CUDA unavailable")
+    if backend not in get_capable_backends("softcap_categorical_stats_sample", device):
+        pytest.skip(f"backend '{backend}' is not capable")
+
+    raw = torch.linspace(-64, 64, 1542, device=device).to(torch.bfloat16).reshape(2, 3, 257)
+    raw[..., 3] = raw[..., 7] = 64
+    noise = torch.linspace(1, 2, raw.numel(), dtype=torch.float32, device=device).reshape(raw.shape)
+    noise[..., 3] = noise[..., 7] = 0.5
+    with ck.use_backend(backend):
+        processed_ref = ck.softcap_scale(raw, 30.0, 1.25)
+        entropy_ref, argmax_ref, sample_ref = ck.categorical_stats_sample(processed_ref, noise)
+        processed, self_conditioning, entropy, argmax, sample = (
+            ck.softcap_categorical_stats_sample(raw, noise, 30.0, 1.25)
+        )
+
+    assert torch.equal(processed, processed_ref)
+    assert torch.equal(self_conditioning, processed_ref.to(torch.bfloat16))
+    torch.testing.assert_close(entropy, entropy_ref, rtol=1e-5, atol=1e-5)
+    assert torch.equal(argmax, argmax_ref)
+    assert torch.equal(sample, sample_ref)
+    assert torch.equal(argmax, torch.full_like(argmax, 3))
+    assert torch.equal(sample, torch.full_like(sample, 3))
