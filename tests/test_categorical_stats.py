@@ -21,22 +21,13 @@ def test_categorical_stats_matches_torch(backend, cuda_available, seed):
     with ck.use_backend(backend):
         probs, entropy, argmax = ck.categorical_stats(logits)
 
-    assert probs.shape == logits.shape
-    assert entropy.shape == logits.shape[:-1]
-    assert argmax.shape == logits.shape[:-1]
+    assert (probs.shape, entropy.shape, argmax.shape) == (
+        logits.shape, logits.shape[:-1], logits.shape[:-1]
+    )
     assert argmax.dtype == torch.int64
     torch.testing.assert_close(probs, reference.probs, rtol=1e-5, atol=1e-7)
     torch.testing.assert_close(entropy, reference.entropy(), rtol=1e-5, atol=1e-5)
     assert torch.equal(argmax, logits.argmax(dim=-1))
-
-
-def test_categorical_stats_preserves_single_row_shape(seed):
-    logits = torch.randn(97, dtype=torch.float32)
-    probs, entropy, argmax = ck.categorical_stats(logits)
-    assert probs.shape == logits.shape
-    assert entropy.shape == torch.Size([])
-    assert argmax.shape == torch.Size([])
-
 
 def test_categorical_stats_rejects_unsupported_storage():
     with pytest.raises(ValueError, match="float32"):
