@@ -66,250 +66,6 @@ private:
     size_t offset_;
 };
 
-/*
- * The narrow-N mainloop builder below is adapted from NVIDIA CUTLASS's
- * sm120_blockscaled_mma_builder.inl.
- *
- * Copyright (c) 2025 - 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
- * SPDX-License-Identifier: BSD-3-Clause
- *
- * Redistribution and use in source and binary forms, with or without
- * modification, are permitted provided that the following conditions are met:
- *
- * 1. Redistributions of source code must retain the above copyright notice,
- * this list of conditions and the following disclaimer.
- * 2. Redistributions in binary form must reproduce the above copyright notice,
- * this list of conditions and the following disclaimer in the documentation
- * and/or other materials provided with the distribution.
- * 3. Neither the name of the copyright holder nor the names of its contributors
- * may be used to endorse or promote products derived from this software without
- * specific prior written permission.
- *
- * THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS "AS IS"
- * AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE
- * IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR A PARTICULAR PURPOSE ARE
- * DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT HOLDER OR CONTRIBUTORS BE LIABLE
- * FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR CONSEQUENTIAL
- * DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
- * SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER
- * CAUSED AND ON ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY,
- * OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
- * OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
- */
-
-namespace cutlass_collective = cutlass::gemm::collective;
-namespace cutlass_collective_detail = cutlass::gemm::collective::detail;
-
-template <class TileShapeMNK, class ClusterShapeMNK, class StageCountType>
-struct DgNarrowMxfp8MainloopBuilder {
-    using ElementPair = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-    using ElementScale = typename cutlass_collective_detail::blockscaled::blockscaled_type<
-        cutlass_collective::KernelScheduleAuto, ElementPair>::sf_type;
-    using ElementA = typename cutlass_collective_detail::blockscaled::blockscaled_type<
-        cutlass_collective::KernelScheduleAuto, ElementPair>::data_type;
-    using ElementB = ElementA;
-    using ElementAccumulator = float;
-    using GmemLayoutATag = cutlass::layout::RowMajor*;
-    using GmemLayoutBTag = cutlass::layout::ColumnMajor*;
-    static constexpr int SFVectorSize =
-        cutlass_collective_detail::blockscaled::blockscaled_type<
-            cutlass_collective::KernelScheduleAuto, ElementPair>::SfVectorSize;
-
-    static constexpr cute::UMMA::Major UmmaMajorA =
-        cutlass_collective_detail::tag_to_umma_major_A<GmemLayoutATag>();
-    static constexpr cute::UMMA::Major UmmaMajorB =
-        cutlass_collective_detail::tag_to_umma_major_B<GmemLayoutBTag>();
-    static_assert(UmmaMajorA == cute::UMMA::Major::K &&
-                  UmmaMajorB == cute::UMMA::Major::K);
-    static_assert(cute::is_static_v<TileShapeMNK>);
-    static_assert(cute::is_static_v<ClusterShapeMNK>);
-    static_assert(cute::size(ClusterShapeMNK{}) == cute::Int<1>{});
-    static_assert(cute::size<1>(TileShapeMNK{}) == 16);
-
-    static constexpr auto Instr = cutlass_collective_detail::blockscaled::select_instr<
-        ElementPair,
-        ElementPair,
-        ElementAccumulator,
-        UmmaMajorA,
-        UmmaMajorB,
-        cutlass_collective::KernelScheduleAuto>();
-    static constexpr bool UseMxf8f6f4 =
-        Instr == cutlass_collective_detail::blockscaled::BlockScaledInstr::MXF4F6F8;
-    static_assert(UseMxf8f6f4);
-
-    using PermTileM = decltype(cute::min(cute::size<0>(TileShapeMNK{}), cute::_128{}));
-    // CUTLASS's generic block-scaled builder uses a 32-column permutation tile
-    // and therefore rejects CTA N=16.  The SM120 MMA atom is 8 columns wide;
-    // the cooperative 2-way N layout natively covers this 16-column tile.
-    using PermTileN = cute::_16;
-    using PermTileK = cute::_32;
-    using AtomLayoutMNK = cute::Layout<cute::Shape<cute::_4, cute::_2, cute::_1>>;
-    using TiledMma = decltype(cute::make_tiled_mma(
-        cute::rr_blockscaled_op_selector_sm120<
-            ElementA,
-            ElementB,
-            ElementAccumulator,
-            ElementScale,
-            SFVectorSize,
-            UseMxf8f6f4>(),
-        AtomLayoutMNK{},
-        cute::Tile<PermTileM, PermTileN, PermTileK>{}));
-
-    static constexpr int MmaScaleFactors =
-        cute::size<2>(typename TiledMma::AtomShape_MNK{}) / SFVectorSize;
-    using SmemAllocTypeA = typename TiledMma::ValTypeA;
-    using SmemAllocTypeB = typename TiledMma::ValTypeB;
-    using SmemAllocTypeScale = ElementScale;
-    using GmemTiledCopyPairA = decltype(cute::make_tuple(SM90_TMA_LOAD{}, SM90_TMA_LOAD{}));
-    using GmemTiledCopyPairB = GmemTiledCopyPairA;
-    using Sm1xxBlkScaledConfig = cutlass::detail::Sm1xxBlockScaledConfig<SFVectorSize>;
-
-    using SmemLayoutAtomA = decltype(cutlass_collective_detail::sm120_rr_smem_selector<
-        SmemAllocTypeA, decltype(cute::size<2>(TileShapeMNK{}))>());
-    using SmemLayoutAtomB = decltype(cutlass_collective_detail::sm120_rr_smem_selector<
-        SmemAllocTypeB, decltype(cute::size<2>(TileShapeMNK{}))>());
-    using SmemCopyAtomA = cute::Copy_Atom<
-        decltype(cutlass_collective_detail::sm120_rr_smem_copy_selector_A<
-            ElementA, ElementB, UseMxf8f6f4>()),
-        SmemAllocTypeA>;
-    using SmemCopyAtomB = cute::Copy_Atom<
-        decltype(cutlass_collective_detail::sm120_rr_smem_copy_selector_B<
-            ElementA, ElementB, UseMxf8f6f4>()),
-        SmemAllocTypeB>;
-    using SmemCopyAtomScale =
-        cute::Copy_Atom<cute::UniversalCopy<SmemAllocTypeScale>, SmemAllocTypeScale>;
-    using SmemCopyAtomsA = decltype(cute::make_tuple(SmemCopyAtomA{}, SmemCopyAtomScale{}));
-    using SmemCopyAtomsB = decltype(cute::make_tuple(SmemCopyAtomB{}, SmemCopyAtomScale{}));
-
-    using ScaleBlockMN = typename Sm1xxBlkScaledConfig::Blk_MN;
-    using ScaleBlockSF = typename Sm1xxBlkScaledConfig::Blk_SF;
-    using ScaleBlockElements = decltype(ScaleBlockMN{} * ScaleBlockSF{});
-    using ScaleBasicMNShape = cute::Shape<cute::_32, cute::_4>;
-    using ScaleBasicMNStride = cute::Stride<cute::_16, cute::_4>;
-    using ScaleBasicKShape = cute::Shape<
-        cute::Int<SFVectorSize>, cute::Int<MmaScaleFactors>>;
-    using ScaleBasicKStride = cute::Stride<cute::_0, cute::_1>;
-
-    using ScaleAShapeM = decltype(cute::prepend(
-        cute::size<0>(TileShapeMNK{}) / ScaleBlockMN{}, ScaleBasicMNShape{}));
-    using ScaleStrideMN = decltype(cute::prepend(
-        ScaleBlockElements{}, ScaleBasicMNStride{}));
-    using ScaleShapeK = decltype(cute::prepend(
-        cute::make_shape(
-            ScaleBlockSF{} / cute::Int<MmaScaleFactors>{},
-            cute::size<2>(TileShapeMNK{}) / cute::Int<SFVectorSize>{} /
-                ScaleBlockSF{}),
-        ScaleBasicKShape{}));
-    using ScaleAStrideK = decltype(cute::prepend(
-        cute::make_stride(
-            cute::Int<MmaScaleFactors>{},
-            cute::size<0>(TileShapeMNK{}) / ScaleBlockMN{} * ScaleBlockElements{}),
-        ScaleBasicKStride{}));
-    using ScaleAShape = decltype(cute::make_shape(ScaleAShapeM{}, ScaleShapeK{}));
-    using ScaleAStride = decltype(cute::make_stride(ScaleStrideMN{}, ScaleAStrideK{}));
-    using SmemLayoutAtomScaleA =
-        decltype(cute::make_layout(ScaleAShape{}, ScaleAStride{}));
-
-    using ScaleBTileN = cute::Int<cute::max(cute::size<1>(TileShapeMNK{}), 128)>;
-    using ScaleBShapeN = decltype(cute::prepend(
-        ScaleBTileN{} / ScaleBlockMN{}, ScaleBasicMNShape{}));
-    using ScaleBStrideK = decltype(cute::prepend(
-        cute::make_stride(
-            cute::Int<MmaScaleFactors>{},
-            ScaleBTileN{} / ScaleBlockMN{} * ScaleBlockElements{}),
-        ScaleBasicKStride{}));
-    using ScaleBShape = decltype(cute::make_shape(ScaleBShapeN{}, ScaleShapeK{}));
-    using ScaleBStride = decltype(cute::make_stride(ScaleStrideMN{}, ScaleBStrideK{}));
-    using SmemLayoutAtomScaleB =
-        decltype(cute::make_layout(ScaleBShape{}, ScaleBStride{}));
-    using SmemLayoutAtomsA = decltype(cute::make_tuple(
-        SmemLayoutAtomA{}, SmemLayoutAtomScaleA{}));
-    using SmemLayoutAtomsB = decltype(cute::make_tuple(
-        SmemLayoutAtomB{}, SmemLayoutAtomScaleB{}));
-
-    using StrideA = cutlass::gemm::TagToStrideA_t<GmemLayoutATag>;
-    using StrideB = cutlass::gemm::TagToStrideB_t<GmemLayoutBTag>;
-    using InternalStrideA = cute::remove_pointer_t<StrideA>;
-    using InternalStrideB = cute::remove_pointer_t<StrideB>;
-    using InternalLayoutSFA = decltype(Sm1xxBlkScaledConfig::deduce_layoutSFA());
-    using InternalLayoutSFB = decltype(Sm1xxBlkScaledConfig::deduce_layoutSFB());
-    using LayoutSFA = InternalLayoutSFA*;
-    using LayoutSFB = InternalLayoutSFB*;
-    using StridePairA = decltype(cute::make_tuple(StrideA{}, LayoutSFA{}));
-    using StridePairB = decltype(cute::make_tuple(StrideB{}, LayoutSFB{}));
-
-    static constexpr uint32_t SchedulerPipelineStageCount = 3;
-    static constexpr int SchedulerPipelineStorage =
-        sizeof(cutlass::PipelineDetail::PipelineAsyncSharedStorage<8>);
-    static constexpr int TensorMapStorage = sizeof(cute::TmaDescriptor) * 2;
-    static constexpr int TensorMapReadyPipelineStorage = sizeof(
-        typename cutlass::PipelineAsync<SchedulerPipelineStageCount>::SharedStorage);
-    static constexpr int ReducedSmemCapacityBytes =
-        cutlass_collective_detail::sm120_smem_capacity_bytes - SchedulerPipelineStorage -
-        TensorMapStorage - TensorMapReadyPipelineStorage;
-    static constexpr int PipelineStages =
-        cutlass_collective_detail::sm100_compute_stage_count_or_override_blockscaled<
-        ReducedSmemCapacityBytes,
-        SmemAllocTypeA,
-        SmemAllocTypeB,
-        TileShapeMNK,
-        SmemLayoutAtomScaleA,
-        SmemLayoutAtomScaleB>(StageCountType{});
-
-    using KernelSchedule = cutlass::gemm::
-        KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120<
-            SchedulerPipelineStageCount>;
-    using DispatchPolicy = cutlass::gemm::MainloopSm120ArrayTmaWarpSpecializedBlockScaled<
-        PipelineStages,
-        SchedulerPipelineStageCount,
-        ClusterShapeMNK,
-        KernelSchedule>;
-    using CollectiveOp = cutlass_collective::CollectiveMma<
-        DispatchPolicy,
-        TileShapeMNK,
-        cute::tuple<ElementA, ElementScale>,
-        StridePairA,
-        cute::tuple<ElementB, ElementScale>,
-        StridePairB,
-        TiledMma,
-        GmemTiledCopyPairA,
-        SmemLayoutAtomsA,
-        SmemCopyAtomsA,
-        cute::identity,
-        GmemTiledCopyPairB,
-        SmemLayoutAtomsB,
-        SmemCopyAtomsB,
-        cute::identity>;
-};
-
-template <bool IsNarrow, class TileShapeMNK, class ClusterShapeMNK, class StageCountType>
-struct DgMxfp8MainloopSelector;
-
-template <class TileShapeMNK, class ClusterShapeMNK, class StageCountType>
-struct DgMxfp8MainloopSelector<true, TileShapeMNK, ClusterShapeMNK, StageCountType> {
-    using CollectiveOp = typename DgNarrowMxfp8MainloopBuilder<
-        TileShapeMNK, ClusterShapeMNK, StageCountType>::CollectiveOp;
-};
-
-template <class TileShapeMNK, class ClusterShapeMNK, class StageCountType>
-struct DgMxfp8MainloopSelector<false, TileShapeMNK, ClusterShapeMNK, StageCountType> {
-    using ElementMainloop = cutlass::mx_float8_t<cutlass::float_e4m3_t>;
-    using CollectiveOp = typename cutlass::gemm::collective::CollectiveBuilder<
-        cutlass::arch::Sm120,
-        cutlass::arch::OpClassBlockScaledTensorOp,
-        ElementMainloop,
-        cutlass::layout::RowMajor*,
-        16,
-        ElementMainloop,
-        cutlass::layout::ColumnMajor*,
-        16,
-        float,
-        TileShapeMNK,
-        ClusterShapeMNK,
-        StageCountType,
-        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
-};
-
 template <
     int ScaleGranularity,
     class ScaleConfig,
@@ -420,12 +176,9 @@ bool run_grouped_mxfp8(
     // The grouped problem swaps A/B so TileM spans the expert output and
     // TileN spans the routed-token bucket.
     using ThreadBlockShape = Shape<Int<TileM>, Int<TileN>, Int<TileK>>;
-    using EpilogueTile = cute::conditional_t<
-        TileN == 16,
-        Shape<_64, _16>,
-        cutlass::epilogue::collective::EpilogueTileAuto>;
 
     constexpr int AlignmentA = 128 / cutlass::sizeof_bits<ElementInput>::value;
+    constexpr int AlignmentB = AlignmentA;
     constexpr int AlignmentD = 128 / cutlass::sizeof_bits<ElementD>::value;
     if (k % AlignmentA || n % AlignmentD) {
         return false;
@@ -436,7 +189,7 @@ bool run_grouped_mxfp8(
         cutlass::arch::OpClassBlockScaledTensorOp,
         ThreadBlockShape,
         ClusterShape,
-        EpilogueTile,
+        cutlass::epilogue::collective::EpilogueTileAuto,
         ElementAccumulator,
         ElementCompute,
         ElementC,
@@ -447,13 +200,21 @@ bool run_grouped_mxfp8(
         AlignmentD,
         cutlass::epilogue::collective::EpilogueScheduleAuto>::CollectiveOp;
 
-    using MainloopStageCount = cutlass::gemm::collective::StageCountAutoCarveout<
-        static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>;
-    using CollectiveMainloop = typename DgMxfp8MainloopSelector<
-        TileN == 16,
+    using CollectiveMainloop = typename cutlass::gemm::collective::CollectiveBuilder<
+        cutlass::arch::Sm120,
+        cutlass::arch::OpClassBlockScaledTensorOp,
+        ElementMainloop,
+        LayoutA*,
+        AlignmentA,
+        ElementMainloop,
+        LayoutB*,
+        AlignmentB,
+        ElementAccumulator,
         ThreadBlockShape,
         ClusterShape,
-        MainloopStageCount>::CollectiveOp;
+        cutlass::gemm::collective::StageCountAutoCarveout<
+            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
 
     using GroupProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -596,7 +357,7 @@ bool run_selected_grouped_mxfp8(
     size_t workspace_size,
     cudaStream_t stream) {
     if (n == 2816 && k == 704) {
-        return run_grouped_mxfp8<128, 16, 128, ElementD>(
+        return run_grouped_mxfp8<128, 64, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
