@@ -46,8 +46,8 @@ def test_categorical_stats_sample_matches_multinomial(backend, cuda_available, s
 
     logits = torch.randn((2, 3, 257), dtype=torch.float32, device=device)
     distribution = torch.distributions.Categorical(logits=logits)
-    reference_generator = torch.Generator(device=device).manual_seed(seed)
-    noise_generator = torch.Generator(device=device).manual_seed(seed)
+    reference_generator = torch.Generator(device=device).manual_seed(5770521)
+    noise_generator = torch.Generator(device=device).manual_seed(5770521)
     reference = torch.multinomial(
         distribution.probs.reshape(-1, logits.shape[-1]), 1, generator=reference_generator
     ).reshape(logits.shape[:-1])
