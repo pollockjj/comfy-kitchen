@@ -164,6 +164,7 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
 _CUTLASS_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUTLASS", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
+_fused_moe_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
@@ -327,6 +328,16 @@ def get_cublas_workspace() -> torch.Tensor:
             device=device_index,
         )
         _cublas_workspaces[device_index] = workspace
+    return workspace
+
+
+def _get_fused_moe_workspace(x: torch.Tensor, stream_ptr: int) -> torch.Tensor:
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    key = (device_index, int(stream_ptr))
+    workspace = _fused_moe_workspaces.get(key)
+    if workspace is None:
+        workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
+        _fused_moe_workspaces[key] = workspace
     return workspace
 
 
@@ -1767,8 +1778,8 @@ def fused_moe_nvfp4(
         else expert_ids.to(dtype=torch.int32).contiguous()
     )
     output = torch.empty_like(x)
-    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    workspace = _get_fused_moe_workspace(x, stream_ptr)
     _C.cutlass_fused_moe_nvfp4(
         _wrap_for_dlpack(x),
         _wrap_for_dlpack(expert_ids_i32),
@@ -1840,8 +1851,8 @@ def fused_moe_mxfp8(
         else expert_ids.to(dtype=torch.int32).contiguous()
     )
     output = torch.empty_like(x)
-    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    workspace = _get_fused_moe_workspace(x, stream_ptr)
     _C.cutlass_fused_moe_mxfp8(
         _wrap_for_dlpack(x),
         _wrap_for_dlpack(expert_ids_i32),
