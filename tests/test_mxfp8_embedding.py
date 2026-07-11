@@ -3,7 +3,6 @@ import torch
 
 import comfy_kitchen as ck
 
-
 cuda_status = ck.list_backends().get("cuda", {})
 
 
