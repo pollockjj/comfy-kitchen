@@ -2307,8 +2307,8 @@ void int8_linear_m1(
     if (output_dtype_code < 0 || output_dtype_code > 2) {
         throw std::runtime_error("Invalid INT8 M=1 linear output dtype code");
     }
-    if (convrot && (group_size != 256 || K % 256 != 0)) {
-        throw std::runtime_error("INT8 M=1 ConvRot linear requires group_size 256 and K divisible by 256");
+    if (convrot && ((group_size != 64 && group_size != 256) || K % group_size != 0)) {
+        throw std::runtime_error("INT8 M=1 ConvRot linear requires group_size 64 or 256 dividing K");
     }
 
     const int input_dtype_code = map_dtype_to_code(input.dtype());

@@ -245,7 +245,11 @@ def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
     return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
 
 
-def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+def _convrot_int8_fused_shared_memory_bytes(m: int, k: int, group_size: int = 256) -> int:
+    if group_size == 64:
+        block_threads = 128
+        groups_in_flight = block_threads // (group_size // 4)
+        return (k + groups_in_flight * 2 * group_size) * 4
     if m == 1:
         block_threads = 512
     elif k == 256:
@@ -283,9 +287,9 @@ def _convrot_int4_fused_shared_memory_bytes(m: int, k: int, group_size: int, dty
 
 
 def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
-    if not x.is_cuda or group_size != 256:
+    if not x.is_cuda or group_size not in (64, 256):
         return True
-    requested_shared = _convrot_int8_fused_shared_memory_bytes(x.shape[0], k)
+    requested_shared = _convrot_int8_fused_shared_memory_bytes(x.shape[0], k, group_size)
     return requested_shared < _max_dynamic_shared_memory_per_block(x)
 
 
@@ -297,6 +301,8 @@ def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: 
 
 
 def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if group_size == 64:
+        return k % 64 == 0 and _convrot_fused_shared_memory_fits(x, k, group_size)
     return (
         group_size == 256
         and k % 256 == 0
@@ -1390,8 +1396,8 @@ def quantize_int8_convrot_weight(
     weight_2d = weight.contiguous()
     k = weight_2d.shape[-1]
     if (
-        group_size == 256
-        and k % 256 == 0
+        group_size in (64, 256)
+        and k % group_size == 0
         and 256 <= k <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(weight_2d, k, group_size)
     ):
@@ -1921,9 +1927,9 @@ def int8_linear(
     convrot_m1_supported = (
         m == 1
         and convrot
-        and convrot_groupsize == 256
-        and k % 256 == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and convrot_groupsize in (64, 256)
+        and k % convrot_groupsize == 0
+        and 64 <= k <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
     )
     nonconvrot_m1_supported = (
@@ -1962,9 +1968,9 @@ def int8_linear(
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
         if (
-            convrot_groupsize == 256
-            and k % 256 == 0
-            and 256 <= k <= _CONVROT_FUSED_MAX_K
+            convrot_groupsize in (64, 256)
+            and k % convrot_groupsize == 0
+            and 64 <= k <= _CONVROT_FUSED_MAX_K
             and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
         ):
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
