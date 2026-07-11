@@ -133,7 +133,11 @@ def categorical_stats_sample(
     logits: torch.Tensor,
     exponential_noise: torch.Tensor,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return categorical entropy, argmax, and an exponential-race sample."""
+    """Return categorical entropy, argmax, and an exponential-race sample.
+
+    ``exponential_noise`` must contain independent, finite, positive Exp(1)
+    samples. The caller owns its generator and all generator-state advancement.
+    """
     if logits.dtype != torch.float32 or exponential_noise.dtype != torch.float32:
         raise ValueError("categorical_stats_sample requires float32 tensors")
     if logits.shape != exponential_noise.shape:
@@ -149,7 +153,10 @@ def categorical_stats_sample(
     logits_2d = logits.reshape(-1, logits.shape[-1])
     noise_2d = exponential_noise.reshape(logits_2d.shape)
     entropy, argmax, sample, invalid = torch.ops.comfy_kitchen.categorical_stats_sample(logits_2d, noise_2d)
-    torch._assert_async(invalid == 0, "categorical_stats_sample received an invalid distribution")
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(invalid == 0, "categorical_stats_sample received an invalid distribution")
+    elif invalid.item() != 0:
+        raise RuntimeError("categorical_stats_sample received an invalid distribution")
     return entropy.reshape(leading_shape), argmax.reshape(leading_shape), sample.reshape(leading_shape)
 
 

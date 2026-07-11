@@ -413,6 +413,8 @@ def categorical_stats_sample(
         or not exponential_noise.is_contiguous()
     ):
         raise ValueError("categorical_stats_sample requires matching contiguous 2D float32 tensors")
+    if exponential_noise.device != logits.device:
+        raise ValueError("categorical_stats_sample requires logits and noise on the same CUDA device")
     if logits.shape[0] == 0 or logits.shape[1] == 0:
         raise ValueError("categorical_stats_sample requires non-empty rows and vocabulary")
 

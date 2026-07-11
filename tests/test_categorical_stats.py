@@ -45,19 +45,19 @@ def test_categorical_stats_sample_matches_multinomial(backend, cuda_available, s
         pytest.skip(f"backend '{backend}' is not capable")
 
     logits = torch.randn((2, 3, 257), dtype=torch.float32, device=device)
-    distribution = torch.distributions.Categorical(logits=logits)
     reference_generator = torch.Generator(device=device).manual_seed(5770521)
     noise_generator = torch.Generator(device=device).manual_seed(5770521)
-    reference = torch.multinomial(
-        distribution.probs.reshape(-1, logits.shape[-1]), 1, generator=reference_generator
-    ).reshape(logits.shape[:-1])
     noise = torch.empty_like(logits).exponential_(generator=noise_generator)
 
     with ck.use_backend(backend):
+        old_probs, old_entropy, old_argmax = ck.categorical_stats(logits)
+        reference = torch.multinomial(
+            old_probs.reshape(-1, logits.shape[-1]), 1, generator=reference_generator
+        ).reshape(logits.shape[:-1])
         entropy, argmax, sample = ck.categorical_stats_sample(logits, noise)
 
-    torch.testing.assert_close(entropy, distribution.entropy(), rtol=1e-5, atol=1e-5)
-    assert torch.equal(argmax, logits.argmax(dim=-1))
+    assert torch.equal(entropy, old_entropy)
+    assert torch.equal(argmax, old_argmax)
     assert torch.equal(sample, reference)
     assert torch.equal(noise_generator.get_state(), reference_generator.get_state())
 

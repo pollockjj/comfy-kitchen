@@ -436,6 +436,17 @@ void categorical_stats_sample(
     ) {
         throw std::runtime_error("categorical_stats_sample requires matching non-empty [rows, vocab] inputs");
     }
+    const int logits_device = logits.device_id();
+    if (
+        exponential_noise.device_id() != logits_device
+        || entropy.device_id() != logits_device
+        || argmax.device_id() != logits_device
+        || sample.device_id() != logits_device
+        || row_stats.device_id() != logits_device
+        || invalid.device_id() != logits_device
+    ) {
+        throw std::runtime_error("categorical_stats_sample tensors must share one CUDA device");
+    }
     if (
         static_cast<int64_t>(entropy.shape(0)) != rows
         || static_cast<int64_t>(argmax.shape(0)) != rows
