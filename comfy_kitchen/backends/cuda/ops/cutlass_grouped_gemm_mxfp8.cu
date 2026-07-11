@@ -362,12 +362,6 @@ bool run_selected_grouped_mxfp8(
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
     }
-    if (n == 1408 && k == 2816) {
-        return run_grouped_mxfp8<128, 32, 256, ElementD>(
-            activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-            workspace_size, stream);
-    }
     return run_grouped_mxfp8<128, 32, 128, ElementD>(
         activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
         output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
