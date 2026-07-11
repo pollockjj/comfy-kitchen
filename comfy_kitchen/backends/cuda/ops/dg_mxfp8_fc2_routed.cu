@@ -50,7 +50,7 @@ struct alignas(16) Fc2Task {
     int32_t expert;
     int32_t route_start;
     int32_t rank_start;
-    int32_t packed_tile_and_rows;
+    int32_t valid_rows;
 };
 
 static_assert(sizeof(Fc2Task) == 16);
@@ -77,7 +77,7 @@ __global__ void build_fc2_tasks(
             running += chunks;
         }
         chunk_offsets[kNumExperts] = running;
-        *task_count = running * kOutputTiles;
+        *task_count = running;
         *next_task = 0;
     }
     __syncthreads();
@@ -89,16 +89,11 @@ __global__ void build_fc2_tasks(
         for (int chunk = 0; chunk < chunks; ++chunk) {
             const int rank_start = chunk * kRoutesPerTask;
             const int valid_rows = min(kRoutesPerTask, route_count - rank_start);
-            const int task_base =
-                (chunk_offsets[expert] + chunk) * kOutputTiles;
-#pragma unroll
-            for (int output_tile = 0; output_tile < kOutputTiles; ++output_tile) {
-                tasks[task_base + output_tile] = {
-                    expert,
-                    route_start + rank_start,
-                    rank_start,
-                    (output_tile << 4) | valid_rows};
-            }
+            tasks[chunk_offsets[expert] + chunk] = {
+                expert,
+                route_start + rank_start,
+                rank_start,
+                valid_rows};
         }
     }
 }
@@ -136,6 +131,8 @@ __global__ __launch_bounds__(256) void fc2_routed_persistent(
 
     __shared__ int32_t shared_task_index;
     __shared__ Fc2Task shared_task;
+    __shared__ uint8_t shared_activations[kRoutesPerTask * kReductionSize];
+    __shared__ uint8_t shared_activation_scales[kRoutesPerTask * kBlockCols];
     const int lane = threadIdx.x & 31;
     const int warp = threadIdx.x >> 5;
 
@@ -155,9 +152,7 @@ __global__ __launch_bounds__(256) void fc2_routed_persistent(
         const int expert = shared_task.expert;
         const int route_start = shared_task.route_start;
         const int rank_start = shared_task.rank_start;
-        const int output_tile = shared_task.packed_tile_and_rows >> 4;
-        const int valid_rows = shared_task.packed_tile_and_rows & 15;
-        const int output_base = output_tile * kOutputTile + warp * kMmaRows;
+        const int valid_rows = shared_task.valid_rows;
         const uint8_t* expert_weights =
             weights + static_cast<size_t>(expert) * kOutputSize * kReductionSize;
         const uint8_t* expert_weight_scales =
@@ -165,67 +160,90 @@ __global__ __launch_bounds__(256) void fc2_routed_persistent(
         const uint8_t* expert_activation_scales =
             activation_scales +
             static_cast<size_t>(expert) * scale_group_m * kScaleStorageCols;
-        float d0 = 0.0f;
-        float d1 = 0.0f;
-        float d2 = 0.0f;
-        float d3 = 0.0f;
 
-#pragma unroll
-        for (int block_col = 0; block_col < kBlockCols; ++block_col) {
-            uint32_t a[4] = {};
-            uint32_t b[2] = {};
-#pragma unroll
-            for (int value = 0; value < 16; ++value) {
-                const int linear =
-                    (lane & 3) * 64 + (lane >> 2) + (value & 3) * 16 +
-                    ((value >> 2) & 1) * 8 + (value >> 3) * 256;
-                const int row = output_base + (linear & 15);
-                const int col = block_col * 32 + (linear >> 4);
-                const uint32_t byte =
-                    expert_weights[static_cast<size_t>(row) * kReductionSize + col];
-                a[value >> 2] |= byte << ((value & 3) * 8);
-            }
-#pragma unroll
-            for (int value = 0; value < 8; ++value) {
-                const int linear =
-                    (lane & 3) * 32 + (lane >> 2) + (value & 3) * 8 +
-                    (value >> 2) * 128;
-                const int row = linear & 7;
-                const int col = block_col * 32 + (linear >> 3);
-                const uint32_t byte = row < valid_rows
-                    ? activations[
-                          static_cast<size_t>(route_start + row) * kReductionSize + col]
-                    : 0;
-                b[value >> 2] |= byte << ((value & 3) * 8);
-            }
-
-            const int scale_a_row = output_base + (lane & 1) * 8 + (lane >> 2);
-            const int scale_b_row = lane >> 2;
-            const uint8_t scale_a = expert_weight_scales[
-                scale_factor_swizzled_offset(scale_a_row, block_col, kBlockCols)];
-            const uint8_t scale_b = scale_b_row < valid_rows
-                ? expert_activation_scales[scale_factor_swizzled_offset(
-                      rank_start + scale_b_row, block_col, kBlockCols)]
+        for (int linear = threadIdx.x;
+             linear < kRoutesPerTask * kReductionSize;
+             linear += blockDim.x) {
+            const int row = linear / kReductionSize;
+            const int col = linear - row * kReductionSize;
+            shared_activations[linear] = row < valid_rows
+                ? activations[
+                      static_cast<size_t>(route_start + row) * kReductionSize + col]
                 : 0;
-            Mma::fma(
-                d0, d1, d2, d3,
-                a[0], a[1], a[2], a[3],
-                b[0], b[1],
-                d0, d1, d2, d3,
-                scale_a, scale_b);
         }
+        for (int linear = threadIdx.x;
+             linear < kRoutesPerTask * kBlockCols;
+             linear += blockDim.x) {
+            const int row = linear / kBlockCols;
+            const int block_col = linear - row * kBlockCols;
+            shared_activation_scales[linear] = row < valid_rows
+                ? expert_activation_scales[scale_factor_swizzled_offset(
+                      rank_start + row, block_col, kBlockCols)]
+                : 0;
+        }
+        __syncthreads();
 
-        const float values[4] = {d0, d1, d2, d3};
+        for (int output_tile = 0; output_tile < kOutputTiles; ++output_tile) {
+            const int output_base = output_tile * kOutputTile + warp * kMmaRows;
+            float d0 = 0.0f;
+            float d1 = 0.0f;
+            float d2 = 0.0f;
+            float d3 = 0.0f;
+
 #pragma unroll
-        for (int value = 0; value < 4; ++value) {
-            const int linear =
-                (lane & 3) * 32 + (lane >> 2) + (value & 1) * 16 +
-                (value >> 1) * 8;
-            const int output_row = output_base + (linear & 15);
-            const int route = linear >> 4;
-            if (route < valid_rows) {
-                output[static_cast<size_t>(route_start + route) * kOutputSize + output_row] =
-                    convert_output<OutputType>(values[value]);
+            for (int block_col = 0; block_col < kBlockCols; ++block_col) {
+                uint32_t a[4] = {};
+                uint32_t b[2] = {};
+#pragma unroll
+                for (int value = 0; value < 16; ++value) {
+                    const int linear =
+                        (lane & 3) * 64 + (lane >> 2) + (value & 3) * 16 +
+                        ((value >> 2) & 1) * 8 + (value >> 3) * 256;
+                    const int row = output_base + (linear & 15);
+                    const int col = block_col * 32 + (linear >> 4);
+                    const uint32_t byte =
+                        expert_weights[static_cast<size_t>(row) * kReductionSize + col];
+                    a[value >> 2] |= byte << ((value & 3) * 8);
+                }
+#pragma unroll
+                for (int value = 0; value < 8; ++value) {
+                    const int linear =
+                        (lane & 3) * 32 + (lane >> 2) + (value & 3) * 8 +
+                        (value >> 2) * 128;
+                    const int row = linear & 7;
+                    const int col = block_col * 32 + (linear >> 3);
+                    const uint32_t byte =
+                        shared_activations[row * kReductionSize + col];
+                    b[value >> 2] |= byte << ((value & 3) * 8);
+                }
+
+                const int scale_a_row = output_base + (lane & 1) * 8 + (lane >> 2);
+                const int scale_b_row = lane >> 2;
+                const uint8_t scale_a = expert_weight_scales[
+                    scale_factor_swizzled_offset(scale_a_row, block_col, kBlockCols)];
+                const uint8_t scale_b =
+                    shared_activation_scales[scale_b_row * kBlockCols + block_col];
+                Mma::fma(
+                    d0, d1, d2, d3,
+                    a[0], a[1], a[2], a[3],
+                    b[0], b[1],
+                    d0, d1, d2, d3,
+                    scale_a, scale_b);
+            }
+
+            const float values[4] = {d0, d1, d2, d3};
+#pragma unroll
+            for (int value = 0; value < 4; ++value) {
+                const int linear =
+                    (lane & 3) * 32 + (lane >> 2) + (value & 1) * 16 +
+                    (value >> 1) * 8;
+                const int output_row = output_base + (linear & 15);
+                const int route = linear >> 4;
+                if (route < valid_rows) {
+                    output[
+                        static_cast<size_t>(route_start + route) * kOutputSize + output_row] =
+                        convert_output<OutputType>(values[value]);
+                }
             }
         }
         __syncthreads();
@@ -261,7 +279,7 @@ extern "C" bool launch_dg_mxfp8_fc2_routed(
     }
     const int64_t max_chunks =
         (routes + 7 * num_experts + 7) / kRoutesPerTask;
-    const int64_t max_tasks = max_chunks * kOutputTiles;
+    const int64_t max_tasks = max_chunks;
     if (max_tasks <= 0 || max_tasks > INT32_MAX) {
         return false;
     }
