@@ -15,6 +15,7 @@
  * limitations under the License.
  */
 
+#include "utils.cuh"
 #include "float_utils.cuh"
 
 #include <cuda_bf16.h>
