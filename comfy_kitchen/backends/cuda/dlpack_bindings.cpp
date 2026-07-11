@@ -930,12 +930,14 @@ void dg_mxfp8_fc2_n8_cutlass_control(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
     uintptr_t stream_ptr) {
+    const int64_t num_groups = weights.shape(0);
     if (activations.shape(0) != 8 || activations.shape(1) != 704 ||
-        activation_scales.shape(0) != 1 || activation_scales.shape(1) != 128 ||
+        num_groups != 128 || activation_scales.shape(0) != num_groups ||
+        activation_scales.shape(1) != 128 ||
         activation_scales.shape(2) != 24 ||
-        weights.shape(0) != 1 || weights.shape(1) != 2816 || weights.shape(2) != 704 ||
-        weight_scales.shape(0) != 1 || weight_scales.shape(1) != 2816 ||
-        weight_scales.shape(2) != 24 || m_indptr.shape(0) != 2 ||
+        weights.shape(1) != 2816 || weights.shape(2) != 704 ||
+        weight_scales.shape(0) != num_groups || weight_scales.shape(1) != 2816 ||
+        weight_scales.shape(2) != 24 || m_indptr.shape(0) != num_groups + 1 ||
         output.shape(0) != 8 || output.shape(1) != 2816 ||
         map_dtype_to_code(output.dtype()) != 2) {
         throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control shape mismatch");
@@ -943,8 +945,8 @@ void dg_mxfp8_fc2_n8_cutlass_control(
     const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_cutlass_grouped_gemm_mxfp8_variable(
             activations.data(), activation_scales.data(), weights.data(),
-            weight_scales.data(), output.data(), m_indptr.data(), 1, 128, 2816,
-            704, 2, workspace.data(), static_cast<int64_t>(workspace.size()), stream)) {
+            weight_scales.data(), output.data(), m_indptr.data(), num_groups, 128,
+            2816, 704, 2, workspace.data(), static_cast<int64_t>(workspace.size()), stream)) {
         throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control failed");
     }
 }
