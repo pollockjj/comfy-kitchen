@@ -57,7 +57,9 @@ __global__ void m16n8k32_probe(
         const int linear =
             (lane & 3) * 64 + (lane >> 2) + (value & 3) * 16 +
             ((value >> 2) & 1) * 8 + (value >> 3) * 256;
-        const uint32_t byte = weights[linear];
+        const int row = linear & 15;
+        const int col = linear >> 4;
+        const uint32_t byte = weights[row * 32 + col];
         a[value >> 2] |= byte << ((value & 3) * 8);
     }
 #pragma unroll
@@ -65,7 +67,9 @@ __global__ void m16n8k32_probe(
         const int linear =
             (lane & 3) * 32 + (lane >> 2) + (value & 3) * 8 +
             (value >> 2) * 128;
-        const uint32_t byte = activations[linear];
+        const int row = linear & 7;
+        const int col = linear >> 3;
+        const uint32_t byte = activations[row * 32 + col];
         b[value >> 2] |= byte << ((value & 3) * 8);
     }
 
@@ -88,8 +92,8 @@ __global__ void m16n8k32_probe(
         const int linear =
             (lane & 3) * 32 + (lane >> 2) + (value & 1) * 16 +
             (value >> 1) * 8;
-        const int row = linear >> 3;
-        const int col = linear & 7;
+        const int row = linear & 15;
+        const int col = linear >> 4;
         output[col * 16 + row] = __float2bfloat16_rn(values[value]);
     }
 }
