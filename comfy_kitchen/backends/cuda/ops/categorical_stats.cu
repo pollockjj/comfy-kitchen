@@ -52,7 +52,7 @@ __device__ __forceinline__ MaxPair block_reduce_max_pair(
     if (warp == 0) {
         MaxPair block_value = lane < kWarps
             ? MaxPair{warp_values[lane], warp_indices[lane]}
-            : MaxPair{-CUDART_INF_F, INT64_MAX};
+            : MaxPair{-FLT_MAX, INT64_MAX};
         block_value = warp_reduce_max_pair(block_value);
         if (lane == 0) {
             warp_values[0] = block_value.value;
@@ -97,7 +97,7 @@ __global__ void categorical_logsumexp_argmax_kernel(
     __shared__ float warp_values[kWarps];
     __shared__ int64_t warp_indices[kWarps];
 
-    MaxPair local{-CUDART_INF_F, INT64_MAX};
+    MaxPair local{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         local = better_pair(local, MaxPair{row_logits[col], col});
     }
