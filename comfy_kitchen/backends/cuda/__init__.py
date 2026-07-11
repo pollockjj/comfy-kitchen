@@ -1578,7 +1578,9 @@ def rmsnorm_quantize_mxfp8(
         raise ValueError("rmsnorm_quantize_mxfp8 input and weight must share one CUDA device")
 
     rows, cols = x.shape
-    qdata = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    qdata = torch.zeros(
+        (roundup(rows, 32), cols), dtype=torch.float8_e4m3fn, device=x.device
+    )
     scale_storage = torch.zeros(
         (roundup(rows, 128), roundup(cols // 32, 4)),
         dtype=torch.uint8,

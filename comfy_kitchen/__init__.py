@@ -510,7 +510,7 @@ def rmsnorm_quantize_mxfp8(
     weight: torch.Tensor,
     eps: float = 1e-6,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Fuse DG row RMSNorm with native-layout MXFP8 activation quantization."""
+    """Fuse DG row RMSNorm with padded native-layout MXFP8 activation quantization."""
     if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
         raise ValueError("rmsnorm_quantize_mxfp8 requires bfloat16 input and weight")
     if tuple(x.shape) not in ((256, 2816), (340, 2816)) or tuple(weight.shape) != (2816,):

@@ -23,10 +23,10 @@ def test_rmsnorm_quantize_mxfp8_matches_composed_reference(
     weight = torch.randn((2816,), dtype=torch.bfloat16, device=device)
     with ck.use_backend(backend):
         normalized = torch.nn.functional.rms_norm(x, (2816,), weight, 1e-6)
-        qdata_ref, scales_ref = ck.quantize_mxfp8(normalized)
+        qdata_ref, scales_ref = ck.quantize_mxfp8(normalized, pad_32x=rows % 32 != 0)
         qdata, scales = ck.rmsnorm_quantize_mxfp8(x, weight)
 
-    assert qdata.shape == x.shape
+    assert qdata.shape == (((rows + 31) // 32) * 32, 2816)
     assert scales.shape == (((rows + 127) // 128) * 128, 88)
     assert qdata.dtype == torch.float8_e4m3fn
     assert scales.dtype == torch.float8_e8m0fnu

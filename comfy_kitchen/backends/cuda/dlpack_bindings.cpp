@@ -1115,6 +1115,7 @@ void rmsnorm_quantize_mxfp8(
 {
     const int64_t rows = static_cast<int64_t>(input.shape(0));
     const int64_t hidden_size = static_cast<int64_t>(input.shape(1));
+    const int64_t qdata_rows = ((rows + 31) / 32) * 32;
     const int64_t scale_rows = ((rows + 127) / 128) * 128;
     const int64_t block_cols = hidden_size / 32;
     const int64_t scale_cols = ((block_cols + 3) / 4) * 4;
@@ -1128,7 +1129,7 @@ void rmsnorm_quantize_mxfp8(
         throw std::runtime_error("rmsnorm_quantize_mxfp8 requires [256|340, 2816] and [2816]");
     }
     if (
-        static_cast<int64_t>(qdata.shape(0)) != rows
+        static_cast<int64_t>(qdata.shape(0)) != qdata_rows
         || static_cast<int64_t>(qdata.shape(1)) != hidden_size
         || static_cast<int64_t>(block_scales.shape(0)) != scale_rows
         || static_cast<int64_t>(block_scales.shape(1)) != scale_cols
