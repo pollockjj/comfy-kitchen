@@ -26,6 +26,7 @@ __all__ = [
     "apply_rope1",
     "apply_rope_split_half",
     "apply_rope_split_half1",
+    "categorical_stats",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -367,6 +368,33 @@ def _wrap_for_dlpack(tensor: torch.Tensor):
     if tensor.requires_grad:
         tensor = tensor.detach()
     return tensor.__dlpack__(stream=-1)
+
+
+def categorical_stats(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute categorical probabilities, entropy, and argmax on CUDA."""
+    if logits.dtype != torch.float32 or logits.ndim != 2 or not logits.is_contiguous():
+        raise ValueError("categorical_stats requires contiguous 2D float32 logits")
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("categorical_stats requires non-empty rows and vocabulary")
+
+    rows, vocab_size = logits.shape
+    probs = torch.empty_like(logits)
+    entropy = torch.empty((rows,), dtype=torch.float32, device=logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    row_stats = torch.empty((rows, 2), dtype=torch.float32, device=logits.device)
+    stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
+    _C.categorical_stats(
+        _wrap_for_dlpack(logits),
+        _wrap_for_dlpack(probs),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(row_stats),
+        vocab_size,
+        stream_ptr,
+    )
+    return probs, entropy, argmax
 
 
 def quantize_per_tensor_fp8(
@@ -2265,6 +2293,15 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "categorical_stats": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(

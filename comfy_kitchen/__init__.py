@@ -28,6 +28,7 @@ __version__ = "0.2.19"
 __all__ = [
     # Normalization
     "adaln",
+    "categorical_stats",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -97,6 +98,31 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def categorical_stats(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return normalized categorical probabilities, entropy, and argmax.
+
+    The final dimension is the vocabulary. Leading dimensions are flattened
+    for backend dispatch and restored on return.
+    """
+    if logits.dtype != torch.float32:
+        raise ValueError("categorical_stats requires float32 logits")
+    if logits.ndim < 1 or logits.numel() == 0 or logits.shape[-1] == 0:
+        raise ValueError("categorical_stats requires a non-empty vocabulary and rows")
+    if not logits.is_contiguous():
+        raise ValueError("categorical_stats requires contiguous logits")
+
+    leading_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    probs, entropy, argmax = torch.ops.comfy_kitchen.categorical_stats(logits_2d)
+    return (
+        probs.reshape(logits.shape),
+        entropy.reshape(leading_shape),
+        argmax.reshape(leading_shape),
+    )
 
 
 def quantize_per_tensor_fp8(

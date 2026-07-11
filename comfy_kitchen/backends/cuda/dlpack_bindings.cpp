@@ -53,6 +53,16 @@ extern "C" {
                                       int input_dtype_code, int output_dtype_code,
                                       cudaStream_t stream);
 
+    void launch_categorical_stats_kernel(
+        const float* logits,
+        float* probs,
+        float* entropy,
+        int64_t* argmax,
+        float* row_stats,
+        int64_t rows,
+        int64_t vocab_size,
+        cudaStream_t stream);
+
     void launch_stochastic_round_fp8_kernel(void* rng_and_output,
                                             const void* input,
                                             int64_t numel,
@@ -345,6 +355,42 @@ void stochastic_round_fp8(
         rng_dtype_code,
         input_dtype_code,
         output_dtype_code,
+        stream);
+}
+
+void categorical_stats(
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> probs,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> row_stats,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(logits.shape(0));
+    if (rows <= 0 || vocab_size <= 0 || static_cast<int64_t>(logits.shape(1)) != vocab_size) {
+        throw std::runtime_error("categorical_stats requires non-empty [rows, vocab] logits");
+    }
+    if (
+        static_cast<int64_t>(probs.shape(0)) != rows
+        || static_cast<int64_t>(probs.shape(1)) != vocab_size
+        || static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(1)) != 2
+    ) {
+        throw std::runtime_error("categorical_stats output shape mismatch");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_categorical_stats_kernel(
+        logits.data(),
+        probs.data(),
+        entropy.data(),
+        argmax.data(),
+        row_stats.data(),
+        rows,
+        vocab_size,
         stream);
 }
 
@@ -2165,6 +2211,16 @@ NB_MODULE(_C, m) {
           nb::arg("input"),
           nb::arg("output_dtype_code"),
           nb::arg("numel"),
+          nb::arg("stream_ptr"));
+
+    m.def("categorical_stats", &categorical_stats,
+          "Categorical probabilities, entropy, and argmax for contiguous FP32 rows",
+          nb::arg("logits"),
+          nb::arg("probs"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("row_stats"),
+          nb::arg("vocab_size"),
           nb::arg("stream_ptr"));
     
     m.def("cublas_gemm_blockwise_fp4", &cublas_gemm_blockwise_fp4,
