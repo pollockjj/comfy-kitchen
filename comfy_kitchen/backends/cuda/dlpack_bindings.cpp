@@ -84,6 +84,21 @@ extern "C" {
         float inverse_temperature,
         cudaStream_t stream);
 
+    void launch_softcap_categorical_stats_sample_kernel(
+        const void* raw_logits,
+        const float* exponential_noise,
+        float* processed_logits,
+        void* self_conditioning_logits,
+        float* entropy,
+        int64_t* argmax,
+        int64_t* sample,
+        int32_t* invalid,
+        int64_t rows,
+        int64_t vocab_size,
+        float cap,
+        float inverse_temperature,
+        cudaStream_t stream);
+
     void launch_stochastic_round_fp8_kernel(void* rng_and_output,
                                             const void* input,
                                             int64_t numel,
@@ -533,6 +548,79 @@ void softcap_scale(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     launch_softcap_scale_kernel(
         raw_logits.data(), output.data(), numel, cap, inverse_temperature, stream);
+}
+
+void softcap_categorical_stats_sample(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> raw_logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> exponential_noise,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> processed_logits,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> self_conditioning_logits,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> sample,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    float cap,
+    float inverse_temperature,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(raw_logits.shape(0));
+    if (map_dtype_to_code(raw_logits.dtype()) != 2 || map_dtype_to_code(self_conditioning_logits.dtype()) != 2) {
+        throw std::runtime_error("softcap_categorical_stats_sample requires bfloat16 logits outputs");
+    }
+    if (
+        rows <= 0
+        || vocab_size <= 0
+        || static_cast<int64_t>(raw_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(exponential_noise.shape(0)) != rows
+        || static_cast<int64_t>(exponential_noise.shape(1)) != vocab_size
+    ) {
+        throw std::runtime_error(
+            "softcap_categorical_stats_sample requires matching non-empty [rows, vocab] inputs");
+    }
+    const int logits_device = raw_logits.device_id();
+    if (
+        exponential_noise.device_id() != logits_device
+        || processed_logits.device_id() != logits_device
+        || self_conditioning_logits.device_id() != logits_device
+        || entropy.device_id() != logits_device
+        || argmax.device_id() != logits_device
+        || sample.device_id() != logits_device
+        || invalid.device_id() != logits_device
+    ) {
+        throw std::runtime_error("softcap_categorical_stats_sample tensors must share one CUDA device");
+    }
+    if (
+        static_cast<int64_t>(processed_logits.shape(0)) != rows
+        || static_cast<int64_t>(processed_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(self_conditioning_logits.shape(0)) != rows
+        || static_cast<int64_t>(self_conditioning_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(sample.shape(0)) != rows
+        || static_cast<int64_t>(invalid.size()) != 1
+    ) {
+        throw std::runtime_error("softcap_categorical_stats_sample output shape mismatch");
+    }
+    if (!std::isfinite(cap) || cap <= 0.0f || !std::isfinite(inverse_temperature) || inverse_temperature <= 0.0f) {
+        throw std::runtime_error("softcap_categorical_stats_sample requires finite positive scales");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_softcap_categorical_stats_sample_kernel(
+        raw_logits.data(),
+        exponential_noise.data(),
+        processed_logits.data(),
+        self_conditioning_logits.data(),
+        entropy.data(),
+        argmax.data(),
+        sample.data(),
+        invalid.data(),
+        rows,
+        vocab_size,
+        cap,
+        inverse_temperature,
+        stream);
 }
 
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
@@ -2499,6 +2587,21 @@ NB_MODULE(_C, m) {
           nb::arg("cap"),
           nb::arg("inverse_temperature"),
           nb::arg("numel"),
+          nb::arg("stream_ptr"));
+
+    m.def("softcap_categorical_stats_sample", &softcap_categorical_stats_sample,
+          "Strict BF16 softcap, self-conditioning cast, categorical stats, and sample",
+          nb::arg("raw_logits"),
+          nb::arg("exponential_noise"),
+          nb::arg("processed_logits"),
+          nb::arg("self_conditioning_logits"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("sample"),
+          nb::arg("invalid"),
+          nb::arg("cap"),
+          nb::arg("inverse_temperature"),
+          nb::arg("vocab_size"),
           nb::arg("stream_ptr"));
     
     m.def("cublas_gemm_blockwise_fp4", &cublas_gemm_blockwise_fp4,

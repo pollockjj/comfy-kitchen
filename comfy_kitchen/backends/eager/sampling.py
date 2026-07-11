@@ -39,6 +39,27 @@ def softcap_scale(
     return torch.tanh(logits / cap) * cap * inverse_temperature
 
 
+def softcap_categorical_stats_sample(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse DG softcapping, BF16 self-conditioning, statistics, and sampling."""
+    processed_logits = softcap_scale(raw_logits, cap, inverse_temperature)
+    entropy, argmax, sample, invalid = categorical_stats_sample(
+        processed_logits, exponential_noise
+    )
+    return (
+        processed_logits,
+        processed_logits.to(torch.bfloat16),
+        entropy,
+        argmax,
+        sample,
+        invalid,
+    )
+
+
 @torch.library.custom_op("comfy_kitchen::categorical_stats", mutates_args=())
 def _op_categorical_stats(
     logits: torch.Tensor,
@@ -97,3 +118,33 @@ def _op_softcap_scale(
 @_op_softcap_scale.register_fake
 def _op_softcap_scale_fake(raw_logits, cap, inverse_temperature):
     return torch.empty_like(raw_logits, dtype=torch.float32)
+
+
+@torch.library.custom_op("comfy_kitchen::softcap_categorical_stats_sample", mutates_args=())
+def _op_softcap_categorical_stats_sample(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    kwargs = {
+        "raw_logits": raw_logits,
+        "exponential_noise": exponential_noise,
+        "cap": cap,
+        "inverse_temperature": inverse_temperature,
+    }
+    impl = registry.get_implementation("softcap_categorical_stats_sample", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_softcap_categorical_stats_sample.register_fake
+def _op_softcap_categorical_stats_sample_fake(raw_logits, exponential_noise, cap, inverse_temperature):
+    rows = raw_logits.shape[0]
+    return (
+        torch.empty_like(raw_logits, dtype=torch.float32),
+        torch.empty_like(raw_logits, dtype=torch.bfloat16),
+        torch.empty((rows,), dtype=torch.float32, device=raw_logits.device),
+        torch.empty((rows,), dtype=torch.int64, device=raw_logits.device),
+        torch.empty((rows,), dtype=torch.int64, device=raw_logits.device),
+        torch.empty((), dtype=torch.int32, device=raw_logits.device),
+    )

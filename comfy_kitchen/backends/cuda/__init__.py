@@ -29,6 +29,7 @@ __all__ = [
     "categorical_stats",
     "categorical_stats_sample",
     "softcap_scale",
+    "softcap_categorical_stats_sample",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -502,6 +503,54 @@ def softcap_scale(
         stream_ptr,
     )
     return output
+
+
+def softcap_categorical_stats_sample(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse strict BF16 softcapping, self-conditioning, stats, and sampling."""
+    if (
+        raw_logits.dtype != torch.bfloat16
+        or exponential_noise.dtype != torch.float32
+        or raw_logits.ndim != 2
+        or exponential_noise.shape != raw_logits.shape
+        or not raw_logits.is_contiguous()
+        or not exponential_noise.is_contiguous()
+    ):
+        raise ValueError(
+            "softcap_categorical_stats_sample requires matching contiguous BF16/FP32 2D tensors"
+        )
+    if exponential_noise.device != raw_logits.device:
+        raise ValueError("softcap_categorical_stats_sample tensors must share one CUDA device")
+    if raw_logits.shape[0] == 0 or raw_logits.shape[1] == 0:
+        raise ValueError("softcap_categorical_stats_sample requires non-empty rows and vocabulary")
+
+    rows, vocab_size = raw_logits.shape
+    processed_logits = torch.empty_like(raw_logits, dtype=torch.float32)
+    self_conditioning_logits = torch.empty_like(raw_logits)
+    entropy = torch.empty((rows,), dtype=torch.float32, device=raw_logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=raw_logits.device)
+    sample = torch.empty((rows,), dtype=torch.int64, device=raw_logits.device)
+    invalid = torch.zeros((), dtype=torch.int32, device=raw_logits.device)
+    stream_ptr = torch.cuda.current_stream(raw_logits.device).cuda_stream
+    _C.softcap_categorical_stats_sample(
+        _wrap_for_dlpack(raw_logits),
+        _wrap_for_dlpack(exponential_noise),
+        _wrap_for_dlpack(processed_logits),
+        _wrap_for_dlpack(self_conditioning_logits),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(sample),
+        _wrap_for_dlpack(invalid),
+        cap,
+        inverse_temperature,
+        vocab_size,
+        stream_ptr,
+    )
+    return processed_logits, self_conditioning_logits, entropy, argmax, sample, invalid
 
 
 def quantize_per_tensor_fp8(
@@ -2553,6 +2602,19 @@ def _build_constraints() -> dict:
         "softcap_scale": FunctionConstraints(
             params={
                 "raw_logits": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "softcap_categorical_stats_sample": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
             },
             default_devices=cuda_devices,
         ),
