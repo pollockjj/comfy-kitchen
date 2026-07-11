@@ -48,6 +48,7 @@ __all__ = [
     # Fused matmul
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
+    "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
@@ -462,6 +463,32 @@ def scaled_mm_mxfp8(
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_mxfp8(
         a, b, block_scale_a, block_scale_b, bias, dtype_code
+    )
+
+
+def grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Grouped SM120 MXFP8 linear over one fixed activation bucket per expert.
+
+    ``a_qdata`` is ``[num_experts * group_size, K]`` and ``weight_qdata`` is
+    ``[num_experts, N, K]``. Both operands use E4M3 data with E8M0 1x32 block
+    scales in the CUTLASS 128x4 swizzled layout. The result is
+    ``[num_experts, group_size, N]``.
+    """
+    return torch.ops.comfy_kitchen.grouped_scaled_mm_mxfp8(
+        a_qdata,
+        weight_qdata,
+        a_block_scales,
+        weight_block_scales,
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
     )
 
 

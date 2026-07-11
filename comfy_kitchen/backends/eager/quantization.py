@@ -751,6 +751,46 @@ def _op_scaled_mm_mxfp8_fake(
     m = a.shape[0]
     n = b.shape[0]
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
+
+
+@torch.library.custom_op("comfy_kitchen::grouped_scaled_mm_mxfp8", mutates_args=())
+def _op_grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a_qdata": a_qdata,
+        "weight_qdata": weight_qdata,
+        "a_block_scales": a_block_scales,
+        "weight_block_scales": weight_block_scales,
+        "group_size": group_size,
+        "out_dtype": out_dtype,
+    }
+    impl = registry.get_implementation("grouped_scaled_mm_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_grouped_scaled_mm_mxfp8.register_fake
+def _op_grouped_scaled_mm_mxfp8_fake(
+    a_qdata,
+    weight_qdata,
+    a_block_scales,
+    weight_block_scales,
+    group_size,
+    output_dtype_code,
+):
+    del a_block_scales, weight_block_scales
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(
+        (weight_qdata.shape[0], group_size, weight_qdata.shape[1]),
+        dtype=out_dtype,
+        device=a_qdata.device,
+    )
 # =============================================================================
 # INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
 # =============================================================================

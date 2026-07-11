@@ -56,6 +56,7 @@ __all__ = [
     "quantize_svdquant_w4a4",
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
+    "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
@@ -1646,6 +1647,65 @@ def grouped_scaled_mm_nvfp4(
     return out
 
 
+def grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run one SM120 CUTLASS MXFP8 GEMM for a fixed token bucket per expert."""
+    if not a_qdata.is_cuda or torch.cuda.get_device_capability(a_qdata.device) != (12, 0):
+        raise RuntimeError("grouped MXFP8 GEMM currently requires CUDA SM120")
+    if a_qdata.dtype != torch.float8_e4m3fn or weight_qdata.dtype != torch.float8_e4m3fn:
+        raise ValueError("grouped MXFP8 qdata must be float8_e4m3fn")
+    if (
+        a_block_scales.dtype != torch.float8_e8m0fnu
+        or weight_block_scales.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("grouped MXFP8 block scales must be float8_e8m0fnu")
+    if a_qdata.ndim != 2 or weight_qdata.ndim != 3:
+        raise ValueError("a_qdata must be 2D and weight_qdata must be a 3D expert bank")
+    groups, n, k = weight_qdata.shape
+    if a_qdata.shape != (groups * group_size, k):
+        raise ValueError("activation shape must be [groups * group_size, K]")
+    if group_size <= 0 or group_size % 128:
+        raise ValueError("group_size must be a positive multiple of 128")
+    if k <= 0 or k % 32:
+        raise ValueError("MXFP8 K must be a positive multiple of 32")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("grouped MXFP8 output must be float16 or bfloat16")
+
+    tensors = (a_qdata, weight_qdata, a_block_scales, weight_block_scales)
+    if any(tensor.device != a_qdata.device for tensor in tensors):
+        raise ValueError("all grouped MXFP8 tensors must be on the activation device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all grouped MXFP8 tensors must be contiguous")
+
+    scale_k = roundup(k // 32, 4)
+    scale_n = roundup(n, 128)
+    if a_block_scales.shape != (groups * group_size, scale_k):
+        raise ValueError("grouped MXFP8 activation scale shape mismatch")
+    if weight_block_scales.shape != (groups, scale_n, scale_k):
+        raise ValueError("grouped MXFP8 weight scale shape mismatch")
+
+    out = torch.empty((groups, group_size, n), device=a_qdata.device, dtype=out_dtype)
+    stream_ptr = torch.cuda.current_stream(a_qdata.device).cuda_stream
+    _C.cutlass_grouped_gemm_mxfp8(
+        _wrap_for_dlpack(a_qdata),
+        _wrap_for_dlpack(a_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(weight_qdata),
+        _wrap_for_dlpack(weight_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
+
+
 def fused_moe_nvfp4(
     x: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -2865,6 +2925,31 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(12, 0),
         )
+        if hasattr(torch, "float8_e8m0fnu"):
+            constraints["grouped_scaled_mm_mxfp8"] = FunctionConstraints(
+                params={
+                    "a_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=32)),
+                    ),
+                    "weight_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3), DivisibleBy(dim=2, factor=32)),
+                    ),
+                    "a_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu})
+                    ),
+                    "weight_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu})
+                    ),
+                    "group_size": ParamConstraint(dtypes=frozenset({int})),
+                    "out_dtype": ParamConstraint(
+                        dtypes=frozenset({torch.float16, torch.bfloat16})
+                    ),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
 
     return constraints
 
