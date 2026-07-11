@@ -90,6 +90,8 @@ __global__ void prepare_grouped_mxfp8_args(
     int n,
     int k,
     int num_groups,
+    const int32_t* m_indptr,
+    int scale_group_m,
     ProblemShape* problem_sizes,
     const ElementA** a_ptr,
     const ElementB** b_ptr,
@@ -115,26 +117,33 @@ __global__ void prepare_grouped_mxfp8_args(
         (static_cast<size_t>(k) + scale_k_alignment - 1) / scale_k_alignment *
         scale_k_alignment;
     const size_t scale_k = swizzled_k / static_cast<size_t>(ScaleGranularity);
-    const size_t activation_row = static_cast<size_t>(group) * group_m;
+    int m = group_m;
+    size_t activation_row = static_cast<size_t>(group) * group_m;
+    if (m_indptr != nullptr) {
+        const int32_t start = m_indptr[group];
+        const int32_t end = m_indptr[group + 1];
+        m = end - start;
+        activation_row = static_cast<size_t>(start);
+    }
 
     // Swap A/B so the large expert output dimension is CUTLASS M and the
     // small routed-token bucket is CUTLASS N.
-    problem_sizes[group] = ProblemShape(n, group_m, k);
+    problem_sizes[group] = ProblemShape(n, m, k);
     stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {n, k, 1});
-    stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {group_m, k, 1});
-    stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {n, group_m, 1});
+    stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {m, k, 1});
+    stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {n, m, 1});
     a_ptr[group] = weights + static_cast<size_t>(group) * n * k;
     b_ptr[group] = activations + activation_row * static_cast<size_t>(k);
     output_ptr[group] = output + activation_row * static_cast<size_t>(n);
 
     layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
-        make_shape(static_cast<int>(scale_n), group_m, static_cast<int>(swizzled_k), 1));
+        make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
     scale_a_ptr[group] =
         weight_scales + static_cast<size_t>(group) * scale_n * scale_k;
     layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
-        make_shape(static_cast<int>(scale_n), group_m, static_cast<int>(swizzled_k), 1));
+        make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
     scale_b_ptr[group] =
-        activation_scales + static_cast<size_t>(group) * group_m * scale_k;
+        activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
 }
 
 template <class ElementD>
@@ -146,6 +155,8 @@ bool run_grouped_mxfp8(
     void* output_raw,
     int num_groups,
     int group_m,
+    const int32_t* m_indptr,
+    int scale_group_m,
     int n,
     int k,
     void* workspace,
@@ -256,6 +267,8 @@ bool run_grouped_mxfp8(
         n,
         k,
         num_groups,
+        m_indptr,
+        scale_group_m,
         problem_sizes,
         a_ptr,
         b_ptr,
@@ -314,6 +327,8 @@ bool run_grouped_mxfp8(
     (void)output_raw;
     (void)num_groups;
     (void)group_m;
+    (void)m_indptr;
+    (void)scale_group_m;
     (void)n;
     (void)k;
     (void)workspace;
@@ -349,14 +364,16 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8(
     if (out_dtype_code == 1) {
         return comfy::run_grouped_mxfp8<cutlass::half_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
-            static_cast<int>(num_groups), static_cast<int>(group_m), static_cast<int>(n),
-            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size), stream);
+            static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
+            static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
     }
     if (out_dtype_code == 2) {
         return comfy::run_grouped_mxfp8<cutlass::bfloat16_t>(
             activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
-            static_cast<int>(num_groups), static_cast<int>(group_m), static_cast<int>(n),
-            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size), stream);
+            static_cast<int>(num_groups), static_cast<int>(group_m), nullptr,
+            static_cast<int>(group_m), static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
     }
 #else
     (void)activation_ptr;
@@ -366,6 +383,58 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8(
     (void)output_ptr;
     (void)num_groups;
     (void)group_m;
+    (void)n;
+    (void)k;
+    (void)out_dtype_code;
+    (void)workspace_ptr;
+    (void)workspace_size;
+    (void)stream;
+#endif
+    return false;
+}
+
+extern "C" bool launch_cutlass_grouped_gemm_mxfp8_variable(
+    const void* activation_ptr,
+    const void* activation_scale_ptr,
+    const void* weight_ptr,
+    const void* weight_scale_ptr,
+    void* output_ptr,
+    const int32_t* m_indptr_ptr,
+    int64_t num_groups,
+    int64_t scale_group_m,
+    int64_t n,
+    int64_t k,
+    int out_dtype_code,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream) {
+#ifdef COMFY_HAVE_CUTLASS
+    if (num_groups <= 0) {
+        return true;
+    }
+    if (out_dtype_code == 1) {
+        return comfy::run_grouped_mxfp8<cutlass::half_t>(
+            activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
+            static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
+            static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
+    }
+    if (out_dtype_code == 2) {
+        return comfy::run_grouped_mxfp8<cutlass::bfloat16_t>(
+            activation_ptr, activation_scale_ptr, weight_ptr, weight_scale_ptr, output_ptr,
+            static_cast<int>(num_groups), 0, m_indptr_ptr, static_cast<int>(scale_group_m),
+            static_cast<int>(n), static_cast<int>(k), workspace_ptr,
+            static_cast<size_t>(workspace_size), stream);
+    }
+#else
+    (void)activation_ptr;
+    (void)activation_scale_ptr;
+    (void)weight_ptr;
+    (void)weight_scale_ptr;
+    (void)output_ptr;
+    (void)m_indptr_ptr;
+    (void)num_groups;
+    (void)scale_group_m;
     (void)n;
     (void)k;
     (void)out_dtype_code;

@@ -50,6 +50,7 @@ __all__ = [
     "grouped_scaled_mm_nvfp4",
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
+    "fused_moe_mxfp8",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -393,6 +394,35 @@ def fused_moe_nvfp4(
         "alpha2": alpha2,
     }
     impl = registry.get_implementation("fused_moe_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_mxfp8(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run a routed MXFP8 MoE layer entirely inside the Kitchen backend.
+
+    The SM120 specialization dynamically quantizes float16 or bfloat16
+    activations, consumes E4M3 expert weights with UE8M0 1x32 block scales,
+    applies ``GELU_tanh(gate) * up``, and returns the FP32 router-weighted sum
+    in the input dtype. The gate/up projection is stored in ``[gate, up]`` order.
+    """
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+    }
+    impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
 
 

@@ -58,6 +58,7 @@ __all__ = [
     "grouped_scaled_mm_nvfp4",
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
+    "fused_moe_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
 ]
@@ -1787,6 +1788,75 @@ def fused_moe_nvfp4(
     return output
 
 
+def fused_moe_mxfp8(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run the native SM120 routed MXFP8 GEGLU pipeline."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device) != (12, 0):
+        raise RuntimeError("fused MXFP8 MoE currently requires CUDA SM120")
+    if x.dtype not in (torch.float16, torch.bfloat16) or x.ndim != 2 or not x.is_contiguous():
+        raise ValueError("fused MXFP8 MoE input must be contiguous 2D float16 or bfloat16")
+    if x.shape[0] not in (256, 340) or x.shape[1] != 2816:
+        raise ValueError("fused MXFP8 MoE input shape must be [256|340, 2816]")
+    if expert_ids.shape != (x.shape[0], 6):
+        raise ValueError("expert_ids must be [num_tokens, 6]")
+    if (
+        router_weights.dtype != torch.float32
+        or router_weights.shape != expert_ids.shape
+        or not router_weights.is_contiguous()
+    ):
+        raise ValueError("router_weights must be contiguous float32 with the expert_ids shape")
+
+    tensors = (fc1_qdata, fc1_block_scales, fc2_qdata, fc2_block_scales)
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("all fused MXFP8 MoE tensors must be on the input device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all fused MXFP8 MoE tensors must be contiguous")
+    if fc1_qdata.dtype != torch.float8_e4m3fn or fc2_qdata.dtype != torch.float8_e4m3fn:
+        raise ValueError("fused MXFP8 MoE qdata must be float8_e4m3fn")
+    if (
+        fc1_block_scales.dtype != torch.float8_e8m0fnu
+        or fc2_block_scales.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("fused MXFP8 MoE block scales must be float8_e8m0fnu")
+    if fc1_qdata.shape != (128, 1408, 2816):
+        raise ValueError("fc1_qdata must have shape [128, 1408, 2816]")
+    if fc1_block_scales.shape != (128, 1408, 88):
+        raise ValueError("fc1_block_scales must have shape [128, 1408, 88]")
+    if fc2_qdata.shape != (128, 2816, 704):
+        raise ValueError("fc2_qdata must have shape [128, 2816, 704]")
+    if fc2_block_scales.shape != (128, 2816, 24):
+        raise ValueError("fc2_block_scales must have shape [128, 2816, 24]")
+
+    expert_ids_i32 = (
+        expert_ids
+        if expert_ids.dtype == torch.int32 and expert_ids.is_contiguous()
+        else expert_ids.to(dtype=torch.int32).contiguous()
+    )
+    output = torch.empty_like(x)
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.cutlass_fused_moe_mxfp8(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(expert_ids_i32),
+        _wrap_for_dlpack(router_weights),
+        _wrap_for_dlpack(fc1_qdata),
+        _wrap_for_dlpack(fc1_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(fc2_qdata),
+        _wrap_for_dlpack(fc2_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
+        stream_ptr,
+    )
+    return output
+
+
 def int8_linear(
     x: torch.Tensor,
     weight: torch.Tensor,
@@ -2945,6 +3015,40 @@ def _build_constraints() -> dict:
                     "group_size": ParamConstraint(dtypes=frozenset({int})),
                     "out_dtype": ParamConstraint(
                         dtypes=frozenset({torch.float16, torch.bfloat16})
+                    ),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
+            constraints["fused_moe_mxfp8"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(
+                        dtypes=frozenset({torch.float16, torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "expert_ids": ParamConstraint(
+                        dtypes=frozenset({torch.int32, torch.int64}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "router_weights": ParamConstraint(
+                        dtypes=frozenset({torch.float32}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "fc1_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc1_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
                     ),
                 },
                 default_devices=cuda_devices,
