@@ -2100,13 +2100,49 @@ def grouped_int8_convrot_linear(
         raise ValueError(f"Grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
     if convrot_groupsize not in (64, 256) or x.shape[2] % convrot_groupsize != 0:
         raise ValueError("Grouped INT8 ConvRot requires group size 64 or 256 dividing K")
-    return torch.stack([
-        int8_linear(
-            x[e], weight[e], weight_scale[e], out_dtype=out_dtype,
-            convrot=True, convrot_groupsize=convrot_groupsize,
-        )
-        for e in range(x.shape[0])
-    ])
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("Grouped INT8 ConvRot input must be float32, float16, or bfloat16")
+    if weight.dtype != torch.int8 or weight_scale.dtype != torch.float32:
+        raise ValueError("Grouped INT8 ConvRot requires int8 weights and float32 scales")
+    if weight.device != x.device or weight_scale.device != x.device:
+        raise ValueError("Grouped INT8 ConvRot tensors must share one CUDA device")
+
+    experts, bucket, k = x.shape
+    n = weight.shape[1]
+    x_flat = x.reshape(experts * bucket, k)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+    qdata_flat = torch.empty_like(x_flat, dtype=torch.int8)
+    activation_scales_flat = torch.empty(
+        (experts * bucket, 1), dtype=torch.float32, device=x.device
+    )
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int8_rowwise_convrot64(
+        _wrap_for_dlpack(x_flat),
+        _wrap_for_dlpack(qdata_flat),
+        _wrap_for_dlpack(activation_scales_flat),
+        convrot_groupsize,
+        False,
+        0,
+        stream_ptr,
+    )
+
+    qdata = qdata_flat.view(experts, bucket, k)
+    weights = weight if weight.is_contiguous() else weight.contiguous()
+    activation_scales = activation_scales_flat.view(experts, bucket)
+    weight_scales = weight_scale.reshape(experts, n).contiguous()
+    output = torch.empty((experts, bucket, n), dtype=out_dtype, device=x.device)
+    if not _C.cutlass_grouped_int8_dequant(
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(activation_scales),
+        _wrap_for_dlpack(weight_scales),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    ):
+        raise RuntimeError("Native grouped INT8 ConvRot CUTLASS GEMM is unavailable")
+    return output
 
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -2995,7 +3031,7 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
-            min_compute_capability=(7, 5),
+            min_compute_capability=(8, 0),
         )
         constraints["scaled_mm_nvfp4"] = FunctionConstraints(
             params={

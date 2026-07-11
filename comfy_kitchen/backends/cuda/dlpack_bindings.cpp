@@ -1405,6 +1405,19 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    bool launch_cutlass_grouped_int8_dequant(
+        const void* A,
+        const void* B,
+        const void* xs,
+        const void* ws,
+        void* D,
+        int64_t groups,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int out_dtype_code,
+        cudaStream_t stream);
+
     bool launch_cutlass_int4_dequant(
         const void* A,
         const void* B,
@@ -1984,6 +1997,40 @@ bool cutlass_int8_dequant(
     const void* bias_ptr = bias.size() > 0 ? bias.data() : nullptr;
     return launch_cutlass_int8_dequant(a.data(), b.data(), xs.data(), ws.data(),
                                        bias_ptr, d.data(), M, N, K, out_dtype_code, stream);
+}
+
+bool cutlass_grouped_int8_dequant(
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> a,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> b,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> xs,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> ws,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> d,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t groups = a.shape(0);
+    const int64_t M = a.shape(1);
+    const int64_t K = a.shape(2);
+    const int64_t N = b.shape(1);
+    if (b.shape(0) != groups || b.shape(2) != K) {
+        throw std::runtime_error("cutlass_grouped_int8_dequant: weight shape mismatch");
+    }
+    if (xs.shape(0) != groups || xs.shape(1) != M) {
+        throw std::runtime_error("cutlass_grouped_int8_dequant: activation scale shape mismatch");
+    }
+    if (ws.shape(0) != groups || ws.shape(1) != N) {
+        throw std::runtime_error("cutlass_grouped_int8_dequant: weight scale shape mismatch");
+    }
+    if (d.shape(0) != groups || d.shape(1) != M || d.shape(2) != N) {
+        throw std::runtime_error("cutlass_grouped_int8_dequant: output shape mismatch");
+    }
+    if (out_dtype_code < 0 || out_dtype_code > 2 ||
+        map_dtype_to_code(d.dtype()) != out_dtype_code) {
+        throw std::runtime_error("cutlass_grouped_int8_dequant: output dtype mismatch");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return launch_cutlass_grouped_int8_dequant(
+        a.data(), b.data(), xs.data(), ws.data(), d.data(), groups, M, N, K,
+        out_dtype_code, stream);
 }
 
 // INT4 GEMM + fused dequant via CUTLASS. A and B are packed signed int4 in int8 storage.
@@ -2687,6 +2734,16 @@ NB_MODULE(_C, m) {
           nb::arg("xs"),
           nb::arg("ws"),
           nb::arg("bias"),
+          nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_int8_dequant", &cutlass_grouped_int8_dequant,
+          "Batched expert INT8 GEMM with fused rowwise x colwise dequant via CUTLASS",
+          nb::arg("a"),
+          nb::arg("b"),
+          nb::arg("xs"),
+          nb::arg("ws"),
           nb::arg("d"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));

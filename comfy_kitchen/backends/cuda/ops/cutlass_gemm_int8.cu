@@ -159,6 +159,27 @@ struct FusedInt8GemmNoBias {
         if (gemm.initialize(args, nullptr, stream) != cutlass::Status::kSuccess) return false;
         return gemm(stream) == cutlass::Status::kSuccess;
     }
+
+    static bool run_batched(const int8_t* A, const int8_t* B, const float* xs,
+                            const float* ws, ElementOutput* D, int groups, int M,
+                            int N, int K, cudaStream_t stream) {
+        cutlass::gemm::GemmCoord problem(M, N, K);
+        typename EVTD::Arguments cb{
+            { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+              {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
+            {D, {N, _1{}, M * N}} };
+        typename Gemm::Arguments args(
+            cutlass::gemm::GemmUniversalMode::kBatched, problem, groups, cb,
+            const_cast<int8_t*>(A), const_cast<int8_t*>(B), nullptr, nullptr,
+            static_cast<int64_t>(M) * K, static_cast<int64_t>(N) * K, 0, 0,
+            K, K, 0, 0);
+
+        Gemm gemm;
+        if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+        if (Gemm::get_workspace_size(args) != 0) return false;
+        if (gemm.initialize(args, nullptr, stream) != cutlass::Status::kSuccess) return false;
+        return gemm(stream) == cutlass::Status::kSuccess;
+    }
 };
 
 // Autotuning dispatcher: try each tile config, time it, cache the fastest per
@@ -359,6 +380,32 @@ bool dispatch_fused_no_bias_strided(const int8_t* A, const int8_t* B, const floa
     if (best < 0) return false;
     return runners[best](A, B, xs, ws, D, M, N, K, output_stride, stream);
 }
+
+template <typename OutT>
+bool dispatch_fused_no_bias_batched(
+    const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+    OutT* D, int groups, int M, int N, int K, cudaStream_t stream) {
+    using Fn = bool (*)(
+        const int8_t*, const int8_t*, const float*, const float*, OutT*,
+        int, int, int, int, cudaStream_t);
+    static const Fn small_m_runners[] = {
+        &FusedInt8GemmNoBias<OutT,  64, 128, 64, 32, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 128, 64, 64, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 256, 64, 64, 64, 64, 3>::run_batched,
+    };
+    static const Fn large_m_runners[] = {
+        &FusedInt8GemmNoBias<OutT, 128, 128, 64, 64, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 256, 64, 64, 64, 64, 3>::run_batched,
+        &FusedInt8GemmNoBias<OutT,  64, 128, 64, 32, 64, 64, 4>::run_batched,
+    };
+    const Fn* runners = M <= 64 ? small_m_runners : large_m_runners;
+    for (int index = 0; index < 3; ++index) {
+        if (runners[index](A, B, xs, ws, D, groups, M, N, K, stream)) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
 
 extern "C" {
@@ -416,6 +463,34 @@ bool launch_cutlass_int8_dequant_strided(
         default: return false;
     }
 }
+
+bool launch_cutlass_grouped_int8_dequant(
+    const void* A, const void* B, const void* xs, const void* ws, void* D,
+    int64_t groups, int64_t M, int64_t N, int64_t K, int out_dtype_code,
+    cudaStream_t stream) {
+    if (groups == 0 || M == 0 || N == 0 || K == 0) return true;
+    if (groups < 0 || M < 0 || N < 0 || K < 0 ||
+        groups > INT32_MAX || M > INT32_MAX || N > INT32_MAX || K > INT32_MAX) {
+        return false;
+    }
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    switch (out_dtype_code) {
+        case 0:
+            return dispatch_fused_no_bias_batched<float>(
+                a, b, x, w, static_cast<float*>(D), groups, M, N, K, stream);
+        case 1:
+            return dispatch_fused_no_bias_batched<cutlass::half_t>(
+                a, b, x, w, static_cast<cutlass::half_t*>(D), groups, M, N, K, stream);
+        case 2:
+            return dispatch_fused_no_bias_batched<cutlass::bfloat16_t>(
+                a, b, x, w, static_cast<cutlass::bfloat16_t*>(D), groups, M, N, K, stream);
+        default:
+            return false;
+    }
+}
 }  // extern "C"
 
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
@@ -429,6 +504,12 @@ extern "C" bool launch_cutlass_int8_dequant(
 extern "C" bool launch_cutlass_int8_dequant_strided(
     const void*, const void*, const void*, const void*, const void*,
     void*, int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_grouped_int8_dequant(
+    const void*, const void*, const void*, const void*, void*,
+    int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
     return false;
 }
 
