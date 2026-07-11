@@ -356,8 +356,11 @@ bool run_selected_grouped_mxfp8(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
-    if (n == 2816 && k == 704) {
-        return run_grouped_mxfp8<128, 64, 128, ElementD>(
+    // DiffusionGemma routes 2,048 rows over 128 experts, so a 32-row CTA
+    // leaves half of the routed-token tile idle on the mean expert. Keep the
+    // grouped persistent scheduler but expose work at its 16-row granularity.
+    if ((n == 1408 && k == 2816) || (n == 2816 && k == 704)) {
+        return run_grouped_mxfp8<128, 16, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
