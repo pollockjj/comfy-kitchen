@@ -410,6 +410,9 @@ bool dispatch_fused_no_bias_batched(
     }
     return false;
 }
+}  // namespace
+
+namespace packed_int8 {
 
 using PackedInt8Epilogue = cutlass::epilogue::thread::LinearCombination<
     int32_t, 4, int32_t, int32_t>;
@@ -651,7 +654,7 @@ bool run_packed_grouped_int8(
         n);
     return cudaGetLastError() == cudaSuccess;
 }
-}  // namespace
+}  // namespace packed_int8
 
 extern "C" {
 // out_dtype_code: 0=float32, 1=float16, 2=bfloat16 (DTYPE_TO_CODE).
@@ -738,7 +741,7 @@ bool launch_cutlass_grouped_int8_dequant(
 }
 
 size_t cutlass_grouped_int8_dequant_packed_workspace_size(int64_t groups, int64_t rows) {
-    return packed_grouped_int8_workspace_size(groups, rows);
+    return packed_int8::packed_grouped_int8_workspace_size(groups, rows);
 }
 
 bool launch_cutlass_grouped_int8_dequant_packed(
@@ -761,20 +764,20 @@ bool launch_cutlass_grouped_int8_dequant_packed(
         rows > INT32_MAX || n > INT32_MAX || k > INT32_MAX) {
         return false;
     }
-    if (workspace_size < packed_grouped_int8_workspace_size(groups, rows)) {
+    if (workspace_size < packed_int8::packed_grouped_int8_workspace_size(groups, rows)) {
         return false;
     }
     switch (out_dtype_code) {
         case 0:
-            return run_packed_grouped_int8<float>(
+            return packed_int8::run_packed_grouped_int8<float>(
                 activations, weights, activation_scales, weight_scales, expert_indptr,
                 accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
         case 1:
-            return run_packed_grouped_int8<cutlass::half_t>(
+            return packed_int8::run_packed_grouped_int8<cutlass::half_t>(
                 activations, weights, activation_scales, weight_scales, expert_indptr,
                 accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
         case 2:
-            return run_packed_grouped_int8<cutlass::bfloat16_t>(
+            return packed_int8::run_packed_grouped_int8<cutlass::bfloat16_t>(
                 activations, weights, activation_scales, weight_scales, expert_indptr,
                 accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
         default:

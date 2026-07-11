@@ -2839,7 +2839,7 @@ NB_MODULE(_C, m) {
           nb::arg("rows"));
 
     m.def("cutlass_grouped_int8_dequant_packed", &cutlass_grouped_int8_dequant_packed,
-          "Packed variable-M expert INT8 GEMM with fused output dequantization",
+          "Packed variable-M expert INT8 GEMM followed by output dequantization",
           nb::arg("activations"),
           nb::arg("weights"),
           nb::arg("activation_scales"),

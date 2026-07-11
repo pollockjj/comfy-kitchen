@@ -810,7 +810,11 @@ def grouped_int8_convrot_linear_packed(
     *,
     out_dtype: torch.dtype = torch.bfloat16,
 ) -> torch.Tensor:
-    """Grouped ConvRot INT8 linear over packed, expert-sorted activation rows."""
+    """Grouped ConvRot INT8 linear over packed, expert-sorted activation rows.
+
+    ``expert_indptr`` is trusted capture metadata: it must be monotonic, start at
+    zero, end at ``x.shape[0]``, and contain one interval per weight expert.
+    """
     return torch.ops.comfy_kitchen.grouped_int8_convrot_linear_packed(
         x,
         expert_indptr,
