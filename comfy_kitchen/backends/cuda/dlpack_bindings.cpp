@@ -2795,7 +2795,7 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("workspace"),
           nb::arg("stream_ptr"),
-          nb::arg("_use_dg_fc2") = true);
+          nb::arg("_use_dg_fc2") = false);
 
     m.def("_dg_mxfp8_mma_probe", &dg_mxfp8_mma_probe,
           "Internal SM120 m16n8k32 MXFP8 instruction probe",
