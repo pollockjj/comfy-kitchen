@@ -4,6 +4,9 @@ import torch
 import comfy_kitchen as ck
 
 
+cuda_status = ck.list_backends().get("cuda", {})
+
+
 def _reference(qweight, block_scales, indices, output_type):
     full = ck.dequantize_mxfp8(qweight, block_scales, output_type)
     return full.index_select(0, indices.reshape(-1)).reshape(*indices.shape, qweight.shape[1])
@@ -30,7 +33,8 @@ def test_mxfp8_embedding_eager_rejects_out_of_range_index():
 
 @pytest.mark.skipif(
     not torch.cuda.is_available()
-    or "mxfp8_embedding" not in ck.list_backends().get("cuda", {}).get("capabilities", ()),
+    or not cuda_status.get("available", False)
+    or "mxfp8_embedding" not in cuda_status.get("capabilities", ()),
     reason="native CUDA MXFP8 embedding kernel required",
 )
 @pytest.mark.parametrize("output_type", [torch.float32, torch.float16, torch.bfloat16])
