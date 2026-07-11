@@ -26,7 +26,7 @@ __global__ void softcap_scale_bf16_kernel(
          index < numel;
          index += stride) {
         const float value = __bfloat162float(raw_logits[index]);
-        output[index] = tanhf(value / cap) * cap * inverse_temperature;
+        output[index] = tanhf(value * (1.0f / cap)) * cap * inverse_temperature;
     }
 }
 
