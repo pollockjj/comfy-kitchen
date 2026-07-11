@@ -323,12 +323,17 @@ bool run_grouped_nvfp4(
     hardware_info.device_id = device;
     hardware_info.sm_count = cached_sm_count;
 
+    using TileSchedulerArguments = typename Gemm::GemmKernel::TileSchedulerArguments;
+    using RasterOrderOptions = typename Gemm::GemmKernel::TileScheduler::RasterOrderOptions;
+    TileSchedulerArguments scheduler_args{1, RasterOrderOptions::AlongN};
+
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
         {num_groups, problem_sizes, nullptr},
         {a_ptr, stride_a, b_ptr, stride_b, scale_a_ptr, layout_scale_a, scale_b_ptr, layout_scale_b},
         {{}, nullptr, nullptr, out_ptr, stride_d},
-        hardware_info};
+        hardware_info,
+        scheduler_args};
     auto& fusion = arguments.epilogue.thread;
     fusion.alpha = 0.0f;
     fusion.beta = 0.0f;
