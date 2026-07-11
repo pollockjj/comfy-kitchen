@@ -357,7 +357,7 @@ bool run_selected_grouped_mxfp8(
     size_t workspace_size,
     cudaStream_t stream) {
     if (n == 2816 && k == 704) {
-        return run_grouped_mxfp8<128, 64, 256, ElementD>(
+        return run_grouped_mxfp8<128, 64, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
