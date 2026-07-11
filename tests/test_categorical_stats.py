@@ -34,3 +34,21 @@ def test_categorical_stats_rejects_unsupported_storage():
         ck.categorical_stats(torch.randn(2, 8, dtype=torch.bfloat16))
     with pytest.raises(ValueError, match="contiguous"):
         ck.categorical_stats(torch.randn(2, 8).t())
+
+
+@pytest.mark.parametrize("backend", ["eager", "cuda"])
+def test_softcap_scale_is_bit_exact(backend, cuda_available):
+    device = "cuda" if backend == "cuda" else "cpu"
+    if backend == "cuda" and not cuda_available:
+        pytest.skip("CUDA unavailable")
+    if backend not in get_capable_backends("softcap_scale", device):
+        pytest.skip(f"backend '{backend}' is not capable")
+
+    raw_logits = torch.linspace(-64, 64, 1542, device=device).to(torch.bfloat16).reshape(2, 3, 257)
+    reference = torch.tanh(raw_logits.float() / 30.0) * 30.0 * 1.25
+    with ck.use_backend(backend):
+        output = ck.softcap_scale(raw_logits, 30.0, 1.25)
+
+    assert output.dtype == torch.float32
+    assert output.shape == raw_logits.shape
+    assert torch.equal(output, reference)

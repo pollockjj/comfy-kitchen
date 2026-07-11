@@ -1,4 +1,5 @@
 import torch
+import math
 
 from .backends import cuda as _cuda_backend  # noqa: F401
 
@@ -29,6 +30,7 @@ __all__ = [
     # Normalization
     "adaln",
     "categorical_stats",
+    "softcap_scale",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -123,6 +125,27 @@ def categorical_stats(
         entropy.reshape(leading_shape),
         argmax.reshape(leading_shape),
     )
+
+
+def softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    """Apply FP32 logit softcapping followed by inverse-temperature scaling."""
+    if raw_logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("softcap_scale requires floating-point logits")
+    if raw_logits.numel() == 0:
+        raise ValueError("softcap_scale requires non-empty logits")
+    if not raw_logits.is_contiguous():
+        raise ValueError("softcap_scale requires contiguous logits")
+    cap = float(cap)
+    inverse_temperature = float(inverse_temperature)
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError("softcap_scale requires a finite positive cap")
+    if not math.isfinite(inverse_temperature) or inverse_temperature <= 0:
+        raise ValueError("softcap_scale requires a finite positive inverse temperature")
+    return torch.ops.comfy_kitchen.softcap_scale(raw_logits, cap, inverse_temperature)
 
 
 def quantize_per_tensor_fp8(

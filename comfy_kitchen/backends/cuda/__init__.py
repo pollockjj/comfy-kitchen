@@ -27,6 +27,7 @@ __all__ = [
     "apply_rope_split_half",
     "apply_rope_split_half1",
     "categorical_stats",
+    "softcap_scale",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -395,6 +396,30 @@ def categorical_stats(
         stream_ptr,
     )
     return probs, entropy, argmax
+
+
+def softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    """Apply strict-math FP32 softcapping and inverse-temperature scaling."""
+    if raw_logits.dtype != torch.bfloat16 or not raw_logits.is_contiguous():
+        raise ValueError("CUDA softcap_scale requires contiguous bfloat16 logits")
+    if raw_logits.numel() == 0:
+        raise ValueError("softcap_scale requires non-empty logits")
+
+    output = torch.empty_like(raw_logits, dtype=torch.float32)
+    stream_ptr = torch.cuda.current_stream(raw_logits.device).cuda_stream
+    _C.softcap_scale(
+        _wrap_for_dlpack(raw_logits),
+        _wrap_for_dlpack(output),
+        cap,
+        inverse_temperature,
+        raw_logits.numel(),
+        stream_ptr,
+    )
+    return output
 
 
 def quantize_per_tensor_fp8(
@@ -2299,6 +2324,12 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
                 ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "softcap_scale": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
             },
             default_devices=cuda_devices,
         ),

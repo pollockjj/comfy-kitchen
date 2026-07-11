@@ -17,6 +17,7 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <cuda_runtime.h>
+#include <cmath>
 #include <cstring>
 #include <string>
 
@@ -61,6 +62,14 @@ extern "C" {
         float* row_stats,
         int64_t rows,
         int64_t vocab_size,
+        cudaStream_t stream);
+
+    void launch_softcap_scale_kernel(
+        const void* raw_logits,
+        float* output,
+        int64_t numel,
+        float cap,
+        float inverse_temperature,
         cudaStream_t stream);
 
     void launch_stochastic_round_fp8_kernel(void* rng_and_output,
@@ -392,6 +401,33 @@ void categorical_stats(
         rows,
         vocab_size,
         stream);
+}
+
+void softcap_scale(
+    nb::ndarray<nb::device::cuda> raw_logits,
+    nb::ndarray<float, nb::device::cuda> output,
+    float cap,
+    float inverse_temperature,
+    int64_t numel,
+    uintptr_t stream_ptr)
+{
+    if (map_dtype_to_code(raw_logits.dtype()) != 2) {
+        throw std::runtime_error("softcap_scale requires bfloat16 logits");
+    }
+    if (
+        numel <= 0
+        || static_cast<int64_t>(raw_logits.size()) != numel
+        || static_cast<int64_t>(output.size()) != numel
+    ) {
+        throw std::runtime_error("softcap_scale input and output size mismatch");
+    }
+    if (!std::isfinite(cap) || cap <= 0.0f || !std::isfinite(inverse_temperature) || inverse_temperature <= 0.0f) {
+        throw std::runtime_error("softcap_scale requires finite positive scales");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_softcap_scale_kernel(
+        raw_logits.data(), output.data(), numel, cap, inverse_temperature, stream);
 }
 
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
@@ -2221,6 +2257,15 @@ NB_MODULE(_C, m) {
           nb::arg("argmax"),
           nb::arg("row_stats"),
           nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("softcap_scale", &softcap_scale,
+          "Strict FP32 softcap and inverse-temperature scaling for BF16 logits",
+          nb::arg("raw_logits"),
+          nb::arg("output"),
+          nb::arg("cap"),
+          nb::arg("inverse_temperature"),
+          nb::arg("numel"),
           nb::arg("stream_ptr"));
     
     m.def("cublas_gemm_blockwise_fp4", &cublas_gemm_blockwise_fp4,

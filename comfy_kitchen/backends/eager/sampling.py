@@ -14,6 +14,16 @@ def categorical_stats(
     return distribution.probs, distribution.entropy(), logits.argmax(dim=-1)
 
 
+def softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    """Apply logit softcapping in FP32 and scale by inverse temperature."""
+    logits = raw_logits.to(torch.float32)
+    return torch.tanh(logits / cap) * cap * inverse_temperature
+
+
 @torch.library.custom_op("comfy_kitchen::categorical_stats", mutates_args=())
 def _op_categorical_stats(
     logits: torch.Tensor,
@@ -31,3 +41,23 @@ def _op_categorical_stats_fake(logits):
         torch.empty((rows,), dtype=logits.dtype, device=logits.device),
         torch.empty((rows,), dtype=torch.int64, device=logits.device),
     )
+
+
+@torch.library.custom_op("comfy_kitchen::softcap_scale", mutates_args=())
+def _op_softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    kwargs = {
+        "raw_logits": raw_logits,
+        "cap": cap,
+        "inverse_temperature": inverse_temperature,
+    }
+    impl = registry.get_implementation("softcap_scale", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_softcap_scale.register_fake
+def _op_softcap_scale_fake(raw_logits, cap, inverse_temperature):
+    return torch.empty_like(raw_logits, dtype=torch.float32)

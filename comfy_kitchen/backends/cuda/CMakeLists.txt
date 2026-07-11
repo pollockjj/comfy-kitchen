@@ -119,6 +119,24 @@ set(CUDA_SOURCES
     ops/categorical_stats.cu
 )
 
+# Softcapping feeds DiffusionGemma self-conditioning and must retain strict
+# FP32 behavior. Compile it separately because the other CUDA kernels use
+# --use_fast_math globally.
+set(STRICT_CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS})
+list(REMOVE_ITEM STRICT_CUDA_NVCC_FLAGS --use_fast_math)
+list(APPEND STRICT_CUDA_NVCC_FLAGS --ftz=false --prec-div=true --prec-sqrt=true)
+add_library(comfy_kitchen_strict_cuda OBJECT ops/softcap_scale.cu)
+set_target_properties(comfy_kitchen_strict_cuda PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${COMFY_CUDA_ARCHS}"
+)
+target_compile_options(comfy_kitchen_strict_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${STRICT_CUDA_NVCC_FLAGS}>
+)
+target_include_directories(comfy_kitchen_strict_cuda PRIVATE
+    ${CUDAToolkit_INCLUDE_DIRS}
+)
+
 set(CPP_SOURCES
     dlpack_bindings.cpp
 )
@@ -140,6 +158,8 @@ else()
     message(STATUS "Python ${Python_VERSION} detected - building version-specific wheel")
     nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${CUDA_SOURCES})
 endif()
+
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_strict_cuda>)
 
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
