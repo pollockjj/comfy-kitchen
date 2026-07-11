@@ -256,10 +256,10 @@ struct DgNarrowMxfp8MainloopBuilder {
         SmemLayoutAtomScaleA,
         SmemLayoutAtomScaleB>(StageCountType{});
 
-    using KernelSchedule = cutlass_collective::
+    using KernelSchedule = cutlass::gemm::
         KernelPtrArrayTmaWarpSpecializedCooperativeBlockScaledSm120<
             SchedulerPipelineStageCount>;
-    using DispatchPolicy = cutlass_collective::MainloopSm120ArrayTmaWarpSpecializedBlockScaled<
+    using DispatchPolicy = cutlass::gemm::MainloopSm120ArrayTmaWarpSpecializedBlockScaled<
         PipelineStages,
         SchedulerPipelineStageCount,
         ClusterShapeMNK,
