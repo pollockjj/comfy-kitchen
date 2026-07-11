@@ -3,6 +3,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
+#include "utils.cuh"
 #include "dtype_dispatch.cuh"
 #include "float_utils.cuh"
 
