@@ -1126,8 +1126,8 @@ void mxfp8_embedding(
     if (embedding_dim % 32 != 0) {
         throw std::runtime_error("mxfp8_embedding requires embedding_dim divisible by 32");
     }
-    if (map_dtype_to_code(qweight.dtype()) != 5 || map_dtype_to_code(block_scales.dtype()) != 5) {
-        throw std::runtime_error("mxfp8_embedding requires E4M3 weights and E8M0 scales");
+    if (map_dtype_to_code(qweight.dtype()) != 5 || map_dtype_to_code(block_scales.dtype()) != 3) {
+        throw std::runtime_error("mxfp8_embedding requires E4M3 weights and uint8 E8M0 scale storage");
     }
     if (output_dtype_code < 0 || output_dtype_code > 2
         || map_dtype_to_code(output.dtype()) != output_dtype_code) {
