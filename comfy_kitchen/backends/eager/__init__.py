@@ -20,6 +20,7 @@ __all__ = [
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
+    "rmsnorm_quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_convrot_w4a4_weight",
@@ -68,6 +69,7 @@ from .quantization import (
     quantize_mxfp8,
     quantize_nvfp4,
     quantize_per_tensor_fp8,
+    rmsnorm_quantize_mxfp8,
     scaled_mm_mxfp8,
     scaled_mm_nvfp4,
     stochastic_rounding_fp8,
@@ -405,6 +407,19 @@ def _build_constraints() -> dict:
                     "x": ParamConstraint(
                         dtypes=standard_floats,
                         shape_rules=(ExactDims(2),),
+                    ),
+                },
+                default_devices=all_devices)
+
+        out["rmsnorm_quantize_mxfp8"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(
+                        dtypes=frozenset({torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "weight": ParamConstraint(
+                        dtypes=frozenset({torch.bfloat16}),
+                        shape_rules=(ExactDims(1),),
                     ),
                 },
                 default_devices=all_devices)

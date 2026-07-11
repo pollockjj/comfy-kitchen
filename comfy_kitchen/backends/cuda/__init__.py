@@ -52,6 +52,7 @@ __all__ = [
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "quantize_mxfp8",
+    "rmsnorm_quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
@@ -1558,6 +1559,42 @@ def quantize_mxfp8(
     return qx, sx
 
 
+def rmsnorm_quantize_mxfp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse DG BF16 RMSNorm with native-layout MXFP8 activation quantization."""
+    if (
+        x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16
+        or tuple(x.shape) not in ((256, 2816), (340, 2816))
+        or tuple(weight.shape) != (2816,)
+        or not x.is_contiguous() or not weight.is_contiguous()
+    ):
+        raise ValueError(
+            "rmsnorm_quantize_mxfp8 requires contiguous BF16 [256|340, 2816] and [2816]"
+        )
+    if x.device != weight.device:
+        raise ValueError("rmsnorm_quantize_mxfp8 input and weight must share one CUDA device")
+
+    rows, cols = x.shape
+    qdata = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    scale_storage = torch.zeros(
+        (roundup(rows, 128), roundup(cols // 32, 4)),
+        dtype=torch.uint8,
+        device=x.device,
+    )
+    _C.rmsnorm_quantize_mxfp8(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(scale_storage),
+        eps,
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    return qdata, scale_storage.view(torch.float8_e8m0fnu)
+
+
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2692,6 +2729,20 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),
+        "rmsnorm_quantize_mxfp8": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(12, 0),
         ),
         "dequantize_nvfp4": FunctionConstraints(
             params={

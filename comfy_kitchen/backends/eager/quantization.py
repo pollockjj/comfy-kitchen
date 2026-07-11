@@ -326,6 +326,16 @@ def quantize_mxfp8(
     return data_fp8, blocked_scales.view(torch.float8_e8m0fnu)
 
 
+def rmsnorm_quantize_mxfp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Reference DG RMSNorm followed by native-layout MXFP8 quantization."""
+    normalized = torch.nn.functional.rms_norm(x, (x.shape[-1],), weight, eps)
+    return quantize_mxfp8(normalized, pad_32x=False)
+
+
 def dequantize_mxfp8(
     qx: torch.Tensor,
     block_scales: torch.Tensor,
@@ -678,6 +688,29 @@ def _op_quantize_mxfp8_fake(x, pad_32x):
     scale_cols = roundup(num_blocks, 4)
     block_scales = torch.empty((scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=x.device)
 
+    return qdata, block_scales
+
+
+@torch.library.custom_op("comfy_kitchen::rmsnorm_quantize_mxfp8", mutates_args=())
+def _op_rmsnorm_quantize_mxfp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    kwargs = {"x": x, "weight": weight, "eps": eps}
+    impl = registry.get_implementation("rmsnorm_quantize_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_rmsnorm_quantize_mxfp8.register_fake
+def _op_rmsnorm_quantize_mxfp8_fake(x, weight, eps):
+    rows, cols = x.shape
+    qdata = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    block_scales = torch.empty(
+        (roundup(rows, 128), roundup(cols // 32, 4)),
+        dtype=torch.float8_e8m0fnu,
+        device=x.device,
+    )
     return qdata, block_scales
 
 

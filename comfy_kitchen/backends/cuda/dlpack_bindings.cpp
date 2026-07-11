@@ -280,6 +280,16 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    void launch_rmsnorm_quantize_mxfp8_kernel(
+        const void* input,
+        const void* weight,
+        void* qdata,
+        void* block_scales,
+        int64_t rows,
+        int64_t hidden_size,
+        float eps,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -1093,6 +1103,52 @@ void quantize_mxfp8(
         orig_cols,
         input_dtype_code,
         stream);
+}
+
+void rmsnorm_quantize_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> weight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> qdata,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> block_scales,
+    float eps,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(input.shape(0));
+    const int64_t hidden_size = static_cast<int64_t>(input.shape(1));
+    const int64_t scale_rows = ((rows + 127) / 128) * 128;
+    const int64_t block_cols = hidden_size / 32;
+    const int64_t scale_cols = ((block_cols + 3) / 4) * 4;
+    if (map_dtype_to_code(input.dtype()) != 2 || map_dtype_to_code(weight.dtype()) != 2) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires bfloat16 input and weight");
+    }
+    if (map_dtype_to_code(qdata.dtype()) != 5 || map_dtype_to_code(block_scales.dtype()) != 3) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires E4M3 output and uint8 scale storage");
+    }
+    if ((rows != 256 && rows != 340) || hidden_size != 2816 || weight.size() != hidden_size) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires [256|340, 2816] and [2816]");
+    }
+    if (
+        static_cast<int64_t>(qdata.shape(0)) != rows
+        || static_cast<int64_t>(qdata.shape(1)) != hidden_size
+        || static_cast<int64_t>(block_scales.shape(0)) != scale_rows
+        || static_cast<int64_t>(block_scales.shape(1)) != scale_cols
+    ) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 output shape mismatch");
+    }
+    const int device = input.device_id();
+    if (
+        weight.device_id() != device || qdata.device_id() != device
+        || block_scales.device_id() != device
+    ) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 tensors must share one CUDA device");
+    }
+    if (!std::isfinite(eps) || eps <= 0.0f) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires finite positive eps");
+    }
+
+    launch_rmsnorm_quantize_mxfp8_kernel(
+        input.data(), weight.data(), qdata.data(), block_scales.data(), rows, hidden_size,
+        eps, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -2933,6 +2989,15 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("rmsnorm_quantize_mxfp8", &rmsnorm_quantize_mxfp8,
+          "Fuse DG RMSNorm with native E4M3/E8M0 activation quantization",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("qdata"),
+          nb::arg("block_scales"),
+          nb::arg("eps"),
           nb::arg("stream_ptr"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,

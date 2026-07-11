@@ -40,6 +40,7 @@ __all__ = [
     "quantize_nvfp4",
     "dequantize_nvfp4",
     "quantize_mxfp8",
+    "rmsnorm_quantize_mxfp8",
     "dequantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
@@ -502,6 +503,26 @@ def quantize_mxfp8(
         - block_scales_e8m0: E8M0 scales in swizzled layout
     """
     return torch.ops.comfy_kitchen.quantize_mxfp8(x, pad_32x)
+
+
+def rmsnorm_quantize_mxfp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    eps: float = 1e-6,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Fuse DG row RMSNorm with native-layout MXFP8 activation quantization."""
+    if x.dtype != torch.bfloat16 or weight.dtype != torch.bfloat16:
+        raise ValueError("rmsnorm_quantize_mxfp8 requires bfloat16 input and weight")
+    if tuple(x.shape) not in ((256, 2816), (340, 2816)) or tuple(weight.shape) != (2816,):
+        raise ValueError("rmsnorm_quantize_mxfp8 requires [256|340, 2816] and [2816]")
+    if x.device != weight.device:
+        raise ValueError("rmsnorm_quantize_mxfp8 input and weight must share one device")
+    if not x.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("rmsnorm_quantize_mxfp8 requires contiguous tensors")
+    eps = float(eps)
+    if not math.isfinite(eps) or eps <= 0:
+        raise ValueError("rmsnorm_quantize_mxfp8 requires finite positive eps")
+    return torch.ops.comfy_kitchen.rmsnorm_quantize_mxfp8(x, weight, eps)
 
 
 def dequantize_mxfp8(
