@@ -858,8 +858,6 @@ void dg_mxfp8_mma_probe(
         activations.shape(0) != 8 || activations.shape(1) != 32 ||
         weight_scales.shape(0) != 16 || activation_scales.shape(0) != 8 ||
         output.shape(0) != 8 || output.shape(1) != 16 ||
-        map_dtype_to_code(weights.dtype()) != 5 ||
-        map_dtype_to_code(activations.dtype()) != 5 ||
         map_dtype_to_code(output.dtype()) != 2) {
         throw std::runtime_error(
             "DG MXFP8 MMA probe requires FP8 [16,32] weights, FP8 [8,32] "
