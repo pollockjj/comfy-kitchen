@@ -190,6 +190,14 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_dg_mxfp8_mma_probe(
+        const void* weights,
+        const uint8_t* weight_scales,
+        const void* activations,
+        const uint8_t* activation_scales,
+        void* output,
+        cudaStream_t stream);
+
     int cutlass_fused_moe_mxfp8_last_error_stage();
 
     bool launch_cutlass_fused_moe_nvfp4(
@@ -836,6 +844,32 @@ void cutlass_grouped_gemm_mxfp8(
             output.data(), num_groups, group_m, n, k, out_dtype_code, workspace.data(),
             workspace.size(), stream)) {
         throw std::runtime_error("CUTLASS grouped MXFP8 GEMM is unavailable for this configuration");
+    }
+}
+
+void dg_mxfp8_mma_probe(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    uintptr_t stream_ptr) {
+    if (weights.shape(0) != 16 || weights.shape(1) != 32 ||
+        activations.shape(0) != 8 || activations.shape(1) != 32 ||
+        weight_scales.shape(0) != 16 || activation_scales.shape(0) != 8 ||
+        output.shape(0) != 8 || output.shape(1) != 16 ||
+        map_dtype_to_code(weights.dtype()) != 5 ||
+        map_dtype_to_code(activations.dtype()) != 5 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error(
+            "DG MXFP8 MMA probe requires FP8 [16,32] weights, FP8 [8,32] "
+            "activations, uint8 [16]/[8] scales, and BF16 [8,16] output");
+    }
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_dg_mxfp8_mma_probe(
+            weights.data(), weight_scales.data(), activations.data(),
+            activation_scales.data(), output.data(), stream)) {
+        throw std::runtime_error("DG MXFP8 SM120 m16n8k32 probe is unavailable");
     }
 }
 
@@ -2667,6 +2701,15 @@ NB_MODULE(_C, m) {
           nb::arg("fc2_block_scales"),
           nb::arg("output"),
           nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("_dg_mxfp8_mma_probe", &dg_mxfp8_mma_probe,
+          "Internal SM120 m16n8k32 MXFP8 instruction probe",
+          nb::arg("weights"),
+          nb::arg("weight_scales"),
+          nb::arg("activations"),
+          nb::arg("activation_scales"),
+          nb::arg("output"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_fused_moe_nvfp4", &cutlass_fused_moe_nvfp4,
