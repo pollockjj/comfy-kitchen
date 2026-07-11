@@ -1840,7 +1840,7 @@ def fused_moe_mxfp8(
         else expert_ids.to(dtype=torch.int32).contiguous()
     )
     output = torch.empty_like(x)
-    workspace = torch.zeros(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
+    workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     _C.cutlass_fused_moe_mxfp8(
         _wrap_for_dlpack(x),

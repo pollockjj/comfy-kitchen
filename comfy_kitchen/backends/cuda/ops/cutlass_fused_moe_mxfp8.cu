@@ -421,6 +421,15 @@ bool run_fused_moe_mxfp8(
     }
 
     last_error_stage = 3;
+    const size_t input_scale_bytes =
+        static_cast<size_t>(e) * scale_group_m * input_scale_cols;
+    const size_t intermediate_scale_bytes =
+        static_cast<size_t>(e) * scale_group_m * intermediate_scale_cols;
+    if (cudaMemsetAsync(input_block_scales, 0, input_scale_bytes, stream) != cudaSuccess ||
+        cudaMemsetAsync(
+            intermediate_block_scales, 0, intermediate_scale_bytes, stream) != cudaSuccess) {
+        return false;
+    }
     if (cudaMemsetAsync(counts, 0, static_cast<size_t>(e) * sizeof(int32_t), stream) !=
         cudaSuccess) {
         return false;
