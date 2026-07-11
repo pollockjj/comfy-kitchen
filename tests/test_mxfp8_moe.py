@@ -255,6 +255,8 @@ def test_fused_moe_mxfp8_has_no_eager_fallback():
 def test_fused_moe_workspace_can_be_released(fused_expert_bank):
     stream = torch.cuda.current_stream()
     ck.release_cuda_stream_workspaces(stream)
+    assert ck.reserve_cuda_stream_workspaces(stream)
+    assert not ck.reserve_cuda_stream_workspaces(stream)
     x, expert_ids, router_weights = _fused_inputs(torch.bfloat16)
     ck.fused_moe_mxfp8(x, expert_ids, router_weights, *fused_expert_bank)
     assert ck.release_cuda_stream_workspaces(stream)
