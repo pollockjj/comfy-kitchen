@@ -37,6 +37,7 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "int8_linear",
+    "grouped_int8_convrot_linear",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -2082,6 +2083,32 @@ def int8_linear(
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
+def grouped_int8_convrot_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dispatch fixed expert buckets through CK's native rank-2 INT8 path."""
+    if x.dim() != 3 or weight.dim() != 3:
+        raise ValueError("Grouped INT8 ConvRot expects x [E, C, K] and weight [E, N, K]")
+    if x.shape[0] != weight.shape[0] or x.shape[2] != weight.shape[2]:
+        raise ValueError(f"Grouped INT8 ConvRot shape mismatch: x {tuple(x.shape)}, weight {tuple(weight.shape)}")
+    expected_scales = weight.shape[:2]
+    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
+        raise ValueError(f"Grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
+    if convrot_groupsize not in (64, 256) or x.shape[2] % convrot_groupsize != 0:
+        raise ValueError("Grouped INT8 ConvRot requires group size 64 or 256 dividing K")
+    return torch.stack([
+        int8_linear(
+            x[e], weight[e], weight_scale[e], out_dtype=out_dtype,
+            convrot=True, convrot_groupsize=convrot_groupsize,
+        )
+        for e in range(x.shape[0])
+    ])
+
+
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     orig_shape = x.shape
     d = x.shape[-1]
@@ -2947,6 +2974,25 @@ def _build_constraints() -> dict:
                 ),
                 "convrot": ParamConstraint(dtypes=frozenset({bool})),
                 "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(7, 5),
+        )
+        constraints["grouped_int8_convrot_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
+                ),
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),

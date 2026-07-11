@@ -59,6 +59,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
     "int8_linear",
+    "grouped_int8_convrot_linear",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -783,6 +784,20 @@ def int8_linear(
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def grouped_int8_convrot_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Grouped ConvRot INT8 linear over ``[experts, bucket, features]`` inputs."""
+    return torch.ops.comfy_kitchen.grouped_int8_convrot_linear(
+        x, weight, weight_scale, convrot_groupsize, DTYPE_TO_CODE[out_dtype]
+    )
 
 
 # =============================================================================

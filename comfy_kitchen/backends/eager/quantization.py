@@ -1099,6 +1099,32 @@ def int8_linear(
     return result.reshape(*orig_shape[:-1], weight.shape[0])
 
 
+def grouped_int8_convrot_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Apply ConvRot INT8 linear independently to fixed-size expert buckets."""
+    if x.dim() != 3 or weight.dim() != 3:
+        raise ValueError("Grouped INT8 ConvRot expects x [E, C, K] and weight [E, N, K]")
+    if x.shape[0] != weight.shape[0] or x.shape[2] != weight.shape[2]:
+        raise ValueError(f"Grouped INT8 ConvRot shape mismatch: x {tuple(x.shape)}, weight {tuple(weight.shape)}")
+    expected_scales = weight.shape[:2]
+    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
+        raise ValueError(f"Grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
+    if convrot_groupsize not in (64, 256) or x.shape[2] % convrot_groupsize != 0:
+        raise ValueError("Grouped INT8 ConvRot requires group size 64 or 256 dividing K")
+    return torch.stack([
+        int8_linear(
+            x[e], weight[e], weight_scale[e], out_dtype=out_dtype,
+            convrot=True, convrot_groupsize=convrot_groupsize,
+        )
+        for e in range(x.shape[0])
+    ])
+
+
 # =============================================================================
 # torch.library Custom Op Definitions — INT8 Tensor-wise
 # =============================================================================
@@ -1245,3 +1271,32 @@ def _op_int8_linear(
 def _op_int8_linear_fake(x, weight, weight_scale, bias, output_dtype_code, convrot=False, convrot_groupsize=256):
     out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
     return torch.empty(*x.shape[:-1], weight.shape[0], dtype=out_dtype, device=x.device)
+
+
+@torch.library.custom_op("comfy_kitchen::grouped_int8_convrot_linear", mutates_args=())
+def _op_grouped_int8_convrot_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "convrot_groupsize": convrot_groupsize,
+        "out_dtype": out_dtype,
+    }
+    return registry.get_implementation("grouped_int8_convrot_linear", kwargs=kwargs)(**kwargs)
+
+
+@_op_grouped_int8_convrot_linear.register_fake
+def _op_grouped_int8_convrot_linear_fake(x, weight, weight_scale, convrot_groupsize, output_dtype_code):
+    del weight_scale, convrot_groupsize
+    return torch.empty(
+        (x.shape[0], x.shape[1], weight.shape[1]),
+        dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],
+        device=x.device,
+    )

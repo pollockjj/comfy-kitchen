@@ -690,6 +690,28 @@ class TestTensorWisePublicAPI:
         assert out.shape == (4, 64)
         assert out.dtype == torch.bfloat16
 
+    @pytest.mark.parametrize("group_size", [64, 256])
+    def test_grouped_int8_convrot_matches_rank2_contract(self, seed, group_size):
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_convrot_weight
+
+        x = torch.randn(2, 3, group_size, dtype=torch.bfloat16)
+        weights = torch.randn(2, 8, group_size, dtype=torch.bfloat16)
+        quantized = [quantize_int8_convrot_weight(weight, group_size) for weight in weights]
+        qweight = torch.stack([item[0] for item in quantized])
+        scales = torch.stack([item[1] for item in quantized])
+
+        with ck.registry.use_backend("eager"):
+            actual = ck.grouped_int8_convrot_linear(x, qweight, scales, group_size)
+            expected = torch.stack([
+                ck.int8_linear(
+                    x[e], qweight[e], scales[e], convrot=True,
+                    convrot_groupsize=group_size,
+                )
+                for e in range(2)
+            ])
+
+        assert torch.equal(actual, expected)
+
     def test_eager_int8_linear_single_row(self, seed, device):
         """Eager int8_linear supports single-row batches."""
         import torch
