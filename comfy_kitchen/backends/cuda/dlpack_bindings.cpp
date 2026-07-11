@@ -1122,8 +1122,8 @@ void rmsnorm_quantize_mxfp8(
     if (map_dtype_to_code(input.dtype()) != 2 || map_dtype_to_code(weight.dtype()) != 2) {
         throw std::runtime_error("rmsnorm_quantize_mxfp8 requires bfloat16 input and weight");
     }
-    if (map_dtype_to_code(qdata.dtype()) != 5 || map_dtype_to_code(block_scales.dtype()) != 3) {
-        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires E4M3 output and uint8 scale storage");
+    if (map_dtype_to_code(block_scales.dtype()) != 3) {
+        throw std::runtime_error("rmsnorm_quantize_mxfp8 requires uint8 scale storage");
     }
     if ((rows != 256 && rows != 340) || hidden_size != 2816 || weight.size() != hidden_size) {
         throw std::runtime_error("rmsnorm_quantize_mxfp8 requires [256|340, 2816] and [2816]");
