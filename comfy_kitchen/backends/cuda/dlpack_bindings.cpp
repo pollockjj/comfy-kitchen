@@ -1418,6 +1418,27 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
+    size_t cutlass_grouped_int8_dequant_packed_workspace_size(
+        int64_t groups,
+        int64_t rows);
+
+    bool launch_cutlass_grouped_int8_dequant_packed(
+        const void* activations,
+        const void* weights,
+        const void* activation_scales,
+        const void* weight_scales,
+        const int32_t* expert_indptr,
+        void* accumulator,
+        void* output,
+        int64_t groups,
+        int64_t rows,
+        int64_t n,
+        int64_t k,
+        void* workspace,
+        size_t workspace_size,
+        int out_dtype_code,
+        cudaStream_t stream);
+
     bool launch_cutlass_int4_dequant(
         const void* A,
         const void* B,
@@ -2031,6 +2052,69 @@ bool cutlass_grouped_int8_dequant(
     return launch_cutlass_grouped_int8_dequant(
         a.data(), b.data(), xs.data(), ws.data(), d.data(), groups, M, N, K,
         out_dtype_code, stream);
+}
+
+size_t cutlass_grouped_int8_dequant_packed_workspace_bytes(int64_t groups, int64_t rows) {
+    if (groups < 0 || rows < 0) {
+        throw std::runtime_error("packed grouped INT8 workspace dimensions must be non-negative");
+    }
+    return cutlass_grouped_int8_dequant_packed_workspace_size(groups, rows);
+}
+
+bool cutlass_grouped_int8_dequant_packed(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> weights,
+    nb::ndarray<float, nb::device::cuda> activation_scales,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> weight_scales,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> expert_indptr,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> accumulator,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t rows = activations.shape(0);
+    const int64_t k = activations.shape(1);
+    const int64_t groups = weights.shape(0);
+    const int64_t n = weights.shape(1);
+    if (weights.shape(2) != k) {
+        throw std::runtime_error("packed grouped INT8 weight shape mismatch");
+    }
+    if (activation_scales.size() != static_cast<size_t>(rows)) {
+        throw std::runtime_error("packed grouped INT8 activation scale shape mismatch");
+    }
+    if (weight_scales.shape(0) != groups || weight_scales.shape(1) != n) {
+        throw std::runtime_error("packed grouped INT8 weight scale shape mismatch");
+    }
+    if (expert_indptr.shape(0) != groups + 1) {
+        throw std::runtime_error("packed grouped INT8 indptr shape mismatch");
+    }
+    if (accumulator.shape(0) != rows || accumulator.shape(1) != n) {
+        throw std::runtime_error("packed grouped INT8 accumulator shape mismatch");
+    }
+    if (output.shape(0) != rows || output.shape(1) != n) {
+        throw std::runtime_error("packed grouped INT8 output shape mismatch");
+    }
+    if (out_dtype_code < 0 || out_dtype_code > 2 ||
+        map_dtype_to_code(output.dtype()) != out_dtype_code) {
+        throw std::runtime_error("packed grouped INT8 output dtype mismatch");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return launch_cutlass_grouped_int8_dequant_packed(
+        activations.data(),
+        weights.data(),
+        activation_scales.data(),
+        weight_scales.data(),
+        expert_indptr.data(),
+        accumulator.data(),
+        output.data(),
+        groups,
+        rows,
+        n,
+        k,
+        workspace.data(),
+        workspace.size(),
+        out_dtype_code,
+        stream);
 }
 
 // INT4 GEMM + fused dequant via CUTLASS. A and B are packed signed int4 in int8 storage.
@@ -2745,6 +2829,25 @@ NB_MODULE(_C, m) {
           nb::arg("xs"),
           nb::arg("ws"),
           nb::arg("d"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_int8_dequant_packed_workspace_bytes",
+          &cutlass_grouped_int8_dequant_packed_workspace_bytes,
+          "Workspace bytes for packed variable-M expert INT8 GEMM",
+          nb::arg("groups"),
+          nb::arg("rows"));
+
+    m.def("cutlass_grouped_int8_dequant_packed", &cutlass_grouped_int8_dequant_packed,
+          "Packed variable-M expert INT8 GEMM with fused output dequantization",
+          nb::arg("activations"),
+          nb::arg("weights"),
+          nb::arg("activation_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("expert_indptr"),
+          nb::arg("accumulator"),
+          nb::arg("output"),
+          nb::arg("workspace"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 

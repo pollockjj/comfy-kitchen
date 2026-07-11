@@ -712,6 +712,62 @@ class TestTensorWisePublicAPI:
 
         assert torch.equal(actual, expected)
 
+    @pytest.mark.parametrize("group_size", [64, 256])
+    def test_packed_grouped_int8_convrot_matches_fixed_real_rows(self, seed, group_size):
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_convrot_weight
+
+        counts = (2, 0, 3, 1)
+        bucket = max(counts)
+        x_bucket = torch.randn(len(counts), bucket, group_size, dtype=torch.bfloat16)
+        x_packed = torch.cat([
+            x_bucket[expert, :count] for expert, count in enumerate(counts) if count
+        ])
+        indptr = torch.tensor([0, 2, 2, 5, 6], dtype=torch.int32)
+        weights = torch.randn(len(counts), 8, group_size, dtype=torch.bfloat16)
+        quantized = [quantize_int8_convrot_weight(weight, group_size) for weight in weights]
+        qweight = torch.stack([item[0] for item in quantized])
+        scales = torch.stack([item[1] for item in quantized])
+
+        with ck.registry.use_backend("eager"):
+            actual = ck.grouped_int8_convrot_linear_packed(
+                x_packed, indptr, qweight, scales, group_size
+            )
+            fixed = ck.grouped_int8_convrot_linear(
+                x_bucket, qweight, scales, group_size
+            )
+        expected = torch.cat([
+            fixed[expert, :count] for expert, count in enumerate(counts) if count
+        ])
+
+        assert torch.equal(actual, expected)
+
+    def test_cuda_packed_grouped_int8_convrot_matches_fixed_real_rows(self, seed):
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        from comfy_kitchen.backends.eager.quantization import quantize_int8_convrot_weight
+
+        counts = (2, 0, 3, 1)
+        x_bucket = torch.randn(4, 3, 64, device="cuda", dtype=torch.bfloat16)
+        x_packed = torch.cat([
+            x_bucket[expert, :count] for expert, count in enumerate(counts) if count
+        ])
+        indptr = torch.tensor([0, 2, 2, 5, 6], device="cuda", dtype=torch.int32)
+        weights = torch.randn(4, 128, 64, device="cuda", dtype=torch.bfloat16)
+        quantized = [quantize_int8_convrot_weight(weight, 64) for weight in weights]
+        qweight = torch.stack([item[0] for item in quantized])
+        scales = torch.stack([item[1] for item in quantized])
+
+        with ck.registry.use_backend("cuda"):
+            actual = ck.grouped_int8_convrot_linear_packed(
+                x_packed, indptr, qweight, scales, 64
+            )
+            fixed = ck.grouped_int8_convrot_linear(x_bucket, qweight, scales, 64)
+        expected = torch.cat([
+            fixed[expert, :count] for expert, count in enumerate(counts) if count
+        ])
+
+        assert torch.equal(actual, expected)
+
     def test_eager_int8_linear_single_row(self, seed, device):
         """Eager int8_linear supports single-row batches."""
         import torch

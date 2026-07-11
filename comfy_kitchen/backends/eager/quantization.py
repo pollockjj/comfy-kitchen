@@ -1125,6 +1125,52 @@ def grouped_int8_convrot_linear(
     ])
 
 
+def grouped_int8_convrot_linear_packed(
+    x: torch.Tensor,
+    expert_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Apply ConvRot INT8 linear to packed, expert-sorted activation rows."""
+    if x.dim() != 2 or weight.dim() != 3:
+        raise ValueError("Packed grouped INT8 ConvRot expects x [R, K] and weight [E, N, K]")
+    experts, n, k = weight.shape
+    if x.shape[1] != k:
+        raise ValueError(f"Packed grouped INT8 ConvRot shape mismatch: x {tuple(x.shape)}, weight {tuple(weight.shape)}")
+    if expert_indptr.dim() != 1 or expert_indptr.numel() != experts + 1:
+        raise ValueError("Packed grouped INT8 ConvRot indptr must be [E + 1]")
+    if expert_indptr.dtype != torch.int32:
+        raise ValueError("Packed grouped INT8 ConvRot indptr must be int32")
+    expected_scales = weight.shape[:2]
+    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
+        raise ValueError(f"Packed grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
+    if convrot_groupsize not in (64, 256) or k % convrot_groupsize != 0:
+        raise ValueError("Packed grouped INT8 ConvRot requires group size 64 or 256 dividing K")
+
+    offsets = expert_indptr.tolist()
+    if offsets[0] != 0 or offsets[-1] != x.shape[0] or any(
+        start > end for start, end in zip(offsets, offsets[1:])
+    ):
+        raise ValueError("Packed grouped INT8 ConvRot indptr must be monotonic from 0 through R")
+    outputs = [
+        int8_linear(
+            x[offsets[expert]:offsets[expert + 1]],
+            weight[expert],
+            weight_scale[expert],
+            out_dtype=out_dtype,
+            convrot=True,
+            convrot_groupsize=convrot_groupsize,
+        )
+        for expert in range(experts)
+        if offsets[expert] != offsets[expert + 1]
+    ]
+    if not outputs:
+        return torch.empty((0, n), dtype=out_dtype, device=x.device)
+    return torch.cat(outputs, dim=0)
+
+
 # =============================================================================
 # torch.library Custom Op Definitions — INT8 Tensor-wise
 # =============================================================================
@@ -1297,6 +1343,39 @@ def _op_grouped_int8_convrot_linear_fake(x, weight, weight_scale, convrot_groups
     del weight_scale, convrot_groupsize
     return torch.empty(
         (x.shape[0], x.shape[1], weight.shape[1]),
+        dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],
+        device=x.device,
+    )
+
+
+@torch.library.custom_op("comfy_kitchen::grouped_int8_convrot_linear_packed", mutates_args=())
+def _op_grouped_int8_convrot_linear_packed(
+    x: torch.Tensor,
+    expert_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "x": x,
+        "expert_indptr": expert_indptr,
+        "weight": weight,
+        "weight_scale": weight_scale,
+        "convrot_groupsize": convrot_groupsize,
+        "out_dtype": out_dtype,
+    }
+    return registry.get_implementation("grouped_int8_convrot_linear_packed", kwargs=kwargs)(**kwargs)
+
+
+@_op_grouped_int8_convrot_linear_packed.register_fake
+def _op_grouped_int8_convrot_linear_packed_fake(
+    x, expert_indptr, weight, weight_scale, convrot_groupsize, output_dtype_code
+):
+    del expert_indptr, weight_scale, convrot_groupsize
+    return torch.empty(
+        (x.shape[0], weight.shape[1]),
         dtype=DTYPE_CODE_TO_DTYPE[output_dtype_code],
         device=x.device,
     )
