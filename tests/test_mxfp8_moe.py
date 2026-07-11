@@ -3,7 +3,6 @@ import torch
 
 import comfy_kitchen as ck
 
-
 cuda_status = ck.list_backends().get("cuda", {})
 sm120_grouped_mxfp8_available = (
     hasattr(torch, "float8_e8m0fnu")
