@@ -3,11 +3,11 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#include "float_utils.cuh"
-
 #include <cuda_bf16.h>
 #include <cuda_fp8.h>
 #include <cuda_runtime.h>
+
+#include "float_utils.cuh"
 
 #include <cstdint>
 #include <stdexcept>
@@ -16,7 +16,7 @@
 namespace comfy {
 namespace {
 
-#if CUDA_VERSION >= 12080
+#if CUDART_VERSION >= 12080
 
 constexpr int kHiddenSize = 2816;
 constexpr int kThreads = 256;
@@ -120,7 +120,7 @@ __global__ void rmsnorm_quantize_mxfp8_bf16_kernel(
     }
 }
 
-#endif  // CUDA_VERSION >= 12080
+#endif  // CUDART_VERSION >= 12080
 
 }  // namespace
 }  // namespace comfy
@@ -135,7 +135,7 @@ extern "C" void launch_rmsnorm_quantize_mxfp8_kernel(
     float eps,
     cudaStream_t stream)
 {
-#if CUDA_VERSION >= 12080
+#if CUDART_VERSION >= 12080
     if (input == nullptr || weight == nullptr || qdata == nullptr || block_scales == nullptr) {
         throw std::runtime_error("rmsnorm_quantize_mxfp8 received a null pointer");
     }
