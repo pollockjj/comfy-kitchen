@@ -101,7 +101,6 @@ __global__ void m16n8k32_probe(
     }
 }
 
-constexpr int kFc2Rows = 8;
 constexpr int kFc2Output = 2816;
 constexpr int kFc2Reduction = 704;
 constexpr int kFc2OutputTile = 128;
