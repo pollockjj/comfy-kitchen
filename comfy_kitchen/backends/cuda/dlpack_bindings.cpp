@@ -42,6 +42,12 @@ int map_dtype_to_code(const nb::dlpack::dtype& dtype) {
     return -1;  // unsupported
 }
 
+bool is_mxfp8_scale_storage(const nb::dlpack::dtype& dtype) {
+    return dtype.bits == 8 && dtype.lanes == 1 &&
+        (dtype.code == (uint8_t)nb::dlpack::dtype_code::UInt ||
+         dtype.code == (uint8_t)nb::dlpack::dtype_code::Float8_E8M0FNU);
+}
+
 // Forward declarations of CUDA kernel wrappers
 extern "C" {
     void launch_quantize_fp8_kernel(const void* input, void* output, 
@@ -897,35 +903,39 @@ void dg_mxfp8_mma_probe(
 
 void dg_mxfp8_fc2_n8(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weight_scales,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
-    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activation_scales,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     uintptr_t stream_ptr) {
     if (weights.shape(0) != 2816 || weights.shape(1) != 704 ||
         weight_scales.shape(0) != 2816 || weight_scales.shape(1) != 24 ||
+        !is_mxfp8_scale_storage(weight_scales.dtype()) ||
         activations.shape(0) != 8 || activations.shape(1) != 704 ||
         activation_scales.shape(0) != 128 || activation_scales.shape(1) != 24 ||
+        !is_mxfp8_scale_storage(activation_scales.dtype()) ||
         output.shape(0) != 8 || output.shape(1) != 2816 ||
         map_dtype_to_code(output.dtype()) != 2) {
         throw std::runtime_error(
             "DG MXFP8 FC2 N8 requires weights [2816,704], weight scales "
-            "[2816,24], activations [8,704], activation scales [128,24], "
-            "and BF16 output [8,2816]");
+            "[2816,24] in E8M0 or raw uint8 storage, activations [8,704], "
+            "activation scales [128,24] in E8M0 or raw uint8 storage, and "
+            "BF16 output [8,2816]");
     }
     const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_dg_mxfp8_fc2_n8(
-            weights.data(), weight_scales.data(), activations.data(),
-            activation_scales.data(), output.data(), stream)) {
+            weights.data(), static_cast<const uint8_t*>(weight_scales.data()),
+            activations.data(), static_cast<const uint8_t*>(activation_scales.data()),
+            output.data(), stream)) {
         throw std::runtime_error("DG MXFP8 SM120 FC2 N8 kernel is unavailable");
     }
 }
 
 void dg_mxfp8_fc2_n8_cutlass_control(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
-    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> activation_scales,
     nb::ndarray<nb::ndim<3>, nb::device::cuda> weights,
-    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> weight_scales,
     nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> m_indptr,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
@@ -935,17 +945,20 @@ void dg_mxfp8_fc2_n8_cutlass_control(
         num_groups != 128 || activation_scales.shape(0) != num_groups ||
         activation_scales.shape(1) != 128 ||
         activation_scales.shape(2) != 24 ||
+        !is_mxfp8_scale_storage(activation_scales.dtype()) ||
         weights.shape(1) != 2816 || weights.shape(2) != 704 ||
         weight_scales.shape(0) != num_groups || weight_scales.shape(1) != 2816 ||
-        weight_scales.shape(2) != 24 || m_indptr.shape(0) != num_groups + 1 ||
+        weight_scales.shape(2) != 24 ||
+        !is_mxfp8_scale_storage(weight_scales.dtype()) ||
+        m_indptr.shape(0) != num_groups + 1 ||
         output.shape(0) != 8 || output.shape(1) != 2816 ||
         map_dtype_to_code(output.dtype()) != 2) {
         throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control shape mismatch");
     }
     const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     if (!launch_cutlass_grouped_gemm_mxfp8_variable(
-            activations.data(), activation_scales.data(), weights.data(),
-            weight_scales.data(), output.data(), m_indptr.data(), num_groups, 128,
+            activations.data(), activation_scales.data(), weights.data(), weight_scales.data(),
+            output.data(), m_indptr.data(), num_groups, 128,
             2816, 704, 2, workspace.data(), static_cast<int64_t>(workspace.size()), stream)) {
         throw std::runtime_error("DG MXFP8 FC2 N8 CUTLASS control failed");
     }
