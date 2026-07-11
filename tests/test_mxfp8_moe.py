@@ -15,6 +15,10 @@ sm120_fused_mxfp8_available = (
     sm120_grouped_mxfp8_available
     and "fused_moe_mxfp8" in set(cuda_status.get("capabilities", ()))
 )
+sm120_prequantized_fused_mxfp8_available = (
+    sm120_fused_mxfp8_available
+    and "fused_moe_mxfp8_prequantized" in set(cuda_status.get("capabilities", ()))
+)
 
 NUM_EXPERTS = 128
 HIDDEN_SIZE = 2816
@@ -54,17 +58,17 @@ def fused_expert_bank():
     return fc1_qdata, fc1_block_scales, fc2_qdata, fc2_block_scales
 
 
-def _fused_inputs(dtype):
+def _fused_inputs(dtype, num_tokens=256):
     generator = torch.Generator(device="cuda:0").manual_seed(5770777)
     x = torch.randn(
-        256,
+        num_tokens,
         HIDDEN_SIZE,
         generator=generator,
         dtype=dtype,
         device="cuda:0",
     )
     logits = torch.randn(
-        256,
+        num_tokens,
         NUM_EXPERTS,
         generator=generator,
         dtype=torch.float32,
@@ -236,6 +240,25 @@ def test_fused_moe_mxfp8_marks_invalid_route_nan(fused_expert_bank):
     assert output[1:].isfinite().all()
 
 
+@pytest.mark.skipif(
+    not sm120_prequantized_fused_mxfp8_available,
+    reason="SM120 prequantized fused MXFP8 required",
+)
+@pytest.mark.parametrize("num_tokens", [256, 340])
+def test_prequantized_fused_moe_matches_dynamic_input_quantization(
+    num_tokens, fused_expert_bank
+):
+    x, expert_ids, router_weights = _fused_inputs(torch.bfloat16, num_tokens)
+    with ck.use_backend("cuda"):
+        qdata, scales = ck.quantize_mxfp8(x, pad_32x=num_tokens == 340)
+        reference = ck.fused_moe_mxfp8(x, expert_ids, router_weights, *fused_expert_bank)
+        candidate = ck.fused_moe_mxfp8_prequantized(
+            qdata, scales, expert_ids, router_weights, *fused_expert_bank
+        )
+
+    assert torch.equal(candidate, reference)
+
+
 def test_fused_moe_mxfp8_has_no_eager_fallback():
     if not hasattr(torch, "float8_e8m0fnu"):
         pytest.skip("PyTorch does not expose E8M0")
@@ -248,6 +271,10 @@ def test_fused_moe_mxfp8_has_no_eager_fallback():
     with ck.use_backend("eager"), pytest.raises(ck.NoCapableBackendError):
         ck.fused_moe_mxfp8(
             x, expert_ids, router_weights, qdata, scales, qdata, scales
+        )
+    with ck.use_backend("eager"), pytest.raises(ck.NoCapableBackendError):
+        ck.fused_moe_mxfp8_prequantized(
+            qdata, scales, expert_ids, router_weights, qdata, scales, qdata, scales
         )
 
 

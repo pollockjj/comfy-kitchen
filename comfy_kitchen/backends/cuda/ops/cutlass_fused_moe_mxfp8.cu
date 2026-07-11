@@ -266,6 +266,59 @@ __global__ void quantize_and_route_input_ranked(
     }
 }
 
+__global__ void route_prequantized_input_ranked(
+    const uint8_t* input_qdata,
+    const uint8_t* dense_block_scales,
+    const int32_t* expert_ids,
+    const int32_t* route_rank,
+    const int32_t* route_dest,
+    uint8_t* routed_qdata,
+    uint8_t* routed_block_scales,
+    int hidden_size,
+    int top_k,
+    int scale_group_m,
+    int block_cols,
+    int scale_storage_cols) {
+    const int token = blockIdx.x;
+    const uint8_t* input_row = input_qdata + static_cast<size_t>(token) * hidden_size;
+    constexpr int groups_per_block = kQuantThreads / kThreadsPerQuantGroup;
+    const int group_in_block = threadIdx.x / kThreadsPerQuantGroup;
+    const int lane_in_group = threadIdx.x & (kThreadsPerQuantGroup - 1);
+
+    for (int block_col = group_in_block; block_col < block_cols;
+         block_col += groups_per_block) {
+        const int col = block_col * kBlockSize + lane_in_group * kValuesPerThread;
+        const uint64_t packed = *reinterpret_cast<const uint64_t*>(input_row + col);
+        const uint8_t scale = lane_in_group == 0
+            ? dense_block_scales[
+                  scale_factor_swizzled_offset(token, block_col, block_cols)]
+            : 0;
+#pragma unroll
+        for (int position = 0; position < kTopK; ++position) {
+            if (position >= top_k) {
+                break;
+            }
+            const int route = token * top_k + position;
+            const int dest = route_dest[route];
+            if (dest < 0) {
+                continue;
+            }
+            uint8_t* routed_row =
+                routed_qdata + static_cast<size_t>(dest) * hidden_size;
+            *reinterpret_cast<uint64_t*>(routed_row + col) = packed;
+            if (lane_in_group == 0) {
+                const int expert = expert_ids[route];
+                const int rank = route_rank[route];
+                uint8_t* scale_base =
+                    routed_block_scales + static_cast<size_t>(expert) * scale_group_m *
+                        scale_storage_cols;
+                scale_base[scale_factor_swizzled_offset(rank, block_col, block_cols)] =
+                    scale;
+            }
+        }
+    }
+}
+
 template <class OutputType>
 __device__ __forceinline__ OutputType geglu_product(OutputType gate, OutputType up) {
     const float x = lowp_to_float(gate);
@@ -371,6 +424,8 @@ __host__ __forceinline__ bool is_aligned(const void* ptr, uintptr_t alignment) {
 template <class OutputType>
 bool run_fused_moe_mxfp8(
     const void* input,
+    const uint8_t* prequantized_input_scales,
+    bool input_is_prequantized,
     const int32_t* expert_ids,
     const float* router_weights,
     const void* fc1_qdata,
@@ -450,9 +505,17 @@ bool run_fused_moe_mxfp8(
     }
 
     last_error_stage = 6;
-    quantize_and_route_input_ranked<OutputType><<<n, kQuantThreads, 0, stream>>>(
-        static_cast<const OutputType*>(input), expert_ids, route_rank, route_dest, qx,
-        input_block_scales, h, top_k, scale_group_m, input_block_cols, input_scale_cols);
+    if (input_is_prequantized) {
+        route_prequantized_input_ranked<<<n, kQuantThreads, 0, stream>>>(
+            static_cast<const uint8_t*>(input), prequantized_input_scales, expert_ids,
+            route_rank, route_dest, qx, input_block_scales, h, top_k, scale_group_m,
+            input_block_cols, input_scale_cols);
+    } else {
+        quantize_and_route_input_ranked<OutputType><<<n, kQuantThreads, 0, stream>>>(
+            static_cast<const OutputType*>(input), expert_ids, route_rank, route_dest, qx,
+            input_block_scales, h, top_k, scale_group_m, input_block_cols,
+            input_scale_cols);
+    }
     if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
@@ -549,14 +612,14 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
 
     if (input_dtype_code == 1) {
         return run_fused_moe_mxfp8<__half>(
-            input, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
+            input, nullptr, false, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
             fc2_block_scales, output, static_cast<int>(num_tokens),
             static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
             static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
             static_cast<size_t>(workspace_size), input_dtype_code, stream);
     }
     return run_fused_moe_mxfp8<__nv_bfloat16>(
-        input, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
+        input, nullptr, false, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
         fc2_block_scales, output, static_cast<int>(num_tokens),
         static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
         static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
@@ -576,6 +639,75 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
     (void)num_experts;
     (void)top_k;
     (void)input_dtype_code;
+    (void)workspace_ptr;
+    (void)workspace_size;
+    (void)stream;
+    return false;
+#endif
+}
+
+extern "C" bool launch_cutlass_fused_moe_mxfp8_prequantized(
+    const void* input_qdata,
+    const void* input_block_scales,
+    const int32_t* expert_ids,
+    const float* router_weights,
+    const void* fc1_qdata,
+    const void* fc1_block_scales,
+    const void* fc2_qdata,
+    const void* fc2_block_scales,
+    void* output_bf16,
+    int64_t num_tokens,
+    int64_t hidden_size,
+    int64_t intermediate_size,
+    int64_t num_experts,
+    int64_t top_k,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream) {
+#if CUDA_VERSION >= 12080
+    using namespace comfy::fused_moe_mxfp8;
+    last_error_stage = 1;
+    if (input_qdata == nullptr || input_block_scales == nullptr || expert_ids == nullptr ||
+        router_weights == nullptr || fc1_qdata == nullptr || fc1_block_scales == nullptr ||
+        fc2_qdata == nullptr || fc2_block_scales == nullptr || output_bf16 == nullptr ||
+        workspace_ptr == nullptr) {
+        return false;
+    }
+    if ((num_tokens != 256 && num_tokens != 340) || hidden_size != 2816 ||
+        intermediate_size != 704 || num_experts != 128 || top_k != kTopK ||
+        workspace_size <= 0 || hidden_size % kBlockSize != 0 ||
+        intermediate_size % kBlockSize != 0) {
+        return false;
+    }
+    if (!is_aligned(input_qdata, 16) || !is_aligned(input_block_scales, 16) ||
+        !is_aligned(expert_ids, 4) || !is_aligned(router_weights, 4) ||
+        !is_aligned(fc1_qdata, 16) || !is_aligned(fc1_block_scales, 16) ||
+        !is_aligned(fc2_qdata, 16) || !is_aligned(fc2_block_scales, 16) ||
+        !is_aligned(output_bf16, 2) || !is_aligned(workspace_ptr, 16)) {
+        return false;
+    }
+    return run_fused_moe_mxfp8<__nv_bfloat16>(
+        input_qdata, static_cast<const uint8_t*>(input_block_scales), true, expert_ids,
+        router_weights, fc1_qdata, fc1_block_scales, fc2_qdata, fc2_block_scales,
+        output_bf16, static_cast<int>(num_tokens), static_cast<int>(hidden_size),
+        static_cast<int>(intermediate_size), static_cast<int>(num_experts),
+        static_cast<int>(top_k), workspace_ptr, static_cast<size_t>(workspace_size), 2,
+        stream);
+#else
+    (void)input_qdata;
+    (void)input_block_scales;
+    (void)expert_ids;
+    (void)router_weights;
+    (void)fc1_qdata;
+    (void)fc1_block_scales;
+    (void)fc2_qdata;
+    (void)fc2_block_scales;
+    (void)output_bf16;
+    (void)num_tokens;
+    (void)hidden_size;
+    (void)intermediate_size;
+    (void)num_experts;
+    (void)top_k;
     (void)workspace_ptr;
     (void)workspace_size;
     (void)stream;

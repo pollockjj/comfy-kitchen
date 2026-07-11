@@ -53,6 +53,7 @@ __all__ = [
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
+    "fused_moe_mxfp8_prequantized",
     "reserve_cuda_stream_workspaces",
     "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
@@ -472,6 +473,37 @@ def fused_moe_mxfp8(
         "fc2_block_scales": fc2_block_scales,
     }
     impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_mxfp8_prequantized(
+    x_qdata: torch.Tensor,
+    x_block_scales: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run the BF16 DG MoE from native-layout MXFP8 activations.
+
+    ``x_qdata`` and ``x_block_scales`` are the outputs of
+    :func:`quantize_mxfp8` or :func:`rmsnorm_quantize_mxfp8`. The SM120
+    specialization routes those bytes directly into the grouped GEMM input,
+    avoiding a second activation quantization pass.
+    """
+    kwargs = {
+        "x_qdata": x_qdata,
+        "x_block_scales": x_block_scales,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+    }
+    impl = registry.get_implementation("fused_moe_mxfp8_prequantized", kwargs=kwargs)
     return impl(**kwargs)
 
 

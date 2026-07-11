@@ -190,6 +190,25 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_fused_moe_mxfp8_prequantized(
+        const void* input_qdata,
+        const void* input_block_scales,
+        const int32_t* expert_ids,
+        const float* router_weights,
+        const void* fc1_qdata,
+        const void* fc1_block_scales,
+        const void* fc2_qdata,
+        const void* fc2_block_scales,
+        void* output_bf16,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     int cutlass_fused_moe_mxfp8_last_error_stage();
 
     bool launch_cutlass_fused_moe_nvfp4(
@@ -910,6 +929,81 @@ void cutlass_fused_moe_mxfp8(
             stream)) {
         throw std::runtime_error(
             "native CUTLASS fused MXFP8 MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
+    }
+}
+
+void cutlass_fused_moe_mxfp8_prequantized(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input_qdata,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> input_block_scales,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> router_weights,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_block_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_tokens = expert_ids.shape(0);
+    const int64_t hidden_size = input_qdata.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t fc1_output = fc1_qdata.shape(1);
+    const int64_t intermediate_size = fc1_output / 2;
+    const int64_t qdata_rows = ((num_tokens + 31) / 32) * 32;
+    const int64_t input_scale_rows = ((num_tokens + 127) / 128) * 128;
+    const int64_t input_scale_cols = ((hidden_size / 32) + 3) / 4 * 4;
+    const int64_t intermediate_scale_cols = ((intermediate_size / 32) + 3) / 4 * 4;
+    const int64_t fc1_scale_rows = ((fc1_output + 127) / 128) * 128;
+    const int64_t fc2_scale_rows = ((hidden_size + 127) / 128) * 128;
+
+    if (map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE output must be bfloat16");
+    }
+    if (input_qdata.shape(0) != qdata_rows ||
+        input_block_scales.shape(0) != input_scale_rows ||
+        input_block_scales.shape(1) != input_scale_cols) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE activation shape mismatch");
+    }
+    if (router_weights.shape(0) != num_tokens || router_weights.shape(1) != top_k) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE routing shape mismatch");
+    }
+    if (fc1_output <= 0 || fc1_output % 2 != 0 || fc1_qdata.shape(2) != hidden_size ||
+        fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) != intermediate_size) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE weight shape mismatch");
+    }
+    if (fc1_block_scales.shape(0) != num_experts ||
+        fc1_block_scales.shape(1) != fc1_scale_rows ||
+        fc1_block_scales.shape(2) != input_scale_cols ||
+        fc2_block_scales.shape(0) != num_experts ||
+        fc2_block_scales.shape(1) != fc2_scale_rows ||
+        fc2_block_scales.shape(2) != intermediate_scale_cols) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE weight scale shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE output shape mismatch");
+    }
+    const int device = input_qdata.device_id();
+    if (input_block_scales.device_id() != device || expert_ids.device_id() != device ||
+        router_weights.device_id() != device || fc1_qdata.device_id() != device ||
+        fc1_block_scales.device_id() != device || fc2_qdata.device_id() != device ||
+        fc2_block_scales.device_id() != device || output.device_id() != device ||
+        workspace.device_id() != device) {
+        throw std::runtime_error("prequantized fused MXFP8 MoE tensors must share one device");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_mxfp8_prequantized(
+            input_qdata.data(), input_block_scales.data(), expert_ids.data(),
+            router_weights.data(), fc1_qdata.data(), fc1_block_scales.data(),
+            fc2_qdata.data(), fc2_block_scales.data(), output.data(), num_tokens,
+            hidden_size, intermediate_size, num_experts, top_k, workspace.data(),
+            static_cast<int64_t>(workspace.size()), stream)) {
+        throw std::runtime_error(
+            "native CUTLASS prequantized fused MXFP8 MoE failed at stage " +
             std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
     }
 }
@@ -2716,6 +2810,21 @@ NB_MODULE(_C, m) {
     m.def("cutlass_fused_moe_mxfp8", &cutlass_fused_moe_mxfp8,
           "Native SM120 routed MXFP8 MoE with GEGLU and weighted reduction",
           nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("router_weights"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_block_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_block_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_mxfp8_prequantized",
+          &cutlass_fused_moe_mxfp8_prequantized,
+          "Native SM120 BF16 MoE consuming prequantized MXFP8 activations",
+          nb::arg("input_qdata"),
+          nb::arg("input_block_scales"),
           nb::arg("expert_ids"),
           nb::arg("router_weights"),
           nb::arg("fc1_qdata"),
