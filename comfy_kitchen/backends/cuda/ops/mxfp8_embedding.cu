@@ -48,15 +48,22 @@ __global__ void mxfp8_embedding_kernel(
     const uint32_t scale_cols = static_cast<uint32_t>(embedding_dim / 32);
     const int64_t source_base = source_row * embedding_dim;
     const int64_t output_base = selected_row * embedding_dim;
-    for (int64_t col = threadIdx.x; col < embedding_dim; col += blockDim.x) {
-        const size_t scale_offset = scale_factor_swizzled_offset(
-            static_cast<size_t>(source_row),
-            static_cast<size_t>(col / 32),
-            scale_cols);
-        const uint8_t exponent = block_scales[scale_offset];
-        const float scale = exponent == 0
-            ? 0.0f
-            : __uint_as_float(static_cast<uint32_t>(exponent) << 23);
+    const int lane = threadIdx.x & 31;
+    const int warp = threadIdx.x >> 5;
+    const int warps = blockDim.x >> 5;
+    for (uint32_t block_col = warp; block_col < scale_cols; block_col += warps) {
+        uint32_t scale_bits = 0;
+        if (lane == 0) {
+            const size_t scale_offset = scale_factor_swizzled_offset(
+                static_cast<size_t>(source_row),
+                static_cast<size_t>(block_col),
+                scale_cols);
+            const uint8_t exponent = block_scales[scale_offset];
+            scale_bits = exponent == 0 ? 0 : static_cast<uint32_t>(exponent) << 23;
+        }
+        scale_bits = __shfl_sync(0xffffffffu, scale_bits, 0);
+        const float scale = __uint_as_float(scale_bits);
+        const int64_t col = static_cast<int64_t>(block_col) * 32 + lane;
         const float value = static_cast<float>(qweight[source_base + col]) * scale;
         output[output_base + col] = static_cast<OutputType>(value);
     }
