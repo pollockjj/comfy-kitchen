@@ -37,6 +37,32 @@ def test_categorical_stats_rejects_unsupported_storage():
 
 
 @pytest.mark.parametrize("backend", ["eager", "cuda"])
+def test_categorical_stats_sample_matches_multinomial(backend, cuda_available, seed):
+    device = "cuda" if backend == "cuda" else "cpu"
+    if backend == "cuda" and not cuda_available:
+        pytest.skip("CUDA unavailable")
+    if backend not in get_capable_backends("categorical_stats_sample", device):
+        pytest.skip(f"backend '{backend}' is not capable")
+
+    logits = torch.randn((2, 3, 257), dtype=torch.float32, device=device)
+    distribution = torch.distributions.Categorical(logits=logits)
+    reference_generator = torch.Generator(device=device).manual_seed(seed)
+    noise_generator = torch.Generator(device=device).manual_seed(seed)
+    reference = torch.multinomial(
+        distribution.probs.reshape(-1, logits.shape[-1]), 1, generator=reference_generator
+    ).reshape(logits.shape[:-1])
+    noise = torch.empty_like(logits).exponential_(generator=noise_generator)
+
+    with ck.use_backend(backend):
+        entropy, argmax, sample = ck.categorical_stats_sample(logits, noise)
+
+    torch.testing.assert_close(entropy, distribution.entropy(), rtol=1e-5, atol=1e-5)
+    assert torch.equal(argmax, logits.argmax(dim=-1))
+    assert torch.equal(sample, reference)
+    assert torch.equal(noise_generator.get_state(), reference_generator.get_state())
+
+
+@pytest.mark.parametrize("backend", ["eager", "cuda"])
 def test_softcap_scale_is_bit_exact(backend, cuda_available):
     device = "cuda" if backend == "cuda" else "cpu"
     if backend == "cuda" and not cuda_available:

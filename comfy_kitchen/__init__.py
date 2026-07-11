@@ -31,6 +31,7 @@ __all__ = [
     # Normalization
     "adaln",
     "categorical_stats",
+    "categorical_stats_sample",
     "softcap_scale",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
@@ -126,6 +127,30 @@ def categorical_stats(
         entropy.reshape(leading_shape),
         argmax.reshape(leading_shape),
     )
+
+
+def categorical_stats_sample(
+    logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return categorical entropy, argmax, and an exponential-race sample."""
+    if logits.dtype != torch.float32 or exponential_noise.dtype != torch.float32:
+        raise ValueError("categorical_stats_sample requires float32 tensors")
+    if logits.shape != exponential_noise.shape:
+        raise ValueError("categorical_stats_sample requires matching logits and noise shapes")
+    if logits.device != exponential_noise.device:
+        raise ValueError("categorical_stats_sample requires logits and noise on the same device")
+    if logits.ndim < 1 or logits.numel() == 0 or logits.shape[-1] == 0:
+        raise ValueError("categorical_stats_sample requires a non-empty vocabulary and rows")
+    if not logits.is_contiguous() or not exponential_noise.is_contiguous():
+        raise ValueError("categorical_stats_sample requires contiguous tensors")
+
+    leading_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    noise_2d = exponential_noise.reshape(logits_2d.shape)
+    entropy, argmax, sample, invalid = torch.ops.comfy_kitchen.categorical_stats_sample(logits_2d, noise_2d)
+    torch._assert_async(invalid == 0, "categorical_stats_sample received an invalid distribution")
+    return entropy.reshape(leading_shape), argmax.reshape(leading_shape), sample.reshape(leading_shape)
 
 
 def softcap_scale(

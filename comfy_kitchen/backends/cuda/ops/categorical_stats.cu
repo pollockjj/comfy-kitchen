@@ -149,6 +149,53 @@ __global__ void categorical_probs_entropy_kernel(
     if (threadIdx.x == 0) entropy[row] = -entropy_sum;
 }
 
+__global__ void categorical_entropy_sample_kernel(
+    const float* __restrict__ logits,
+    const float* __restrict__ exponential_noise,
+    const float* __restrict__ row_stats,
+    float* __restrict__ entropy,
+    int64_t* __restrict__ sample,
+    int32_t* __restrict__ invalid,
+    int64_t vocab_size)
+{
+    const int64_t row = blockIdx.x;
+    const float* row_logits = logits + row * vocab_size;
+    const float* row_noise = exponential_noise + row * vocab_size;
+    const float log_normalizer = row_stats[row * 2];
+    const float normalized_max = row_stats[row * 2 + 1];
+    __shared__ float warp_values[kWarps];
+    __shared__ int64_t warp_indices[kWarps];
+
+    float softmax_sum = 0.0f;
+    for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+        const float logit = row_logits[col];
+        if (!isfinite(logit)) atomicExch(invalid, 1);
+        const float normalized = logit - log_normalizer;
+        softmax_sum += expf(normalized - normalized_max);
+    }
+    softmax_sum = block_reduce_sum(softmax_sum, warp_values);
+
+    float entropy_sum = 0.0f;
+    MaxPair local_sample{-FLT_MAX, INT64_MAX};
+    for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
+        const float normalized = row_logits[col] - log_normalizer;
+        const float probability = expf(normalized - normalized_max) / softmax_sum;
+        const float noise = row_noise[col];
+        if (!isfinite(noise) || noise <= 0.0f) {
+            atomicExch(invalid, 1);
+        } else {
+            local_sample = better_pair(local_sample, MaxPair{__fdiv_rn(probability, noise), col});
+        }
+        entropy_sum += fmaxf(normalized, -FLT_MAX) * probability;
+    }
+    entropy_sum = block_reduce_sum(entropy_sum, warp_values);
+    const MaxPair sampled = block_reduce_max_pair(local_sample, warp_values, warp_indices);
+    if (threadIdx.x == 0) {
+        entropy[row] = -entropy_sum;
+        sample[row] = sampled.index;
+    }
+}
+
 }  // namespace
 }  // namespace comfy
 
@@ -166,4 +213,22 @@ extern "C" void launch_categorical_stats_kernel(
         logits, row_stats, argmax, vocab_size);
     comfy::categorical_probs_entropy_kernel<<<static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
         logits, row_stats, probs, entropy, vocab_size);
+}
+
+extern "C" void launch_categorical_stats_sample_kernel(
+    const float* logits,
+    const float* exponential_noise,
+    float* entropy,
+    int64_t* argmax,
+    int64_t* sample,
+    float* row_stats,
+    int32_t* invalid,
+    int64_t rows,
+    int64_t vocab_size,
+    cudaStream_t stream)
+{
+    comfy::categorical_logsumexp_argmax_kernel<<<static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
+        logits, row_stats, argmax, vocab_size);
+    comfy::categorical_entropy_sample_kernel<<<static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
+        logits, exponential_noise, row_stats, entropy, sample, invalid, vocab_size);
 }

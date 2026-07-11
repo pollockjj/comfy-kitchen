@@ -27,6 +27,7 @@ __all__ = [
     "apply_rope_split_half",
     "apply_rope_split_half1",
     "categorical_stats",
+    "categorical_stats_sample",
     "softcap_scale",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
@@ -396,6 +397,44 @@ def categorical_stats(
         stream_ptr,
     )
     return probs, entropy, argmax
+
+
+def categorical_stats_sample(
+    logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute categorical entropy, argmax, and an exponential-race sample on CUDA."""
+    if (
+        logits.dtype != torch.float32
+        or exponential_noise.dtype != torch.float32
+        or logits.ndim != 2
+        or exponential_noise.shape != logits.shape
+        or not logits.is_contiguous()
+        or not exponential_noise.is_contiguous()
+    ):
+        raise ValueError("categorical_stats_sample requires matching contiguous 2D float32 tensors")
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("categorical_stats_sample requires non-empty rows and vocabulary")
+
+    rows, vocab_size = logits.shape
+    entropy = torch.empty((rows,), dtype=torch.float32, device=logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    sample = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    row_stats = torch.empty((rows, 2), dtype=torch.float32, device=logits.device)
+    invalid = torch.zeros((), dtype=torch.int32, device=logits.device)
+    stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
+    _C.categorical_stats_sample(
+        _wrap_for_dlpack(logits),
+        _wrap_for_dlpack(exponential_noise),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(sample),
+        _wrap_for_dlpack(row_stats),
+        _wrap_for_dlpack(invalid),
+        vocab_size,
+        stream_ptr,
+    )
+    return entropy, argmax, sample, invalid
 
 
 def softcap_scale(
@@ -2321,6 +2360,19 @@ def _build_constraints() -> dict:
         "categorical_stats": FunctionConstraints(
             params={
                 "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "categorical_stats_sample": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
                 ),

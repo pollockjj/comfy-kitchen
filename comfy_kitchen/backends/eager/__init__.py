@@ -5,6 +5,7 @@ __all__ = [
     "apply_rope_split_half",
     "apply_rope_split_half1",
     "categorical_stats",
+    "categorical_stats_sample",
     "softcap_scale",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
@@ -71,7 +72,7 @@ from .quantization import (
     stochastic_rounding_fp8,
 )
 from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_split_half1
-from .sampling import categorical_stats, softcap_scale
+from .sampling import categorical_stats, categorical_stats_sample, softcap_scale
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
@@ -84,6 +85,19 @@ def _build_constraints() -> dict:
         "categorical_stats": FunctionConstraints(
             params={
                 "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "categorical_stats_sample": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
                 ),

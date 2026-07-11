@@ -64,6 +64,18 @@ extern "C" {
         int64_t vocab_size,
         cudaStream_t stream);
 
+    void launch_categorical_stats_sample_kernel(
+        const float* logits,
+        const float* exponential_noise,
+        float* entropy,
+        int64_t* argmax,
+        int64_t* sample,
+        float* row_stats,
+        int32_t* invalid,
+        int64_t rows,
+        int64_t vocab_size,
+        cudaStream_t stream);
+
     void launch_softcap_scale_kernel(
         const void* raw_logits,
         float* output,
@@ -398,6 +410,52 @@ void categorical_stats(
         entropy.data(),
         argmax.data(),
         row_stats.data(),
+        rows,
+        vocab_size,
+        stream);
+}
+
+void categorical_stats_sample(
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> exponential_noise,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> sample,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> row_stats,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(logits.shape(0));
+    if (
+        rows <= 0
+        || vocab_size <= 0
+        || static_cast<int64_t>(logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(exponential_noise.shape(0)) != rows
+        || static_cast<int64_t>(exponential_noise.shape(1)) != vocab_size
+    ) {
+        throw std::runtime_error("categorical_stats_sample requires matching non-empty [rows, vocab] inputs");
+    }
+    if (
+        static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(sample.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(1)) != 2
+        || static_cast<int64_t>(invalid.size()) != 1
+    ) {
+        throw std::runtime_error("categorical_stats_sample output shape mismatch");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_categorical_stats_sample_kernel(
+        logits.data(),
+        exponential_noise.data(),
+        entropy.data(),
+        argmax.data(),
+        sample.data(),
+        row_stats.data(),
+        invalid.data(),
         rows,
         vocab_size,
         stream);
@@ -2256,6 +2314,18 @@ NB_MODULE(_C, m) {
           nb::arg("entropy"),
           nb::arg("argmax"),
           nb::arg("row_stats"),
+          nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("categorical_stats_sample", &categorical_stats_sample,
+          "Categorical entropy, argmax, and exponential-race sample for FP32 rows",
+          nb::arg("logits"),
+          nb::arg("exponential_noise"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("sample"),
+          nb::arg("row_stats"),
+          nb::arg("invalid"),
           nb::arg("vocab_size"),
           nb::arg("stream_ptr"));
 
