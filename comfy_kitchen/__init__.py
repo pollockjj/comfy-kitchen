@@ -51,6 +51,7 @@ __all__ = [
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
+    "reserve_cuda_stream_workspaces",
     "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
@@ -425,6 +426,11 @@ def fused_moe_mxfp8(
     }
     impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
     return impl(**kwargs)
+
+
+def reserve_cuda_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Reserve Kitchen workspaces before a caller captures work on a CUDA stream."""
+    return _cuda_backend.reserve_stream_workspaces(stream)
 
 
 def release_cuda_stream_workspaces(stream: torch.cuda.Stream) -> bool:
