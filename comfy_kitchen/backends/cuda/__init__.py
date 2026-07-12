@@ -2851,19 +2851,6 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
         ),
-        "gelu_tanh_multiply_quantize_mxfp8": FunctionConstraints(
-            params={
-                "gate": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "up": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-            },
-            default_devices=cuda_devices,
-        ),
         "mxfp8_embedding": FunctionConstraints(
             params={
                 "qweight": ParamConstraint(

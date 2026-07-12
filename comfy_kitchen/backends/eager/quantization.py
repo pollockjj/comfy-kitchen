@@ -326,18 +326,6 @@ def quantize_mxfp8(
     return data_fp8, blocked_scales.view(torch.float8_e8m0fnu)
 
 
-def gelu_tanh_multiply_quantize_mxfp8(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    pad_32x: bool = False,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Reference composition for fused tanh-GELU multiplication and MXFP8 quantization."""
-    if gate.shape != up.shape or gate.dtype != up.dtype or gate.device != up.device:
-        raise ValueError("gate and up tensors must have identical shape, dtype, and device")
-    product = torch.nn.functional.gelu(gate, approximate="tanh") * up
-    return quantize_mxfp8(product, pad_32x=pad_32x)
-
-
 def dequantize_mxfp8(
     qx: torch.Tensor,
     block_scales: torch.Tensor,

@@ -18,7 +18,6 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
     "mxfp8_embedding",
-    "gelu_tanh_multiply_quantize_mxfp8",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -64,7 +63,6 @@ from .quantization import (
     dequantize_per_tensor_fp8,
     int8_linear,
     mxfp8_embedding,
-    gelu_tanh_multiply_quantize_mxfp8,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -408,19 +406,6 @@ def _build_constraints() -> dict:
                 params={
                     "x": ParamConstraint(
                         dtypes=standard_floats,
-                        shape_rules=(ExactDims(2),),
-                    ),
-                },
-                default_devices=all_devices)
-
-        out["gelu_tanh_multiply_quantize_mxfp8"] = FunctionConstraints(
-                params={
-                    "gate": ParamConstraint(
-                        dtypes=frozenset({torch.float16, torch.bfloat16}),
-                        shape_rules=(ExactDims(2),),
-                    ),
-                    "up": ParamConstraint(
-                        dtypes=frozenset({torch.float16, torch.bfloat16}),
                         shape_rules=(ExactDims(2),),
                     ),
                 },

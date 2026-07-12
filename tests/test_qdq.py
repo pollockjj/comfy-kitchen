@@ -455,9 +455,7 @@ class TestQuantizeMXFP8:
     (256, torch.float16),
 ])
 def test_gelu_tanh_multiply_quantize_mxfp8_exact(device, seed, m, dtype):
-    if device != "cuda" or "cuda" not in get_capable_backends(
-        "gelu_tanh_multiply_quantize_mxfp8", device
-    ):
+    if device != "cuda":
         pytest.skip("CUDA fused GELU MXFP8 quantization is unavailable")
 
     gate = torch.randn(m, 2112, device=device, dtype=dtype)

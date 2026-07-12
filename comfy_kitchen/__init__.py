@@ -537,11 +537,9 @@ def gelu_tanh_multiply_quantize_mxfp8(
     up: torch.Tensor,
     pad_32x: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply tanh GELU, multiply by ``up``, and quantize the BF16/FP16 result to MXFP8."""
-    kwargs = {"gate": gate, "up": up, "pad_32x": pad_32x}
-    impl = registry.get_implementation(
-        "gelu_tanh_multiply_quantize_mxfp8", kwargs=kwargs)
-    return impl(**kwargs)
+    """Apply tanh GELU, multiply by ``up``, and quantize to MXFP8 on CUDA."""
+    return _cuda_backend.gelu_tanh_multiply_quantize_mxfp8(
+        gate, up, pad_32x=pad_32x)
 
 
 def dequantize_mxfp8(
