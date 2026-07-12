@@ -171,6 +171,22 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    bool launch_cutlass_paired_gemm_mxfp8(
+        const void* activation_ptr,
+        const void* activation_scale_ptr,
+        const void* first_weight_ptr,
+        const void* first_weight_scale_ptr,
+        const void* second_weight_ptr,
+        const void* second_weight_scale_ptr,
+        void* output_ptr,
+        int64_t group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
     bool launch_cutlass_fused_moe_mxfp8(
         const void* input,
         const int32_t* expert_ids,
@@ -881,6 +897,61 @@ void cutlass_grouped_gemm_mxfp8(
             output.data(), num_groups, group_m, n, k, out_dtype_code, workspace.data(),
             workspace.size(), stream)) {
         throw std::runtime_error("CUTLASS grouped MXFP8 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_paired_gemm_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> first_weight,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> first_weight_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> second_weight,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> second_weight_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t group_m = activations.shape(0);
+    const int64_t k = activations.shape(1);
+    const int64_t n = first_weight.shape(0);
+    const int64_t scale_m = ((group_m + 127) / 128) * 128;
+    const int64_t scale_k = ((k / 32) + 3) / 4 * 4;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+
+    if (group_m <= 0 || group_m % 32 != 0) {
+        throw std::runtime_error("paired MXFP8 M must be a positive multiple of 32");
+    }
+    if (k <= 0 || k % 32 != 0) {
+        throw std::runtime_error("paired MXFP8 K must be a positive multiple of 32");
+    }
+    if (first_weight.shape(1) != k || second_weight.shape(0) != n ||
+        second_weight.shape(1) != k) {
+        throw std::runtime_error("paired MXFP8 weight shapes must match");
+    }
+    if (activation_scales.shape(0) != scale_m || activation_scales.shape(1) != scale_k) {
+        throw std::runtime_error("paired MXFP8 activation scale shape mismatch");
+    }
+    if (first_weight_scales.shape(0) != scale_n ||
+        first_weight_scales.shape(1) != scale_k ||
+        second_weight_scales.shape(0) != scale_n ||
+        second_weight_scales.shape(1) != scale_k) {
+        throw std::runtime_error("paired MXFP8 weight scale shapes must match");
+    }
+    if (output.shape(0) != 2 || output.shape(1) != group_m || output.shape(2) != n) {
+        throw std::runtime_error("paired MXFP8 output shape mismatch");
+    }
+    if (out_dtype_code != 1 && out_dtype_code != 2) {
+        throw std::runtime_error("paired MXFP8 output must be float16 or bfloat16");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_paired_gemm_mxfp8(
+            activations.data(), activation_scales.data(), first_weight.data(),
+            first_weight_scales.data(), second_weight.data(), second_weight_scales.data(),
+            output.data(), group_m, n, k, out_dtype_code, workspace.data(),
+            workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS paired MXFP8 GEMM is unavailable for this configuration");
     }
 }
 
@@ -2868,6 +2939,19 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("workspace"),
           nb::arg("group_m"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_paired_gemm_mxfp8", &cutlass_paired_gemm_mxfp8,
+          "CUTLASS SM120 paired MXFP8 GEMM sharing one activation matrix",
+          nb::arg("activations"),
+          nb::arg("activation_scales"),
+          nb::arg("first_weight"),
+          nb::arg("first_weight_scales"),
+          nb::arg("second_weight"),
+          nb::arg("second_weight_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
           nb::arg("out_dtype_code"),
           nb::arg("stream_ptr"));
 
