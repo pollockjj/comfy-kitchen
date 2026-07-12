@@ -729,34 +729,6 @@ def _op_quantize_mxfp8_fake(x, pad_32x):
     return qdata, block_scales
 
 
-@torch.library.custom_op(
-    "comfy_kitchen::gelu_tanh_multiply_quantize_mxfp8", mutates_args=())
-def _op_gelu_tanh_multiply_quantize_mxfp8(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    pad_32x: bool,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    kwargs = {"gate": gate, "up": up, "pad_32x": pad_32x}
-    impl = registry.get_implementation(
-        "gelu_tanh_multiply_quantize_mxfp8", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_gelu_tanh_multiply_quantize_mxfp8.register_fake
-def _op_gelu_tanh_multiply_quantize_mxfp8_fake(gate, up, pad_32x):
-    rows, cols = gate.shape
-    if pad_32x:
-        rows = roundup(rows, 32)
-        cols = roundup(cols, 32)
-    qdata = torch.empty(
-        (rows, cols), dtype=torch.float8_e4m3fn, device=gate.device)
-    scale_rows = roundup(rows, 128)
-    scale_cols = roundup(cols // 32, 4)
-    block_scales = torch.empty(
-        (scale_rows, scale_cols), dtype=torch.float8_e8m0fnu, device=gate.device)
-    return qdata, block_scales
-
-
 @torch.library.custom_op("comfy_kitchen::dequantize_mxfp8", mutates_args=())
 def _op_dequantize_mxfp8(
     qx: torch.Tensor,
