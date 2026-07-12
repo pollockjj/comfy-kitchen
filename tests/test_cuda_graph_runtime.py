@@ -20,11 +20,12 @@ def test_cuda_runtime_graph_lifecycle():
     output_ref = weakref.ref(captured_output)
     del captured_output
     gc.collect()
-    static_input.fill_(4)
-    torch.cuda.synchronize()
-    graph.replay(stream)
-    stream.synchronize()
-    torch.testing.assert_close(output_ref(), torch.full_like(static_input, 5))
+    for value in (4, 7):
+        static_input.fill_(value)
+        torch.cuda.synchronize()
+        graph.replay(stream)
+        stream.synchronize()
+        torch.testing.assert_close(output_ref(), torch.full_like(static_input, value + 1))
     graph.reset()
     assert output_ref() is None
     with pytest.raises(RuntimeError, match="has been reset"):
