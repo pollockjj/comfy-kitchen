@@ -402,6 +402,16 @@ def mxfp8_embedding(
     return output, invalid
 
 
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Reference BF16 dequantize-then-matmul path for an MXFP8 embedding."""
+    dequantized = dequantize_mxfp8(qweight, block_scales, torch.bfloat16)
+    return torch.mm(weights, dequantized, out_dtype=torch.float32)
+
+
 def scaled_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -773,6 +783,30 @@ def _op_mxfp8_embedding_fake(qweight, block_scales, indices, output_dtype_code):
     )
     invalid = torch.empty((), dtype=torch.int32, device=qweight.device)
     return output, invalid
+
+
+@torch.library.custom_op("comfy_kitchen::mxfp8_weighted_embedding", mutates_args=())
+def _op_mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    kwargs = {
+        "qweight": qweight,
+        "block_scales": block_scales,
+        "weights": weights,
+    }
+    impl = registry.get_implementation("mxfp8_weighted_embedding", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_mxfp8_weighted_embedding.register_fake
+def _op_mxfp8_weighted_embedding_fake(qweight, block_scales, weights):
+    return torch.empty(
+        (weights.shape[0], qweight.shape[1]),
+        dtype=torch.float32,
+        device=weights.device,
+    )
 
 
 @torch.library.custom_op("comfy_kitchen::scaled_mm_mxfp8", mutates_args=())

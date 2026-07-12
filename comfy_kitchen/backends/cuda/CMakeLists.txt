@@ -131,6 +131,7 @@ list(APPEND STRICT_CUDA_NVCC_FLAGS --ftz=false --prec-div=true --prec-sqrt=true)
 add_library(comfy_kitchen_strict_cuda OBJECT
     ops/softcap_scale.cu
     ops/gelu_tanh_multiply_quantize_mxfp8.cu
+    ops/mxfp8_weighted_embedding.cu
 )
 set_target_properties(comfy_kitchen_strict_cuda PROPERTIES
     POSITION_INDEPENDENT_CODE ON

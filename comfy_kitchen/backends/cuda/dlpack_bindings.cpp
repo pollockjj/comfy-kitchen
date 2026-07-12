@@ -325,6 +325,18 @@ extern "C" {
         int output_dtype_code,
         cudaStream_t stream);
 
+    void launch_mxfp8_weighted_embedding_kernel(
+        const void* qweight,
+        const void* block_scales,
+        const void* weights,
+        float* partials,
+        float* output,
+        int64_t m,
+        int64_t k,
+        int64_t n,
+        int split_k,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -1308,6 +1320,54 @@ void mxfp8_embedding(
         index_bits,
         output_dtype_code,
         stream);
+}
+
+void mxfp8_weighted_embedding(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> qweight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> block_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
+    nb::ndarray<nb::device::cuda> partials,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int split_k,
+    uintptr_t stream_ptr)
+{
+    const int64_t k = static_cast<int64_t>(qweight.shape(0));
+    const int64_t n = static_cast<int64_t>(qweight.shape(1));
+    const int64_t m = static_cast<int64_t>(weights.shape(0));
+    if (m <= 0 || k <= 0 || n <= 0 || weights.shape(1) != k) {
+        throw std::runtime_error("mxfp8_weighted_embedding shape mismatch");
+    }
+    if (m % 64 || k % 64 || n % 128) {
+        throw std::runtime_error(
+            "mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0");
+    }
+    if (map_dtype_to_code(qweight.dtype()) != 3
+        || map_dtype_to_code(block_scales.dtype()) != 3
+        || map_dtype_to_code(weights.dtype()) != 2
+        || map_dtype_to_code(partials.dtype()) != 0
+        || map_dtype_to_code(output.dtype()) != 0) {
+        throw std::runtime_error("mxfp8_weighted_embedding dtype mismatch");
+    }
+    if (split_k <= 0
+        || static_cast<int64_t>(partials.size()) != split_k * m * n
+        || static_cast<int64_t>(output.size()) != m * n) {
+        throw std::runtime_error("mxfp8_weighted_embedding workspace shape mismatch");
+    }
+    const int64_t scale_rows = ((k + 127) / 128) * 128;
+    const int64_t scale_cols = (((n / 32) + 3) / 4) * 4;
+    if (static_cast<int64_t>(block_scales.size()) < scale_rows * scale_cols) {
+        throw std::runtime_error("mxfp8_weighted_embedding block scale storage is too small");
+    }
+    const int device = qweight.device_id();
+    if (block_scales.device_id() != device
+        || weights.device_id() != device
+        || partials.device_id() != device
+        || output.device_id() != device) {
+        throw std::runtime_error("mxfp8_weighted_embedding tensors must share one CUDA device");
+    }
+    launch_mxfp8_weighted_embedding_kernel(
+        qweight.data(), block_scales.data(), weights.data(), partials.data(), output.data(),
+        m, k, n, split_k, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -3182,6 +3242,16 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("invalid"),
           nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("mxfp8_weighted_embedding", &mxfp8_weighted_embedding,
+          "Multiply BF16 probabilities by an MXFP8 embedding into FP32",
+          nb::arg("qweight"),
+          nb::arg("block_scales"),
+          nb::arg("weights"),
+          nb::arg("partials"),
+          nb::arg("output"),
+          nb::arg("split_k"),
           nb::arg("stream_ptr"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,

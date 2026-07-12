@@ -52,6 +52,7 @@ __all__ = [
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "mxfp8_embedding",
+    "mxfp8_weighted_embedding",
     "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_mxfp8",
     "quantize_nvfp4",
@@ -1651,6 +1652,61 @@ def mxfp8_embedding(
     return output, invalid
 
 
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Direct BF16-by-MXFP8 matrix product with FP32 accumulation."""
+    if (
+        qweight.dtype != torch.float8_e4m3fn
+        or block_scales.dtype != torch.float8_e8m0fnu
+        or weights.dtype != torch.bfloat16
+        or qweight.ndim != 2
+        or block_scales.ndim != 2
+        or weights.ndim != 2
+        or not qweight.is_contiguous()
+        or not block_scales.is_contiguous()
+        or not weights.is_contiguous()
+    ):
+        raise ValueError(
+            "mxfp8_weighted_embedding requires contiguous 2D E4M3 weights, "
+            "2D E8M0 scales, and 2D BF16 probabilities"
+        )
+    if qweight.device != block_scales.device or qweight.device != weights.device:
+        raise ValueError("mxfp8_weighted_embedding tensors must share one CUDA device")
+    k, n = qweight.shape
+    m = weights.shape[0]
+    if weights.shape[1] != k:
+        raise ValueError("mxfp8_weighted_embedding reduction dimensions must match")
+    if m == 0 or k == 0 or n == 0:
+        raise ValueError("mxfp8_weighted_embedding requires non-empty tensors")
+    if m % 64 != 0 or k % 64 != 0 or n % 128 != 0:
+        raise ValueError(
+            "native mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0"
+        )
+    scale_rows = roundup(k, 128)
+    scale_cols = roundup(n // 32, 4)
+    if block_scales.numel() < scale_rows * scale_cols:
+        raise ValueError("mxfp8_weighted_embedding block scale storage is too small")
+
+    output = torch.empty((m, n), dtype=torch.float32, device=weights.device)
+    split_k = 9 if (m, k, n) == (256, 262144, 2816) else 1
+    partials = output.unsqueeze(0) if split_k == 1 else torch.empty(
+        (split_k, m, n), dtype=torch.float32, device=weights.device)
+    stream_ptr = torch.cuda.current_stream(weights.device).cuda_stream
+    _C.mxfp8_weighted_embedding(
+        _wrap_for_dlpack(qweight.view(torch.uint8)),
+        _wrap_for_dlpack(block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(partials),
+        _wrap_for_dlpack(output),
+        split_k,
+        stream_ptr,
+    )
+    return output
+
+
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -2870,6 +2926,24 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),
+        "mxfp8_weighted_embedding": FunctionConstraints(
+            params={
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e8m0fnu}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weights": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
         ),
         "dequantize_nvfp4": FunctionConstraints(
             params={

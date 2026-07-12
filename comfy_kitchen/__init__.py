@@ -42,6 +42,7 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "mxfp8_embedding",
+    "mxfp8_weighted_embedding",
     "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
@@ -594,6 +595,28 @@ def mxfp8_embedding(
     elif invalid.item() != 0:
         raise IndexError("mxfp8_embedding index out of range")
     return output.reshape(*leading_shape, qweight.shape[1])
+
+
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply BF16 weights by an MXFP8 embedding and accumulate in FP32."""
+    if qweight.dtype != torch.float8_e4m3fn or qweight.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires a 2D float8_e4m3fn qweight")
+    if block_scales.dtype != torch.float8_e8m0fnu or block_scales.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires 2D float8_e8m0fnu block scales")
+    if weights.dtype != torch.bfloat16 or weights.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires 2D bfloat16 weights")
+    if weights.shape[1] != qweight.shape[0]:
+        raise ValueError("mxfp8_weighted_embedding reduction dimensions must match")
+    if qweight.device != block_scales.device or qweight.device != weights.device:
+        raise ValueError("mxfp8_weighted_embedding tensors must share one device")
+    if qweight.numel() == 0 or weights.shape[0] == 0:
+        raise ValueError("mxfp8_weighted_embedding requires non-empty tensors")
+    return torch.ops.comfy_kitchen.mxfp8_weighted_embedding(
+        qweight, block_scales, weights)
 
 
 def scaled_mm_mxfp8(
