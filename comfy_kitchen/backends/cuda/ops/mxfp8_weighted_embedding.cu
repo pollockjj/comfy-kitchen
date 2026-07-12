@@ -34,6 +34,8 @@ constexpr int kAccumulatorRows = kWarpM / kWmma;
 constexpr int kAccumulatorCols = kWarpN / kWmma;
 constexpr int kFp8ValuesPerVector = 16;
 constexpr int kFp8VectorsPerRow = kTileN / kFp8ValuesPerVector;
+constexpr int kBf16ValuesPerVector = sizeof(uint4) / sizeof(__nv_bfloat16);
+constexpr int kAVectorsPerRow = kTileK / kBf16ValuesPerVector;
 
 using Accumulator = wmma::fragment<wmma::accumulator, kWmma, kWmma, kWmma, float>;
 using FragmentA = wmma::fragment<
@@ -82,13 +84,17 @@ __global__ void mxfp8_weighted_embedding_kernel(
 
     const uint32_t scale_cols = static_cast<uint32_t>(n / 32);
     for (int64_t k_base = k_begin; k_base < k_end; k_base += kTileK) {
-        for (int index = static_cast<int>(threadIdx.x);
-             index < kTileM * kTileK;
-             index += kThreads) {
-            const int local_m = index / kTileK;
-            const int local_k = index % kTileK;
-            shared_a[local_m * kSharedStrideA + local_k] =
-                weights[(m_base + local_m) * k + k_base + local_k];
+        for (int vector_index = static_cast<int>(threadIdx.x);
+             vector_index < kTileM * kAVectorsPerRow;
+             vector_index += kThreads) {
+            const int local_m = vector_index / kAVectorsPerRow;
+            const int local_k =
+                (vector_index % kAVectorsPerRow) * kBf16ValuesPerVector;
+            const auto* source = reinterpret_cast<const uint4*>(
+                weights + (m_base + local_m) * k + k_base + local_k);
+            auto* destination = reinterpret_cast<uint4*>(
+                shared_a + local_m * kSharedStrideA + local_k);
+            *destination = *source;
         }
 
         if (threadIdx.x < kTileK) {
