@@ -21,6 +21,7 @@
 #include <cstdint>
 #include <cstring>
 #include <stdexcept>
+#include <type_traits>
 
 #ifdef COMFY_HAVE_CUTLASS
 #include "cute/tensor.hpp"
@@ -148,7 +149,13 @@ __global__ void prepare_grouped_mxfp8_args(
         activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
 }
 
-template <int TileM, int TileN, int TileK, class ElementD>
+template <
+    int TileM,
+    int TileN,
+    int TileK,
+    class ElementD,
+    bool Pingpong = false,
+    int PipelineStages = 0>
 bool run_grouped_mxfp8(
     const void* activations_raw,
     const void* activation_scales_raw,
@@ -214,9 +221,15 @@ bool run_grouped_mxfp8(
         ElementAccumulator,
         ThreadBlockShape,
         ClusterShape,
-        cutlass::gemm::collective::StageCountAutoCarveout<
-            static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+        std::conditional_t<
+            PipelineStages == 0,
+            cutlass::gemm::collective::StageCountAutoCarveout<
+                static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
+            cutlass::gemm::collective::StageCount<PipelineStages>>,
+        std::conditional_t<
+            Pingpong,
+            cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong,
+            cutlass::gemm::collective::KernelScheduleAuto>>::CollectiveOp;
 
     using GroupProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -360,6 +373,24 @@ bool run_selected_grouped_mxfp8(
     cudaStream_t stream) {
     if (n == 2816 && k == 704) {
         const char* tile = std::getenv("COMFY_KITCHEN_MXFP8_FC2_TILE");
+        if (tile != nullptr && std::strcmp(tile, "pingpong") == 0) {
+            return run_grouped_mxfp8<128, 64, 128, ElementD, true>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
+        if (tile != nullptr && std::strcmp(tile, "stage2") == 0) {
+            return run_grouped_mxfp8<128, 64, 128, ElementD, false, 2>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
+        if (tile != nullptr && std::strcmp(tile, "pingpong_stage2") == 0) {
+            return run_grouped_mxfp8<128, 64, 128, ElementD, true, 2>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
         if (tile != nullptr && std::strcmp(tile, "256x64") == 0) {
             return run_grouped_mxfp8<256, 64, 128, ElementD>(
                 activations_raw, activation_scales_raw, weights_raw,
