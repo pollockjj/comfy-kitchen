@@ -42,6 +42,7 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "mxfp8_embedding",
+    "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
@@ -529,6 +530,16 @@ def quantize_mxfp8(
         - block_scales_e8m0: E8M0 scales in swizzled layout
     """
     return torch.ops.comfy_kitchen.quantize_mxfp8(x, pad_32x)
+
+
+def gelu_tanh_multiply_quantize_mxfp8(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply tanh GELU, multiply by ``up``, and quantize the BF16/FP16 result to MXFP8."""
+    return torch.ops.comfy_kitchen.gelu_tanh_multiply_quantize_mxfp8(
+        gate, up, pad_32x)
 
 
 def dequantize_mxfp8(

@@ -300,6 +300,18 @@ extern "C" {
         int input_dtype_code,
         cudaStream_t stream);
 
+    void launch_gelu_tanh_multiply_quantize_mxfp8_kernel(
+        const void* gate,
+        const void* up,
+        void* output,
+        void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t orig_rows,
+        int64_t orig_cols,
+        int input_dtype_code,
+        cudaStream_t stream);
+
     void launch_mxfp8_embedding_kernel(
         const void* qweight,
         const void* block_scales,
@@ -1195,6 +1207,39 @@ void quantize_mxfp8(
         orig_cols,
         input_dtype_code,
         stream);
+}
+
+void gelu_tanh_multiply_quantize_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> gate,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> up,
+    nb::ndarray<nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> block_scales,
+    bool pad_32x,
+    uintptr_t stream_ptr) {
+
+    const int64_t orig_rows = gate.shape(0);
+    const int64_t orig_cols = gate.shape(1);
+    if (up.shape(0) != orig_rows || up.shape(1) != orig_cols) {
+        throw std::runtime_error("gate and up tensors must have identical shapes");
+    }
+    const int input_dtype_code = map_dtype_to_code(gate.dtype());
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        map_dtype_to_code(up.dtype()) != input_dtype_code) {
+        throw std::runtime_error(
+            "fused GELU MXFP8 quantization requires matching float16 or bfloat16 inputs");
+    }
+
+    int64_t num_rows = orig_rows;
+    int64_t num_cols = orig_cols;
+    if (pad_32x) {
+        num_rows = (orig_rows + 31) / 32 * 32;
+        num_cols = (orig_cols + 31) / 32 * 32;
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_gelu_tanh_multiply_quantize_mxfp8_kernel(
+        gate.data(), up.data(), output.data(), block_scales.data(), num_rows,
+        num_cols, orig_rows, orig_cols, input_dtype_code, stream);
 }
 
 void mxfp8_embedding(
@@ -3114,6 +3159,16 @@ NB_MODULE(_C, m) {
     m.def("quantize_mxfp8", &quantize_mxfp8,
           "Quantize to FP8 E4M3 with E8M0 block scales using cuBLAS tiled layout",
           nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("block_scales"),
+          nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("gelu_tanh_multiply_quantize_mxfp8",
+          &gelu_tanh_multiply_quantize_mxfp8,
+          "Apply tanh GELU, multiply, and quantize to MXFP8 in one kernel",
+          nb::arg("gate"),
+          nb::arg("up"),
           nb::arg("output"),
           nb::arg("block_scales"),
           nb::arg("pad_32x") = false,

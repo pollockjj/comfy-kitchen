@@ -52,6 +52,7 @@ __all__ = [
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
     "mxfp8_embedding",
+    "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
@@ -1560,6 +1561,46 @@ def quantize_mxfp8(
     return qx, sx
 
 
+def gelu_tanh_multiply_quantize_mxfp8(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply tanh GELU, multiply by ``up``, and quantize the result to MXFP8."""
+    if gate.shape != up.shape or gate.dtype != up.dtype or gate.device != up.device:
+        raise ValueError("gate and up tensors must have identical shape, dtype, and device")
+    if gate.dtype not in (torch.float16, torch.bfloat16) or gate.ndim != 2:
+        raise ValueError("fused GELU MXFP8 quantization requires 2D float16 or bfloat16 inputs")
+    if not gate.is_contiguous() or not up.is_contiguous():
+        raise ValueError("gate and up tensors must be contiguous")
+
+    orig_rows, orig_cols = gate.shape
+    if pad_32x:
+        num_rows = roundup(orig_rows, 32)
+        num_cols = roundup(orig_cols, 32)
+    else:
+        num_rows, num_cols = orig_rows, orig_cols
+        if num_rows % 32 != 0 or num_cols % 32 != 0:
+            raise ValueError("gate and up dimensions must be divisible by 32 unless pad_32x is true")
+
+    qx = torch.empty(
+        (num_rows, num_cols), device=gate.device, dtype=torch.float8_e4m3fn)
+    scale_rows = roundup(num_rows, 128)
+    scale_cols = roundup(num_cols // 32, 4)
+    sx_uint8 = torch.zeros(
+        (scale_rows, scale_cols), device=gate.device, dtype=torch.uint8)
+    stream_ptr = torch.cuda.current_stream(gate.device).cuda_stream
+    _C.gelu_tanh_multiply_quantize_mxfp8(
+        _wrap_for_dlpack(gate),
+        _wrap_for_dlpack(up),
+        _wrap_for_dlpack(qx),
+        _wrap_for_dlpack(sx_uint8),
+        pad_32x,
+        stream_ptr,
+    )
+    return qx, sx_uint8.view(torch.float8_e8m0fnu)
+
+
 def mxfp8_embedding(
     qweight: torch.Tensor,
     block_scales: torch.Tensor,
@@ -2805,6 +2846,19 @@ def _build_constraints() -> dict:
             params={
                 "x": ParamConstraint(
                     dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "gelu_tanh_multiply_quantize_mxfp8": FunctionConstraints(
+            params={
+                "gate": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "up": ParamConstraint(
+                    dtypes=frozenset({torch.float16, torch.bfloat16}),
                     shape_rules=(ExactDims(2),),
                 ),
             },
