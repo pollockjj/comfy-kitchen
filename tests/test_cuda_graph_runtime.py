@@ -7,7 +7,6 @@ import torch
 import comfy_kitchen as ck
 from comfy_kitchen.backends import cuda as cuda_backend
 
-
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not cuda_backend._EXT_AVAILABLE,
     reason="Comfy Kitchen CUDA extension is unavailable",
