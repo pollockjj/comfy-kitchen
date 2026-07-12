@@ -28,6 +28,7 @@ __all__ = [
     "apply_rope_split_half1",
     "categorical_stats",
     "categorical_stats_sample",
+    "scale_moe_routing_weights",
     "softcap_scale",
     "softcap_categorical_stats_sample",
     "dequantize_nvfp4",
@@ -480,6 +481,47 @@ def categorical_stats_sample(
         stream_ptr,
     )
     return entropy, argmax, sample, invalid
+
+
+def scale_moe_routing_weights(
+    normalized_weights: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Apply BF16 expert scales to contiguous FP32 top-k weights on CUDA."""
+    if (
+        normalized_weights.dtype != torch.float32
+        or normalized_weights.ndim != 2
+        or normalized_weights.shape[1] != 8
+        or not normalized_weights.is_contiguous()
+    ):
+        raise ValueError("normalized_weights must be contiguous float32 [N, 8]")
+    if (
+        expert_ids.dtype != torch.int64
+        or expert_ids.shape != normalized_weights.shape
+        or not expert_ids.is_contiguous()
+    ):
+        raise ValueError("expert_ids must be contiguous int64 with the weights shape")
+    if expert_scale.dtype != torch.bfloat16 or expert_scale.ndim != 1 or not expert_scale.is_contiguous():
+        raise ValueError("expert_scale must be contiguous 1D bfloat16")
+    if expert_scale.numel() == 0:
+        raise ValueError("expert_scale must be non-empty")
+    if expert_ids.device != normalized_weights.device or expert_scale.device != normalized_weights.device:
+        raise ValueError("routing weights, ids, and scales must share one CUDA device")
+
+    output = torch.empty_like(normalized_weights)
+    if normalized_weights.numel() == 0:
+        return output
+    stream_ptr = torch.cuda.current_stream(normalized_weights.device).cuda_stream
+    _C.scale_moe_routing_weights(
+        _wrap_for_dlpack(normalized_weights),
+        _wrap_for_dlpack(expert_ids),
+        _wrap_for_dlpack(expert_scale),
+        _wrap_for_dlpack(output),
+        expert_scale.numel(),
+        stream_ptr,
+    )
+    return output
 
 
 def softcap_scale(
@@ -2646,6 +2688,23 @@ def _build_constraints() -> dict:
                 "exponential_noise": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "scale_moe_routing_weights": FunctionConstraints(
+            params={
+                "normalized_weights": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_ids": ParamConstraint(
+                    dtypes=frozenset({torch.int64}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_scale": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(1),),
                 ),
             },
             default_devices=cuda_devices,

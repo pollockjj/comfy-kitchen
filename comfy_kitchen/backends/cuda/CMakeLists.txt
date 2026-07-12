@@ -128,7 +128,10 @@ set(CUDA_SOURCES
 set(STRICT_CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS})
 list(REMOVE_ITEM STRICT_CUDA_NVCC_FLAGS --use_fast_math)
 list(APPEND STRICT_CUDA_NVCC_FLAGS --ftz=false --prec-div=true --prec-sqrt=true)
-add_library(comfy_kitchen_strict_cuda OBJECT ops/softcap_scale.cu)
+add_library(comfy_kitchen_strict_cuda OBJECT
+    ops/softcap_scale.cu
+    ops/scale_moe_routing_weights.cu
+)
 set_target_properties(comfy_kitchen_strict_cuda PROPERTIES
     POSITION_INDEPENDENT_CODE ON
     CUDA_ARCHITECTURES "${COMFY_CUDA_ARCHS}"

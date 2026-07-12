@@ -29,6 +29,15 @@ def categorical_stats_sample(
     return distribution.entropy(), logits.argmax(dim=-1), sample, (~valid).to(torch.int32)
 
 
+def scale_moe_routing_weights(
+    normalized_weights: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Apply selected expert scales without changing routing order."""
+    return normalized_weights * expert_scale[expert_ids]
+
+
 def softcap_scale(
     raw_logits: torch.Tensor,
     cap: float,

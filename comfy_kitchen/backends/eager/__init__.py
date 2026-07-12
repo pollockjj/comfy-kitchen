@@ -6,6 +6,7 @@ __all__ = [
     "apply_rope_split_half1",
     "categorical_stats",
     "categorical_stats_sample",
+    "scale_moe_routing_weights",
     "softcap_scale",
     "softcap_categorical_stats_sample",
     "dequantize_mxfp8",
@@ -78,6 +79,7 @@ from .rope import apply_rope, apply_rope1, apply_rope_split_half, apply_rope_spl
 from .sampling import (
     categorical_stats,
     categorical_stats_sample,
+    scale_moe_routing_weights,
     softcap_categorical_stats_sample,
     softcap_scale,
 )
@@ -108,6 +110,23 @@ def _build_constraints() -> dict:
                 "exponential_noise": ParamConstraint(
                     dtypes=frozenset({torch.float32}),
                     shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "scale_moe_routing_weights": FunctionConstraints(
+            params={
+                "normalized_weights": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_ids": ParamConstraint(
+                    dtypes=frozenset({torch.int64}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_scale": ParamConstraint(
+                    dtypes=standard_floats,
+                    shape_rules=(ExactDims(1),),
                 ),
             },
             default_devices=all_devices,

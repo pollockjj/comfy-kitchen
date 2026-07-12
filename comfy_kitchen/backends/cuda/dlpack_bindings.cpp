@@ -76,6 +76,15 @@ extern "C" {
         int64_t vocab_size,
         cudaStream_t stream);
 
+    void launch_scale_moe_routing_weights_kernel(
+        const float* normalized_weights,
+        const int64_t* expert_ids,
+        const void* expert_scale_bf16,
+        float* output,
+        int64_t num_routes,
+        int64_t num_experts,
+        cudaStream_t stream);
+
     void launch_softcap_scale_kernel(
         const void* raw_logits,
         float* output,
@@ -534,6 +543,43 @@ void categorical_stats_sample(
         rows,
         vocab_size,
         stream);
+}
+
+void scale_moe_routing_weights(
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> normalized_weights,
+    nb::ndarray<int64_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> expert_scale,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> output,
+    int64_t num_experts,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(normalized_weights.shape(0));
+    const int64_t top_k = static_cast<int64_t>(normalized_weights.shape(1));
+    if (map_dtype_to_code(expert_scale.dtype()) != 2) {
+        throw std::runtime_error("scale_moe_routing_weights requires bfloat16 expert scales");
+    }
+    if (
+        top_k != 8 || num_experts <= 0
+        || static_cast<int64_t>(expert_scale.shape(0)) != num_experts
+        || static_cast<int64_t>(expert_ids.shape(0)) != rows
+        || static_cast<int64_t>(expert_ids.shape(1)) != top_k
+        || static_cast<int64_t>(output.shape(0)) != rows
+        || static_cast<int64_t>(output.shape(1)) != top_k
+    ) {
+        throw std::runtime_error("scale_moe_routing_weights shape mismatch");
+    }
+    const int device = normalized_weights.device_id();
+    if (
+        expert_ids.device_id() != device || expert_scale.device_id() != device
+        || output.device_id() != device
+    ) {
+        throw std::runtime_error("scale_moe_routing_weights tensors must share one CUDA device");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_scale_moe_routing_weights_kernel(
+        normalized_weights.data(), expert_ids.data(), expert_scale.data(), output.data(),
+        rows * top_k, num_experts, stream);
 }
 
 void softcap_scale(
@@ -2659,6 +2705,15 @@ NB_MODULE(_C, m) {
           nb::arg("row_stats"),
           nb::arg("invalid"),
           nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("scale_moe_routing_weights", &scale_moe_routing_weights,
+          "Apply BF16 per-expert scales to normalized FP32 routing weights",
+          nb::arg("normalized_weights"),
+          nb::arg("expert_ids"),
+          nb::arg("expert_scale"),
+          nb::arg("output"),
+          nb::arg("num_experts"),
           nb::arg("stream_ptr"));
 
     m.def("softcap_scale", &softcap_scale,

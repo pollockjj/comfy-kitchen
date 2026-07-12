@@ -32,6 +32,7 @@ __all__ = [
     "adaln",
     "categorical_stats",
     "categorical_stats_sample",
+    "scale_moe_routing_weights",
     "softcap_scale",
     "softcap_categorical_stats_sample",
     # Quantization / dequantization
@@ -164,6 +165,21 @@ def categorical_stats_sample(
     elif invalid.item() != 0:
         raise RuntimeError("categorical_stats_sample received an invalid distribution")
     return entropy.reshape(leading_shape), argmax.reshape(leading_shape), sample.reshape(leading_shape)
+
+
+def scale_moe_routing_weights(
+    normalized_weights: torch.Tensor,
+    expert_ids: torch.Tensor,
+    expert_scale: torch.Tensor,
+) -> torch.Tensor:
+    """Apply per-expert scale to normalized top-k routing weights."""
+    kwargs = {
+        "normalized_weights": normalized_weights,
+        "expert_ids": expert_ids,
+        "expert_scale": expert_scale,
+    }
+    impl = registry.get_implementation("scale_moe_routing_weights", kwargs=kwargs)
+    return impl(**kwargs)
 
 
 def softcap_scale(
