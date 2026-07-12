@@ -151,18 +151,11 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     }
     __syncthreads();
 
-    float softmax_sum = 0.0f;
-    for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float normalized = row_processed[col] - log_normalizer;
-        softmax_sum += __expf(normalized - normalized_max);
-    }
-    softmax_sum = block_reduce_sum(softmax_sum, warp_values);
-
     float entropy_sum = 0.0f;
     MaxPair local_sample{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         const float normalized = row_processed[col] - log_normalizer;
-        const float probability = __fdividef(__expf(normalized - normalized_max), softmax_sum);
+        const float probability = __fdividef(__expf(normalized - normalized_max), exponential_sum);
         const float noise = row_noise[col];
         if (!isfinite(noise) || noise <= 0.0f) {
             atomicExch(invalid, 1);
