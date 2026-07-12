@@ -20,10 +20,137 @@
 #include <cmath>
 #include <cstring>
 #include <string>
+#include <utility>
 
 #include "cublaslt_runtime.h"
 
 namespace nb = nanobind;
+
+namespace {
+
+std::string cuda_error_message(const char* operation, cudaError_t error) {
+    return std::string(operation) + " failed: " + cudaGetErrorName(error) + " (" +
+        cudaGetErrorString(error) + ")";
+}
+
+void check_cuda(cudaError_t error, const char* operation) {
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message(operation, error));
+    }
+}
+
+class CudaGraphExec {
+public:
+    CudaGraphExec(cudaGraphExec_t graph_exec, nb::object retained_objects)
+        : graph_exec_(graph_exec), retained_objects_(std::move(retained_objects)) {}
+
+    CudaGraphExec(const CudaGraphExec&) = delete;
+    CudaGraphExec& operator=(const CudaGraphExec&) = delete;
+
+    ~CudaGraphExec() noexcept {
+        if (graph_exec_ != nullptr) {
+            cudaGraphExecDestroy(graph_exec_);
+            graph_exec_ = nullptr;
+        }
+    }
+
+    bool valid() const noexcept {
+        return graph_exec_ != nullptr;
+    }
+
+    void replay(uintptr_t stream_ptr) {
+        if (graph_exec_ == nullptr) {
+            throw std::runtime_error("CUDA graph executable has been reset");
+        }
+        check_cuda(
+            cudaGraphLaunch(graph_exec_, reinterpret_cast<cudaStream_t>(stream_ptr)),
+            "cudaGraphLaunch");
+    }
+
+    void reset() {
+        if (graph_exec_ == nullptr) {
+            return;
+        }
+        cudaGraphExec_t graph_exec = graph_exec_;
+        check_cuda(cudaGraphExecDestroy(graph_exec), "cudaGraphExecDestroy");
+        graph_exec_ = nullptr;
+        retained_objects_ = nb::none();
+    }
+
+private:
+    cudaGraphExec_t graph_exec_ = nullptr;
+    nb::object retained_objects_;
+};
+
+void begin_cuda_graph_capture(uintptr_t stream_ptr) {
+    check_cuda(
+        cudaStreamBeginCapture(
+            reinterpret_cast<cudaStream_t>(stream_ptr),
+            cudaStreamCaptureModeThreadLocal),
+        "cudaStreamBeginCapture");
+}
+
+CudaGraphExec* end_cuda_graph_capture(
+    uintptr_t stream_ptr,
+    nb::object retained_objects) {
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end_error = cudaStreamEndCapture(
+        reinterpret_cast<cudaStream_t>(stream_ptr), &graph);
+    if (end_error != cudaSuccess) {
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+        throw std::runtime_error(cuda_error_message("cudaStreamEndCapture", end_error));
+    }
+    if (graph == nullptr) {
+        throw std::runtime_error("cudaStreamEndCapture returned no graph");
+    }
+
+    cudaGraphExec_t graph_exec = nullptr;
+    const cudaError_t instantiate_error = cudaGraphInstantiate(&graph_exec, graph, 0);
+    const cudaError_t destroy_error = cudaGraphDestroy(graph);
+    if (instantiate_error != cudaSuccess) {
+        std::string message = cuda_error_message("cudaGraphInstantiate", instantiate_error);
+        if (destroy_error != cudaSuccess) {
+            message += "; cleanup " + cuda_error_message("cudaGraphDestroy", destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    if (destroy_error != cudaSuccess) {
+        const cudaError_t exec_destroy_error = cudaGraphExecDestroy(graph_exec);
+        std::string message = cuda_error_message("cudaGraphDestroy", destroy_error);
+        if (exec_destroy_error != cudaSuccess) {
+            message += "; cleanup " +
+                cuda_error_message("cudaGraphExecDestroy", exec_destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    return new CudaGraphExec(graph_exec, std::move(retained_objects));
+}
+
+void abort_cuda_graph_capture(uintptr_t stream_ptr) {
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    check_cuda(cudaStreamIsCapturing(stream, &status), "cudaStreamIsCapturing");
+    if (status == cudaStreamCaptureStatusNone) {
+        throw std::runtime_error("CUDA graph capture is not active on this stream");
+    }
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end_error = cudaStreamEndCapture(stream, &graph);
+    const cudaError_t destroy_error =
+        graph == nullptr ? cudaSuccess : cudaGraphDestroy(graph);
+    if (end_error != cudaSuccess) {
+        std::string message = cuda_error_message("cudaStreamEndCapture", end_error);
+        if (destroy_error != cudaSuccess) {
+            message += "; cleanup " + cuda_error_message("cudaGraphDestroy", destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    check_cuda(destroy_error, "cudaGraphDestroy");
+}
+
+}  // namespace
 
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
@@ -2805,6 +2932,23 @@ void dequantize_int8_convrot_weight(
 
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
+
+    nb::class_<CudaGraphExec>(m, "_CudaGraphExec")
+        .def_prop_ro("valid", &CudaGraphExec::valid)
+        .def("replay", &CudaGraphExec::replay, nb::arg("stream_ptr"))
+        .def("reset", &CudaGraphExec::reset);
+
+    m.def("begin_cuda_graph_capture", &begin_cuda_graph_capture,
+          "Begin thread-local CUDA Runtime graph capture on a stream",
+          nb::arg("stream_ptr"));
+    m.def("end_cuda_graph_capture", &end_cuda_graph_capture,
+          "End capture and instantiate an executable CUDA graph",
+          nb::arg("stream_ptr"),
+          nb::arg("retained_objects"),
+          nb::rv_policy::take_ownership);
+    m.def("abort_cuda_graph_capture", &abort_cuda_graph_capture,
+          "End and destroy a CUDA graph capture without instantiating it",
+          nb::arg("stream_ptr"));
     
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
           "Quantize to FP8 using nanobind ndarrays",

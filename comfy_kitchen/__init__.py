@@ -56,6 +56,10 @@ __all__ = [
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
+    "CudaGraph",
+    "begin_cuda_graph_capture",
+    "end_cuda_graph_capture",
+    "abort_cuda_graph_capture",
     "reserve_cuda_stream_workspaces",
     "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
@@ -91,6 +95,26 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+CudaGraph = _cuda_backend.CudaGraph
+
+
+def begin_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """Begin thread-local CUDA Runtime graph capture on ``stream``."""
+    return _cuda_backend.begin_cuda_graph_capture(stream)
+
+
+def end_cuda_graph_capture(
+    stream: torch.cuda.Stream,
+    *captured_objects: object,
+) -> CudaGraph:
+    """End capture, retaining ``captured_objects`` until the graph is reset."""
+    return _cuda_backend.end_cuda_graph_capture(stream, *captured_objects)
+
+
+def abort_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """End and destroy an active capture without instantiating it."""
+    return _cuda_backend.abort_cuda_graph_capture(stream)
 
 
 def adaln(

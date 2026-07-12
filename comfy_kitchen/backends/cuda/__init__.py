@@ -64,6 +64,10 @@ __all__ = [
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
+    "CudaGraph",
+    "begin_cuda_graph_capture",
+    "end_cuda_graph_capture",
+    "abort_cuda_graph_capture",
     "reserve_stream_workspaces",
     "release_stream_workspaces",
     "scaled_mm_svdquant_w4a4",
@@ -356,6 +360,57 @@ def _stream_workspace_key(stream: torch.cuda.Stream) -> tuple[int, int]:
     if device_index is None:
         device_index = torch.cuda.current_device()
     return device_index, int(stream.cuda_stream)
+
+
+class CudaGraph:
+    """Executable CUDA Runtime graph with explicit replay and lifetime control."""
+
+    __slots__ = ("_graph_exec",)
+
+    def __init__(self, graph_exec: object):
+        self._graph_exec = graph_exec
+
+    @property
+    def valid(self) -> bool:
+        """Return whether this graph still owns an executable CUDA graph."""
+        return bool(self._graph_exec.valid)
+
+    def replay(self, stream: torch.cuda.Stream) -> None:
+        """Launch this graph asynchronously on ``stream``."""
+        self._graph_exec.replay(_stream_workspace_key(stream)[1])
+
+    def reset(self) -> None:
+        """Destroy this graph and release objects retained when capture ended."""
+        self._graph_exec.reset()
+
+
+def _require_cuda_graph_extension() -> None:
+    if not _EXT_AVAILABLE:
+        raise RuntimeError(f"Comfy Kitchen CUDA extension is unavailable: {_EXT_ERROR}")
+
+
+def begin_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """Begin thread-local CUDA Runtime graph capture on ``stream``."""
+    _require_cuda_graph_extension()
+    _C.begin_cuda_graph_capture(_stream_workspace_key(stream)[1])
+
+
+def end_cuda_graph_capture(
+    stream: torch.cuda.Stream,
+    *captured_objects: object,
+) -> CudaGraph:
+    """End capture, retaining ``captured_objects`` until the graph is reset."""
+    _require_cuda_graph_extension()
+    graph_exec = _C.end_cuda_graph_capture(
+        _stream_workspace_key(stream)[1], captured_objects
+    )
+    return CudaGraph(graph_exec)
+
+
+def abort_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """End and destroy an active capture without instantiating it."""
+    _require_cuda_graph_extension()
+    _C.abort_cuda_graph_capture(_stream_workspace_key(stream)[1])
 
 
 def reserve_stream_workspaces(stream: torch.cuda.Stream) -> bool:
