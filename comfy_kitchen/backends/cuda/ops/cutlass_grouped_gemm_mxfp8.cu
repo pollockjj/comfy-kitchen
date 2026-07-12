@@ -146,7 +146,7 @@ __global__ void prepare_grouped_mxfp8_args(
         activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
 }
 
-template <int TileM, int TileN, int TileK, class ElementD>
+template <int TileM, int TileN, int TileK, class ElementD, class KernelSchedule>
 bool run_grouped_mxfp8(
     const void* activations_raw,
     const void* activation_scales_raw,
@@ -214,7 +214,7 @@ bool run_grouped_mxfp8(
         ClusterShape,
         cutlass::gemm::collective::StageCountAutoCarveout<
             static_cast<int>(sizeof(typename CollectiveEpilogue::SharedStorage))>,
-        cutlass::gemm::collective::KernelScheduleAuto>::CollectiveOp;
+        KernelSchedule>::CollectiveOp;
 
     using GroupProblemShape = cutlass::gemm::GroupProblemShape<Shape<int, int, int>>;
     using GemmKernel = cutlass::gemm::kernel::GemmUniversal<
@@ -357,12 +357,14 @@ bool run_selected_grouped_mxfp8(
     size_t workspace_size,
     cudaStream_t stream) {
     if (n == 2816 && k == 704) {
-        return run_grouped_mxfp8<128, 64, 128, ElementD>(
+        return run_grouped_mxfp8<
+            128, 64, 128, ElementD, cutlass::gemm::collective::KernelScheduleAuto>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
     }
-    return run_grouped_mxfp8<128, 32, 128, ElementD>(
+    return run_grouped_mxfp8<
+        128, 32, 128, ElementD, cutlass::gemm::KernelPtrArrayTmaWarpSpecializedPingpong>(
         activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
         output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
         workspace_size, stream);
