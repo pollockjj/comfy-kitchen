@@ -51,7 +51,7 @@ __global__ void mxfp8_weighted_embedding_kernel(
     int64_t n,
     int split_k)
 {
-    extern __shared__ __align__(16) unsigned char shared_bytes[];
+    extern __shared__ __align__(32) unsigned char shared_bytes[];
     auto* shared_a = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
     auto* shared_b = shared_a + kTileM * kSharedStrideA;
     auto* shared_scales = reinterpret_cast<uint32_t*>(
