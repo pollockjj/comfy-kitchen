@@ -21,15 +21,15 @@ namespace {
 
 namespace wmma = nvcuda::wmma;
 
-constexpr int kTileM = 128;
+constexpr int kTileM = 64;
 constexpr int kTileN = 128;
 constexpr int kTileK = 64;
 constexpr int kSharedStrideA = kTileK + 8;
 constexpr int kSharedStrideB = kTileN + 8;
 constexpr int kWarpM = 32;
-constexpr int kWarpN = 32;
+constexpr int kWarpN = 64;
 constexpr int kWmma = 16;
-constexpr int kThreads = 512;
+constexpr int kThreads = 128;
 constexpr int kAccumulatorRows = kWarpM / kWmma;
 constexpr int kAccumulatorCols = kWarpN / kWmma;
 constexpr int kFp8ValuesPerVector = 16;
@@ -61,8 +61,8 @@ __global__ void mxfp8_weighted_embedding_kernel(
     const int tile_m = static_cast<int>(blockIdx.y);
     const int partition = static_cast<int>(blockIdx.z);
     const int warp = static_cast<int>(threadIdx.x) / 32;
-    const int warp_m = warp >> 2;
-    const int warp_n = warp & 3;
+    const int warp_m = warp & 1;
+    const int warp_n = warp >> 1;
     const int64_t m_base = static_cast<int64_t>(tile_m) * kTileM;
     const int64_t n_base = static_cast<int64_t>(tile_n) * kTileN;
 
@@ -218,7 +218,7 @@ extern "C" void launch_mxfp8_weighted_embedding_kernel(
     int split_k,
     cudaStream_t stream)
 {
-    if (m <= 0 || k <= 0 || n <= 0 || m % 128 || k % 64 || n % 128 || split_k <= 0) {
+    if (m <= 0 || k <= 0 || n <= 0 || m % 64 || k % 64 || n % 128 || split_k <= 0) {
         throw std::runtime_error("invalid mxfp8_weighted_embedding launch shape");
     }
     const dim3 grid(
