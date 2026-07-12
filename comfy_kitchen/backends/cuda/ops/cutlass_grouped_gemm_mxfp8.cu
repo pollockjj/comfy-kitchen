@@ -17,7 +17,9 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <cstdint>
+#include <cstring>
 #include <stdexcept>
 
 #ifdef COMFY_HAVE_CUTLASS
@@ -357,6 +359,31 @@ bool run_selected_grouped_mxfp8(
     size_t workspace_size,
     cudaStream_t stream) {
     if (n == 2816 && k == 704) {
+        const char* tile = std::getenv("COMFY_KITCHEN_MXFP8_FC2_TILE");
+        if (tile != nullptr && std::strcmp(tile, "256x64") == 0) {
+            return run_grouped_mxfp8<256, 64, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
+        if (tile != nullptr && std::strcmp(tile, "128x128") == 0) {
+            return run_grouped_mxfp8<128, 128, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
+        if (tile != nullptr && std::strcmp(tile, "256x32") == 0) {
+            return run_grouped_mxfp8<256, 32, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
+        if (tile != nullptr && std::strcmp(tile, "128x32") == 0) {
+            return run_grouped_mxfp8<128, 32, 128, ElementD>(
+                activations_raw, activation_scales_raw, weights_raw,
+                weight_scales_raw, output_raw, num_groups, group_m, m_indptr,
+                scale_group_m, n, k, workspace, workspace_size, stream);
+        }
         return run_grouped_mxfp8<128, 64, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
