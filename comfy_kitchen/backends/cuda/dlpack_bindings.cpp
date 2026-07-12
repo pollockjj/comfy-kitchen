@@ -102,6 +102,7 @@ extern "C" {
     void launch_softcap_categorical_stats_sample_bf16_kernel(
         const void* raw_logits,
         const float* exponential_noise,
+        float* processed_lut,
         void* self_conditioning_logits,
         float* entropy,
         int64_t* argmax,
@@ -673,6 +674,7 @@ void softcap_categorical_stats_sample(
 void softcap_categorical_stats_sample_bf16(
     nb::ndarray<nb::ndim<2>, nb::device::cuda> raw_logits,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> exponential_noise,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> processed_lut,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> self_conditioning_logits,
     nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
     nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
@@ -700,6 +702,7 @@ void softcap_categorical_stats_sample_bf16(
     const int logits_device = raw_logits.device_id();
     if (
         exponential_noise.device_id() != logits_device
+        || processed_lut.device_id() != logits_device
         || self_conditioning_logits.device_id() != logits_device
         || entropy.device_id() != logits_device
         || argmax.device_id() != logits_device
@@ -715,6 +718,7 @@ void softcap_categorical_stats_sample_bf16(
         || static_cast<int64_t>(argmax.shape(0)) != rows
         || static_cast<int64_t>(sample.shape(0)) != rows
         || static_cast<int64_t>(invalid.size()) != 1
+        || static_cast<int64_t>(processed_lut.size()) != (1 << 16)
     ) {
         throw std::runtime_error("softcap_categorical_stats_sample_bf16 output shape mismatch");
     }
@@ -726,6 +730,7 @@ void softcap_categorical_stats_sample_bf16(
     launch_softcap_categorical_stats_sample_bf16_kernel(
         raw_logits.data(),
         exponential_noise.data(),
+        processed_lut.data(),
         self_conditioning_logits.data(),
         entropy.data(),
         argmax.data(),
@@ -2860,6 +2865,7 @@ NB_MODULE(_C, m) {
           "Strict BF16 softcap, self-conditioning, categorical stats, and sample without FP32 output",
           nb::arg("raw_logits"),
           nb::arg("exponential_noise"),
+          nb::arg("processed_lut"),
           nb::arg("self_conditioning_logits"),
           nb::arg("entropy"),
           nb::arg("argmax"),

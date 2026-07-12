@@ -580,6 +580,7 @@ def softcap_categorical_stats_sample_bf16(
         raise ValueError("softcap_categorical_stats_sample_bf16 requires non-empty rows and vocabulary")
 
     rows, vocab_size = raw_logits.shape
+    processed_lut = torch.empty((1 << 16,), dtype=torch.float32, device=raw_logits.device)
     self_conditioning_logits = torch.empty_like(raw_logits)
     entropy = torch.empty((rows,), dtype=torch.float32, device=raw_logits.device)
     argmax = torch.empty((rows,), dtype=torch.int64, device=raw_logits.device)
@@ -589,6 +590,7 @@ def softcap_categorical_stats_sample_bf16(
     _C.softcap_categorical_stats_sample_bf16(
         _wrap_for_dlpack(raw_logits),
         _wrap_for_dlpack(exponential_noise),
+        _wrap_for_dlpack(processed_lut),
         _wrap_for_dlpack(self_conditioning_logits),
         _wrap_for_dlpack(entropy),
         _wrap_for_dlpack(argmax),

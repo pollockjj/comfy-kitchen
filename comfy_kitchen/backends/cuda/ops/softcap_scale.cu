@@ -16,6 +16,7 @@ constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
 constexpr int64_t kMaxBlocks = 65535;
+constexpr int kBf16Values = 1 << 16;
 
 struct MaxPair {
     float value;
@@ -112,6 +113,18 @@ __device__ __forceinline__ float softcap_logit(
     return tanhf(raw * (1.0f / cap)) * cap * inverse_temperature;
 }
 
+__global__ void softcap_bf16_lut_kernel(
+    float* __restrict__ processed_lut,
+    float cap,
+    float inverse_temperature)
+{
+    const int index = blockIdx.x * blockDim.x + threadIdx.x;
+    if (index < kBf16Values) {
+        const float raw = __uint_as_float(static_cast<uint32_t>(index) << 16);
+        processed_lut[index] = softcap_logit(raw, cap, inverse_temperature);
+    }
+}
+
 template <bool StoreProcessedLogits>
 __global__ void softcap_categorical_stats_sample_bf16_kernel(
     const __nv_bfloat16* __restrict__ raw_logits,
@@ -129,8 +142,9 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     const int64_t row = blockIdx.x;
     const int64_t row_offset = row * vocab_size;
     const __nv_bfloat16* row_raw = raw_logits + row_offset;
+    const uint16_t* row_raw_bits = reinterpret_cast<const uint16_t*>(row_raw);
     const float* row_noise = exponential_noise + row_offset;
-    float* row_processed = nullptr;
+    float* row_processed = processed_logits;
     if constexpr (StoreProcessedLogits) {
         row_processed = processed_logits + row_offset;
     }
@@ -142,9 +156,13 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
 
     MaxPair local_max{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float raw = __bfloat162float(row_raw[col]);
-        const float processed = softcap_logit(raw, cap, inverse_temperature);
-        if constexpr (StoreProcessedLogits) row_processed[col] = processed;
+        float processed;
+        if constexpr (StoreProcessedLogits) {
+            processed = softcap_logit(__bfloat162float(row_raw[col]), cap, inverse_temperature);
+            row_processed[col] = processed;
+        } else {
+            processed = row_processed[row_raw_bits[col]];
+        }
         row_self_conditioning[col] = __float2bfloat16_rn(processed);
         local_max = better_pair(local_max, MaxPair{processed, col});
         if (!isfinite(processed)) atomicExch(invalid, 1);
@@ -157,7 +175,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
         if constexpr (StoreProcessedLogits) {
             processed = row_processed[col];
         } else {
-            processed = softcap_logit(__bfloat162float(row_raw[col]), cap, inverse_temperature);
+            processed = row_processed[row_raw_bits[col]];
         }
         exponential_sum += __expf(processed - maximum.value);
     }
@@ -176,7 +194,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
         if constexpr (StoreProcessedLogits) {
             processed = row_processed[col];
         } else {
-            processed = softcap_logit(__bfloat162float(row_raw[col]), cap, inverse_temperature);
+            processed = row_processed[row_raw_bits[col]];
         }
         const float normalized = processed - log_normalizer;
         const float probability = __fdividef(__expf(normalized - normalized_max), exponential_sum);
@@ -251,6 +269,7 @@ extern "C" void launch_softcap_categorical_stats_sample_kernel(
 extern "C" void launch_softcap_categorical_stats_sample_bf16_kernel(
     const void* raw_logits,
     const float* exponential_noise,
+    float* processed_lut,
     void* self_conditioning_logits,
     float* entropy,
     int64_t* argmax,
@@ -262,11 +281,16 @@ extern "C" void launch_softcap_categorical_stats_sample_bf16_kernel(
     float inverse_temperature,
     cudaStream_t stream)
 {
+    constexpr unsigned lut_blocks = comfy::kBf16Values / comfy::kThreads;
+    comfy::softcap_bf16_lut_kernel<<<lut_blocks, comfy::kThreads, 0, stream>>>(
+        processed_lut,
+        cap,
+        inverse_temperature);
     comfy::softcap_categorical_stats_sample_bf16_kernel<false><<<
         static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(raw_logits),
         exponential_noise,
-        nullptr,
+        processed_lut,
         static_cast<__nv_bfloat16*>(self_conditioning_logits),
         entropy,
         argmax,
