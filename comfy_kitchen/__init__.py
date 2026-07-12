@@ -42,6 +42,7 @@ __all__ = [
     "quantize_mxfp8",
     "dequantize_mxfp8",
     "mxfp8_embedding",
+    "requantize_mxfp8_transpose",
     "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
@@ -594,6 +595,19 @@ def mxfp8_embedding(
     elif invalid.item() != 0:
         raise IndexError("mxfp8_embedding index out of range")
     return output.reshape(*leading_shape, qweight.shape[1])
+
+
+def requantize_mxfp8_transpose(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    intermediate_type: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Transpose an MXFP8 matrix by dequantizing and requantizing it."""
+    indices = torch.arange(
+        qweight.shape[0], device=qweight.device, dtype=torch.int64)
+    weight = mxfp8_embedding(
+        qweight, block_scales, indices, output_type=intermediate_type)
+    return quantize_mxfp8(weight.t().contiguous())
 
 
 def scaled_mm_mxfp8(

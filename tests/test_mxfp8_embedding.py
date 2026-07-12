@@ -11,15 +11,19 @@ def _reference(qweight, block_scales, indices, output_type):
     return full.index_select(0, indices.reshape(-1)).reshape(*indices.shape, qweight.shape[1])
 
 
-def test_mxfp8_embedding_eager_is_bit_exact_and_preserves_index_shape():
+def test_mxfp8_embedding_eager_preserves_rows_and_transpose_values():
     torch.manual_seed(19)
-    weight = torch.randn(128, 64, dtype=torch.bfloat16)
+    weight = torch.randn(128, 64, dtype=torch.bfloat16).mul_(2**-5)
     with ck.use_backend("eager"):
         qweight, block_scales = ck.quantize_mxfp8(weight)
         indices = torch.tensor([[127, 3, 3], [64, 0, 31]], dtype=torch.int64)
         candidate = ck.mxfp8_embedding(qweight, block_scales, indices)
         reference = _reference(qweight, block_scales, indices, torch.bfloat16)
+        transposed, transposed_scales = ck.requantize_mxfp8_transpose(qweight, block_scales)
+        actual = ck.dequantize_mxfp8(transposed, transposed_scales, torch.bfloat16)
+        expected = ck.dequantize_mxfp8(qweight, block_scales, torch.bfloat16).t()
     assert torch.equal(candidate, reference)
+    torch.testing.assert_close(actual, expected, rtol=0.125, atol=0.001)
 
 
 def test_mxfp8_embedding_eager_rejects_out_of_range_index():
