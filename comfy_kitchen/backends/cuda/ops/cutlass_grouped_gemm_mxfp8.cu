@@ -378,17 +378,22 @@ bool run_selected_grouped_mxfp8(
     int k,
     void* workspace,
     size_t workspace_size,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* secondary_weights_raw = nullptr,
+    const void* secondary_weight_scales_raw = nullptr,
+    bool share_activation = false) {
     if (n == 2816 && k == 704) {
         return run_grouped_mxfp8<128, 64, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-            workspace_size, stream);
+            workspace_size, stream, secondary_weights_raw,
+            secondary_weight_scales_raw, share_activation);
     }
     return run_grouped_mxfp8<128, 32, 128, ElementD>(
         activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
         output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-        workspace_size, stream);
+        workspace_size, stream, secondary_weights_raw,
+        secondary_weight_scales_raw, share_activation);
 }
 
 #endif
@@ -435,6 +440,57 @@ extern "C" bool launch_cutlass_grouped_gemm_mxfp8(
     (void)weight_scale_ptr;
     (void)output_ptr;
     (void)num_groups;
+    (void)group_m;
+    (void)n;
+    (void)k;
+    (void)out_dtype_code;
+    (void)workspace_ptr;
+    (void)workspace_size;
+    (void)stream;
+#endif
+    return false;
+}
+
+extern "C" bool launch_cutlass_paired_gemm_mxfp8(
+    const void* activation_ptr,
+    const void* activation_scale_ptr,
+    const void* first_weight_ptr,
+    const void* first_weight_scale_ptr,
+    const void* second_weight_ptr,
+    const void* second_weight_scale_ptr,
+    void* output_ptr,
+    int64_t group_m,
+    int64_t n,
+    int64_t k,
+    int out_dtype_code,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream) {
+#ifdef COMFY_HAVE_CUTLASS
+    if (out_dtype_code == 1) {
+        return comfy::run_selected_grouped_mxfp8<cutlass::half_t>(
+            activation_ptr, activation_scale_ptr, first_weight_ptr,
+            first_weight_scale_ptr, output_ptr, 2, static_cast<int>(group_m),
+            nullptr, static_cast<int>(group_m), static_cast<int>(n),
+            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size),
+            stream, second_weight_ptr, second_weight_scale_ptr, true);
+    }
+    if (out_dtype_code == 2) {
+        return comfy::run_selected_grouped_mxfp8<cutlass::bfloat16_t>(
+            activation_ptr, activation_scale_ptr, first_weight_ptr,
+            first_weight_scale_ptr, output_ptr, 2, static_cast<int>(group_m),
+            nullptr, static_cast<int>(group_m), static_cast<int>(n),
+            static_cast<int>(k), workspace_ptr, static_cast<size_t>(workspace_size),
+            stream, second_weight_ptr, second_weight_scale_ptr, true);
+    }
+#else
+    (void)activation_ptr;
+    (void)activation_scale_ptr;
+    (void)first_weight_ptr;
+    (void)first_weight_scale_ptr;
+    (void)second_weight_ptr;
+    (void)second_weight_scale_ptr;
+    (void)output_ptr;
     (void)group_m;
     (void)n;
     (void)k;
