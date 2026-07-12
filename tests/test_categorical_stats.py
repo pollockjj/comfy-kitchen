@@ -87,6 +87,8 @@ def test_softcap_categorical_stats_sample_matches_composed_ops(backend, cuda_ava
         pytest.skip("CUDA unavailable")
     if backend not in get_capable_backends("softcap_categorical_stats_sample", device):
         pytest.skip(f"backend '{backend}' is not capable")
+    if backend not in get_capable_backends("softcap_categorical_stats_sample_bf16", device):
+        pytest.skip(f"backend '{backend}' is not capable")
 
     raw = torch.linspace(-64, 64, 1542, device=device).to(torch.bfloat16).reshape(2, 3, 257)
     raw[..., 3] = raw[..., 7] = 64
@@ -98,11 +100,18 @@ def test_softcap_categorical_stats_sample_matches_composed_ops(backend, cuda_ava
         processed, self_conditioning, entropy, argmax, sample = (
             ck.softcap_categorical_stats_sample(raw, noise, 30.0, 1.25)
         )
+        compact_self_conditioning, compact_entropy, compact_argmax, compact_sample = (
+            ck.softcap_categorical_stats_sample_bf16(raw, noise, 30.0, 1.25)
+        )
 
     assert torch.equal(processed, processed_ref)
     assert torch.equal(self_conditioning, processed_ref.to(torch.bfloat16))
     torch.testing.assert_close(entropy, entropy_ref, rtol=1e-5, atol=1e-5)
     assert torch.equal(argmax, argmax_ref)
     assert torch.equal(sample, sample_ref)
+    assert torch.equal(compact_self_conditioning, self_conditioning)
+    assert torch.equal(compact_entropy, entropy)
+    assert torch.equal(compact_argmax, argmax)
+    assert torch.equal(compact_sample, sample)
     assert torch.equal(argmax, torch.full_like(argmax, 3))
     assert torch.equal(sample, torch.full_like(sample, 3))
