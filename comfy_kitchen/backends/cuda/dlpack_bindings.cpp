@@ -107,7 +107,8 @@ CudaGraphExec* end_cuda_graph_capture(
     }
 
     cudaGraphExec_t graph_exec = nullptr;
-    const cudaError_t instantiate_error = cudaGraphInstantiate(&graph_exec, graph, 0);
+    const cudaError_t instantiate_error = cudaGraphInstantiate(
+        &graph_exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch);
     const cudaError_t destroy_error = cudaGraphDestroy(graph);
     if (instantiate_error != cudaSuccess) {
         std::string message = cuda_error_message("cudaGraphInstantiate", instantiate_error);
