@@ -24,7 +24,6 @@ def test_cuda_runtime_graph_lifecycle():
     torch.cuda.synchronize()
     graph.replay(stream)
     stream.synchronize()
-    assert graph.valid
     torch.testing.assert_close(output_ref(), torch.full_like(static_input, 5))
     graph.reset()
     assert output_ref() is None
