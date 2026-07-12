@@ -17,10 +17,12 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <cuda_runtime.h>
+#include <algorithm>
 #include <cmath>
 #include <cstring>
 #include <string>
 #include <utility>
+#include <vector>
 
 #include "cublaslt_runtime.h"
 
@@ -48,6 +50,7 @@ public:
     CudaGraphExec& operator=(const CudaGraphExec&) = delete;
 
     ~CudaGraphExec() noexcept {
+        synchronize_replays_noexcept();
         if (graph_exec_ != nullptr) {
             cudaGraphExecDestroy(graph_exec_);
             graph_exec_ = nullptr;
@@ -62,15 +65,21 @@ public:
         if (graph_exec_ == nullptr) {
             throw std::runtime_error("CUDA graph executable has been reset");
         }
+        const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
         check_cuda(
-            cudaGraphLaunch(graph_exec_, reinterpret_cast<cudaStream_t>(stream_ptr)),
+            cudaGraphLaunch(graph_exec_, stream),
             "cudaGraphLaunch");
+        if (std::find(replay_streams_.begin(), replay_streams_.end(), stream) ==
+            replay_streams_.end()) {
+            replay_streams_.push_back(stream);
+        }
     }
 
     void reset() {
         if (graph_exec_ == nullptr) {
             return;
         }
+        synchronize_replays();
         cudaGraphExec_t graph_exec = graph_exec_;
         check_cuda(cudaGraphExecDestroy(graph_exec), "cudaGraphExecDestroy");
         graph_exec_ = nullptr;
@@ -78,8 +87,23 @@ public:
     }
 
 private:
+    void synchronize_replays() {
+        for (const cudaStream_t stream : replay_streams_) {
+            check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+        }
+        replay_streams_.clear();
+    }
+
+    void synchronize_replays_noexcept() noexcept {
+        for (const cudaStream_t stream : replay_streams_) {
+            cudaStreamSynchronize(stream);
+        }
+        replay_streams_.clear();
+    }
+
     cudaGraphExec_t graph_exec_ = nullptr;
     nb::object retained_objects_;
+    std::vector<cudaStream_t> replay_streams_;
 };
 
 void begin_cuda_graph_capture(uintptr_t stream_ptr) {

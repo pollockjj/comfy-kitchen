@@ -380,7 +380,7 @@ class CudaGraph:
         self._graph_exec.replay(_stream_workspace_key(stream)[1])
 
     def reset(self) -> None:
-        """Destroy this graph and release objects retained when capture ended."""
+        """Wait for submitted replays, then destroy the graph and release retained objects."""
         self._graph_exec.reset()
 
 
