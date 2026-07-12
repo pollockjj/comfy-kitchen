@@ -24,6 +24,8 @@ namespace wmma = nvcuda::wmma;
 constexpr int kTileM = 64;
 constexpr int kTileN = 128;
 constexpr int kTileK = 64;
+constexpr int kSharedStrideA = kTileK + 8;
+constexpr int kSharedStrideB = kTileN + 8;
 constexpr int kWarpM = 32;
 constexpr int kWarpN = 64;
 constexpr int kWmma = 16;
@@ -51,9 +53,9 @@ __global__ void mxfp8_weighted_embedding_kernel(
 {
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto* shared_a = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
-    auto* shared_b = shared_a + kTileM * kTileK;
+    auto* shared_b = shared_a + kTileM * kSharedStrideA;
     auto* shared_scales = reinterpret_cast<uint32_t*>(
-        shared_b + kTileK * kTileN);
+        shared_b + kTileK * kSharedStrideB);
 
     const int tile_n = static_cast<int>(blockIdx.x);
     const int tile_m = static_cast<int>(blockIdx.y);
@@ -85,7 +87,8 @@ __global__ void mxfp8_weighted_embedding_kernel(
              index += kThreads) {
             const int local_m = index / kTileK;
             const int local_k = index % kTileK;
-            shared_a[index] = weights[(m_base + local_m) * k + k_base + local_k];
+            shared_a[local_m * kSharedStrideA + local_k] =
+                weights[(m_base + local_m) * k + k_base + local_k];
         }
 
         if (threadIdx.x < kTileK) {
@@ -129,7 +132,7 @@ __global__ void mxfp8_weighted_embedding_kernel(
                 bf16_values[value_index] = __float2bfloat16_rn(value);
             }
             auto* shared_vectors = reinterpret_cast<uint4*>(
-                shared_b + local_k * kTileN + local_n);
+                shared_b + local_k * kSharedStrideB + local_n);
             shared_vectors[0] = packed_bf16[0];
             shared_vectors[1] = packed_bf16[1];
         }
@@ -143,13 +146,17 @@ __global__ void mxfp8_weighted_embedding_kernel(
             for (int row = 0; row < kAccumulatorRows; ++row) {
                 const int a_row = warp_m * kWarpM + row * kWmma;
                 wmma::load_matrix_sync(
-                    fragments_a[row], shared_a + a_row * kTileK + local_k, kTileK);
+                    fragments_a[row],
+                    shared_a + a_row * kSharedStrideA + local_k,
+                    kSharedStrideA);
             }
 #pragma unroll
             for (int col = 0; col < kAccumulatorCols; ++col) {
                 const int b_col = warp_n * kWarpN + col * kWmma;
                 wmma::load_matrix_sync(
-                    fragments_b[col], shared_b + local_k * kTileN + b_col, kTileN);
+                    fragments_b[col],
+                    shared_b + local_k * kSharedStrideB + b_col,
+                    kSharedStrideB);
             }
 #pragma unroll
             for (int row = 0; row < kAccumulatorRows; ++row) {
@@ -219,7 +226,8 @@ extern "C" void launch_mxfp8_weighted_embedding_kernel(
         static_cast<unsigned>(m / comfy::kTileM),
         static_cast<unsigned>(split_k));
     constexpr size_t shared_bytes =
-        (comfy::kTileM * comfy::kTileK + comfy::kTileK * comfy::kTileN)
+        (comfy::kTileM * comfy::kSharedStrideA
+         + comfy::kTileK * comfy::kSharedStrideB)
         * sizeof(__nv_bfloat16) + comfy::kTileK * sizeof(uint32_t);
     comfy::mxfp8_weighted_embedding_kernel<<<grid, comfy::kThreads, shared_bytes, stream>>>(
         static_cast<const __nv_fp8_e4m3*>(qweight),
