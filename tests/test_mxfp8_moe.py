@@ -225,6 +225,33 @@ def test_fused_moe_mxfp8_matches_grouped_reference(dtype, fused_expert_bank):
 
 
 @pytest.mark.skipif(not sm120_fused_mxfp8_available, reason="SM120 fused MXFP8 required")
+def test_fused_moe_mxfp8_scaled_matches_pre_scaled_routes(fused_expert_bank):
+    x, expert_ids, normalized_weights = _fused_inputs(torch.bfloat16)
+    expert_scale = torch.linspace(
+        0.98046875,
+        1.0234375,
+        NUM_EXPERTS,
+        dtype=torch.bfloat16,
+        device=x.device,
+    )
+    reference = ck.fused_moe_mxfp8(
+        x,
+        expert_ids,
+        normalized_weights * expert_scale[expert_ids],
+        *fused_expert_bank,
+    )
+    candidate = ck.fused_moe_mxfp8_scaled(
+        x,
+        expert_ids,
+        normalized_weights,
+        expert_scale,
+        *fused_expert_bank,
+    )
+
+    assert torch.equal(candidate, reference)
+
+
+@pytest.mark.skipif(not sm120_fused_mxfp8_available, reason="SM120 fused MXFP8 required")
 def test_fused_moe_mxfp8_marks_invalid_route_nan(fused_expert_bank):
     x, expert_ids, router_weights = _fused_inputs(torch.bfloat16)
     expert_ids[0, 0] = NUM_EXPERTS
