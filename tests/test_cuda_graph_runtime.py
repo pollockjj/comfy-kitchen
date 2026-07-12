@@ -15,8 +15,10 @@ def test_cuda_runtime_graph_lifecycle():
     static_input = torch.zeros(1024, device="cuda")
     with torch.cuda.stream(stream):
         ck.begin_cuda_graph_capture(stream)
+        torch.cuda._sleep(20_000_000)
         captured_output = static_input + 1
         graph = ck.end_cuda_graph_capture(stream, captured_output)
+    observed_output = captured_output.detach()
     output_ref = weakref.ref(captured_output)
     del captured_output
     gc.collect()
@@ -26,7 +28,15 @@ def test_cuda_runtime_graph_lifecycle():
         graph.replay(stream)
         stream.synchronize()
         torch.testing.assert_close(output_ref(), torch.full_like(static_input, value + 1))
+    static_input.fill_(9)
+    torch.cuda.synchronize()
+    graph.replay(stream)
+    replay_complete = torch.cuda.Event()
+    replay_complete.record(stream)
+    assert not replay_complete.query()
     graph.reset()
+    assert replay_complete.query()
+    torch.testing.assert_close(observed_output, torch.full_like(static_input, 10))
     assert output_ref() is None
     with pytest.raises(RuntimeError, match="has been reset"):
         graph.replay(stream)
