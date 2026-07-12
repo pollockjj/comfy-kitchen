@@ -140,6 +140,7 @@ target_compile_options(comfy_kitchen_strict_cuda PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:${STRICT_CUDA_NVCC_FLAGS}>
 )
 target_include_directories(comfy_kitchen_strict_cuda PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
     ${CUDAToolkit_INCLUDE_DIRS}
 )
 
