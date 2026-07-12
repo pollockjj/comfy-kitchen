@@ -146,7 +146,7 @@ __global__ void prepare_grouped_mxfp8_args(
         activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
 }
 
-template <int TileM, int TileN, int TileK, class ElementD>
+template <int TileM, int TileN, int TileK, class ElementD, class EpilogueTile>
 bool run_grouped_mxfp8(
     const void* activations_raw,
     const void* activation_scales_raw,
@@ -189,7 +189,7 @@ bool run_grouped_mxfp8(
         cutlass::arch::OpClassBlockScaledTensorOp,
         ThreadBlockShape,
         ClusterShape,
-        cutlass::epilogue::collective::EpilogueTileAuto,
+        EpilogueTile,
         ElementAccumulator,
         ElementCompute,
         ElementC,
@@ -356,13 +356,21 @@ bool run_selected_grouped_mxfp8(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
-    if (n == 2816 && k == 704) {
-        return run_grouped_mxfp8<128, 64, 128, ElementD>(
+    if (n == 1408 && k == 2816) {
+        return run_grouped_mxfp8<128, 32, 128, ElementD, Shape<_128, _32>>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
             output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
             workspace_size, stream);
     }
-    return run_grouped_mxfp8<128, 32, 128, ElementD>(
+    if (n == 2816 && k == 704) {
+        return run_grouped_mxfp8<
+            128, 64, 128, ElementD, cutlass::epilogue::collective::EpilogueTileAuto>(
+            activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
+            workspace_size, stream);
+    }
+    return run_grouped_mxfp8<
+        128, 32, 128, ElementD, cutlass::epilogue::collective::EpilogueTileAuto>(
         activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
         output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
         workspace_size, stream);
