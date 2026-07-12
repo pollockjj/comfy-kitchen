@@ -34,6 +34,7 @@ __all__ = [
     "categorical_stats_sample",
     "softcap_scale",
     "softcap_categorical_stats_sample",
+    "softcap_categorical_stats_sample_bf16",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -226,6 +227,54 @@ def softcap_categorical_stats_sample(
         raise RuntimeError("softcap_categorical_stats_sample received invalid inputs")
     return (
         processed.reshape(raw_logits.shape),
+        self_conditioning.reshape(raw_logits.shape),
+        entropy.reshape(leading_shape),
+        argmax.reshape(leading_shape),
+        sample.reshape(leading_shape),
+    )
+
+
+def softcap_categorical_stats_sample_bf16(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return DG BF16 self-conditioning logits, entropy, argmax, and sample."""
+    if raw_logits.dtype != torch.bfloat16 or exponential_noise.dtype != torch.float32:
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires BF16 logits and FP32 noise")
+    if raw_logits.shape != exponential_noise.shape:
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires matching logits and noise shapes")
+    if raw_logits.device != exponential_noise.device:
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires logits and noise on the same device")
+    if raw_logits.ndim < 1 or raw_logits.numel() == 0 or raw_logits.shape[-1] == 0:
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires a non-empty vocabulary and rows")
+    if not raw_logits.is_contiguous() or not exponential_noise.is_contiguous():
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires contiguous tensors")
+    cap = float(cap)
+    inverse_temperature = float(inverse_temperature)
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError("softcap_categorical_stats_sample_bf16 requires a finite positive cap")
+    if not math.isfinite(inverse_temperature) or inverse_temperature <= 0:
+        raise ValueError(
+            "softcap_categorical_stats_sample_bf16 requires a finite positive inverse temperature"
+        )
+
+    leading_shape = raw_logits.shape[:-1]
+    raw_logits_2d = raw_logits.reshape(-1, raw_logits.shape[-1])
+    noise_2d = exponential_noise.reshape(raw_logits_2d.shape)
+    self_conditioning, entropy, argmax, sample, invalid = (
+        torch.ops.comfy_kitchen.softcap_categorical_stats_sample_bf16(
+            raw_logits_2d, noise_2d, cap, inverse_temperature
+        )
+    )
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(
+            invalid == 0, "softcap_categorical_stats_sample_bf16 received invalid inputs"
+        )
+    elif invalid.item() != 0:
+        raise RuntimeError("softcap_categorical_stats_sample_bf16 received invalid inputs")
+    return (
         self_conditioning.reshape(raw_logits.shape),
         entropy.reshape(leading_shape),
         argmax.reshape(leading_shape),

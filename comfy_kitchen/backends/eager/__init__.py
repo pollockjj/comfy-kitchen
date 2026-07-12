@@ -8,6 +8,7 @@ __all__ = [
     "categorical_stats_sample",
     "softcap_scale",
     "softcap_categorical_stats_sample",
+    "softcap_categorical_stats_sample_bf16",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
@@ -79,6 +80,7 @@ from .sampling import (
     categorical_stats,
     categorical_stats_sample,
     softcap_categorical_stats_sample,
+    softcap_categorical_stats_sample_bf16,
     softcap_scale,
 )
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
@@ -119,6 +121,19 @@ def _build_constraints() -> dict:
             default_devices=all_devices,
         ),
         "softcap_categorical_stats_sample": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "softcap_categorical_stats_sample_bf16": FunctionConstraints(
             params={
                 "raw_logits": ParamConstraint(
                     dtypes=frozenset({torch.bfloat16}),

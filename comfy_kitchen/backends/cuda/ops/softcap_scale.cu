@@ -104,6 +104,15 @@ __global__ void softcap_scale_bf16_kernel(
     }
 }
 
+__device__ __forceinline__ float softcap_logit(
+    float raw,
+    float cap,
+    float inverse_temperature)
+{
+    return tanhf(raw * (1.0f / cap)) * cap * inverse_temperature;
+}
+
+template <bool StoreProcessedLogits>
 __global__ void softcap_categorical_stats_sample_bf16_kernel(
     const __nv_bfloat16* __restrict__ raw_logits,
     const float* __restrict__ exponential_noise,
@@ -131,8 +140,8 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     MaxPair local_max{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         const float raw = __bfloat162float(row_raw[col]);
-        const float processed = tanhf(raw * (1.0f / cap)) * cap * inverse_temperature;
-        row_processed[col] = processed;
+        const float processed = softcap_logit(raw, cap, inverse_temperature);
+        if constexpr (StoreProcessedLogits) row_processed[col] = processed;
         row_self_conditioning[col] = __float2bfloat16_rn(processed);
         local_max = better_pair(local_max, MaxPair{processed, col});
         if (!isfinite(processed)) atomicExch(invalid, 1);
@@ -141,7 +150,13 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
 
     float exponential_sum = 0.0f;
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        exponential_sum += __expf(row_processed[col] - maximum.value);
+        float processed;
+        if constexpr (StoreProcessedLogits) {
+            processed = row_processed[col];
+        } else {
+            processed = softcap_logit(__bfloat162float(row_raw[col]), cap, inverse_temperature);
+        }
+        exponential_sum += __expf(processed - maximum.value);
     }
     exponential_sum = block_reduce_sum(exponential_sum, warp_values);
     if (threadIdx.x == 0) {
@@ -154,7 +169,13 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     float entropy_sum = 0.0f;
     MaxPair local_sample{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float normalized = row_processed[col] - log_normalizer;
+        float processed;
+        if constexpr (StoreProcessedLogits) {
+            processed = row_processed[col];
+        } else {
+            processed = softcap_logit(__bfloat162float(row_raw[col]), cap, inverse_temperature);
+        }
+        const float normalized = processed - log_normalizer;
         const float probability = __fdividef(__expf(normalized - normalized_max), exponential_sum);
         const float noise = row_noise[col];
         if (!isfinite(noise) || noise <= 0.0f) {
@@ -209,11 +230,40 @@ extern "C" void launch_softcap_categorical_stats_sample_kernel(
     float inverse_temperature,
     cudaStream_t stream)
 {
-    comfy::softcap_categorical_stats_sample_bf16_kernel<<<
+    comfy::softcap_categorical_stats_sample_bf16_kernel<true><<<
         static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
         static_cast<const __nv_bfloat16*>(raw_logits),
         exponential_noise,
         processed_logits,
+        static_cast<__nv_bfloat16*>(self_conditioning_logits),
+        entropy,
+        argmax,
+        sample,
+        invalid,
+        vocab_size,
+        cap,
+        inverse_temperature);
+}
+
+extern "C" void launch_softcap_categorical_stats_sample_bf16_kernel(
+    const void* raw_logits,
+    const float* exponential_noise,
+    void* self_conditioning_logits,
+    float* entropy,
+    int64_t* argmax,
+    int64_t* sample,
+    int32_t* invalid,
+    int64_t rows,
+    int64_t vocab_size,
+    float cap,
+    float inverse_temperature,
+    cudaStream_t stream)
+{
+    comfy::softcap_categorical_stats_sample_bf16_kernel<false><<<
+        static_cast<unsigned>(rows), comfy::kThreads, 0, stream>>>(
+        static_cast<const __nv_bfloat16*>(raw_logits),
+        exponential_noise,
+        nullptr,
         static_cast<__nv_bfloat16*>(self_conditioning_logits),
         entropy,
         argmax,
