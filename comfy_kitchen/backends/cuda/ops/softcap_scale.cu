@@ -130,7 +130,10 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     const int64_t row_offset = row * vocab_size;
     const __nv_bfloat16* row_raw = raw_logits + row_offset;
     const float* row_noise = exponential_noise + row_offset;
-    float* row_processed = processed_logits + row_offset;
+    float* row_processed = nullptr;
+    if constexpr (StoreProcessedLogits) {
+        row_processed = processed_logits + row_offset;
+    }
     __nv_bfloat16* row_self_conditioning = self_conditioning_logits + row_offset;
     __shared__ float warp_values[kWarps];
     __shared__ int64_t warp_indices[kWarps];
