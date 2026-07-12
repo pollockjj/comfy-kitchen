@@ -171,7 +171,6 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
 
     float entropy_sum = 0.0f;
     MaxPair local_sample{-FLT_MAX, INT64_MAX};
-    #pragma unroll 4
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         float processed;
         if constexpr (StoreProcessedLogits) {
