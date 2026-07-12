@@ -106,7 +106,9 @@ __global__ void gelu_tanh_multiply_quantize_mxfp8_kernel(
     }
 
     constexpr float fp8_max = 448.0f;
-    const float ratio = static_cast<float>(absmax) / fp8_max;
+    // Match the existing quantize_mxfp8 kernel, which is compiled with
+    // --use_fast_math and therefore uses the CUDA fast divide intrinsic.
+    const float ratio = __fdividef(static_cast<float>(absmax), fp8_max);
     const __nv_fp8_storage_t e8m0_val =
         __nv_cvt_float_to_e8m0(ratio, __NV_SATFINITE, cudaRoundPosInf);
     if ((threadIdx.x % kGeluQuantThreadsPerGroup) == 0) {
