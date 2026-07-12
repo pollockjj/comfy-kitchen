@@ -1366,7 +1366,8 @@ void mxfp8_weighted_embedding(
         throw std::runtime_error("mxfp8_weighted_embedding tensors must share one CUDA device");
     }
     launch_mxfp8_weighted_embedding_kernel(
-        qweight.data(), block_scales.data(), weights.data(), partials.data(), output.data(),
+        qweight.data(), block_scales.data(), weights.data(),
+        static_cast<float*>(partials.data()), static_cast<float*>(output.data()),
         m, k, n, split_k, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
