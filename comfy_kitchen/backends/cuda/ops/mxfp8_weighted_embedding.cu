@@ -30,6 +30,8 @@ constexpr int kWmma = 16;
 constexpr int kThreads = 128;
 constexpr int kAccumulatorRows = kWarpM / kWmma;
 constexpr int kAccumulatorCols = kWarpN / kWmma;
+constexpr int kFp8ValuesPerVector = 16;
+constexpr int kFp8VectorsPerRow = kTileN / kFp8ValuesPerVector;
 
 using Accumulator = wmma::fragment<wmma::accumulator, kWmma, kWmma, kWmma, float>;
 using FragmentA = wmma::fragment<
@@ -50,6 +52,8 @@ __global__ void mxfp8_weighted_embedding_kernel(
     extern __shared__ __align__(16) unsigned char shared_bytes[];
     auto* shared_a = reinterpret_cast<__nv_bfloat16*>(shared_bytes);
     auto* shared_b = shared_a + kTileM * kTileK;
+    auto* shared_scales = reinterpret_cast<uint32_t*>(
+        shared_b + kTileK * kTileN);
 
     const int tile_n = static_cast<int>(blockIdx.x);
     const int tile_m = static_cast<int>(blockIdx.y);
@@ -84,24 +88,50 @@ __global__ void mxfp8_weighted_embedding_kernel(
             shared_a[index] = weights[(m_base + local_m) * k + k_base + local_k];
         }
 
-        for (int index = static_cast<int>(threadIdx.x);
-             index < kTileK * kTileN;
-             index += kThreads) {
-            const int local_k = index / kTileN;
-            const int local_n = index % kTileN;
-            const int64_t global_k = k_base + local_k;
-            const int64_t global_n = n_base + local_n;
+        if (threadIdx.x < kTileK) {
+            const int64_t global_k = k_base + threadIdx.x;
             const size_t scale_offset = scale_factor_swizzled_offset(
                 static_cast<size_t>(global_k),
-                static_cast<size_t>(global_n / 32),
+                static_cast<size_t>(n_base / 32),
                 scale_cols);
-            const uint8_t exponent = block_scales[scale_offset];
+            shared_scales[threadIdx.x] =
+                *reinterpret_cast<const uint32_t*>(block_scales + scale_offset);
+        }
+        __syncthreads();
+
+        for (int vector_index = static_cast<int>(threadIdx.x);
+             vector_index < kTileK * kFp8VectorsPerRow;
+             vector_index += kThreads) {
+            const int local_k = vector_index / kFp8VectorsPerRow;
+            const int local_n =
+                (vector_index % kFp8VectorsPerRow) * kFp8ValuesPerVector;
+            const int64_t global_k = k_base + local_k;
+            const int64_t global_n = n_base + local_n;
+            const uint4 packed_qweight = *reinterpret_cast<const uint4*>(
+                qweight + global_k * n + global_n);
+            const uint32_t packed_scales = shared_scales[local_k];
+            const uint8_t exponent = static_cast<uint8_t>(
+                packed_scales >> ((local_n / 32) * 8));
             const uint32_t scale_bits =
                 exponent == 0 ? 0 : static_cast<uint32_t>(exponent) << 23;
             const float scale = __uint_as_float(scale_bits);
-            const float value =
-                static_cast<float>(qweight[global_k * n + global_n]) * scale;
-            shared_b[index] = __float2bfloat16_rn(value);
+
+            uint4 packed_bf16[2];
+            const auto* fp8_bytes = reinterpret_cast<const uint8_t*>(&packed_qweight);
+            auto* bf16_values = reinterpret_cast<__nv_bfloat16*>(packed_bf16);
+#pragma unroll
+            for (int value_index = 0;
+                 value_index < kFp8ValuesPerVector;
+                 ++value_index) {
+                __nv_fp8_e4m3 fp8_value;
+                fp8_value.__x = fp8_bytes[value_index];
+                const float value = static_cast<float>(fp8_value) * scale;
+                bf16_values[value_index] = __float2bfloat16_rn(value);
+            }
+            auto* shared_vectors = reinterpret_cast<uint4*>(
+                shared_b + local_k * kTileN + local_n);
+            shared_vectors[0] = packed_bf16[0];
+            shared_vectors[1] = packed_bf16[1];
         }
         __syncthreads();
 
@@ -190,7 +220,7 @@ extern "C" void launch_mxfp8_weighted_embedding_kernel(
         static_cast<unsigned>(split_k));
     constexpr size_t shared_bytes =
         (comfy::kTileM * comfy::kTileK + comfy::kTileK * comfy::kTileN)
-        * sizeof(__nv_bfloat16);
+        * sizeof(__nv_bfloat16) + comfy::kTileK * sizeof(uint32_t);
     comfy::mxfp8_weighted_embedding_kernel<<<grid, comfy::kThreads, shared_bytes, stream>>>(
         static_cast<const __nv_fp8_e4m3*>(qweight),
         static_cast<const uint8_t*>(block_scales),
