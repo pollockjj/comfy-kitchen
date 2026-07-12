@@ -17,6 +17,7 @@
 
 #include <cuda_runtime.h>
 
+#include <cstdlib>
 #include <cstdint>
 #include <stdexcept>
 
@@ -159,6 +160,8 @@ bool run_grouped_mxfp8(
     int scale_group_m,
     int n,
     int k,
+    bool along_n,
+    bool use_pdl,
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
@@ -299,6 +302,10 @@ bool run_grouped_mxfp8(
     cutlass::KernelHardwareInfo hardware_info;
     hardware_info.device_id = device;
     hardware_info.sm_count = cached_sm_count;
+    typename Gemm::GemmKernel::TileSchedulerArguments scheduler;
+    if (along_n) {
+        scheduler.raster_order = cutlass::gemm::kernel::detail::RasterOrderOptions::AlongN;
+    }
 
     typename Gemm::Arguments arguments{
         cutlass::gemm::GemmUniversalMode::kGrouped,
@@ -306,7 +313,8 @@ bool run_grouped_mxfp8(
         {a_ptr, stride_a, b_ptr, stride_b, scale_a_ptr, layout_scale_a, scale_b_ptr,
          layout_scale_b},
         {{}, nullptr, nullptr, output_ptr, stride_d},
-        hardware_info};
+        hardware_info,
+        scheduler};
     auto& fusion = arguments.epilogue.thread;
     fusion.alpha = 1.0f;
     fusion.beta = 0.0f;
@@ -320,7 +328,7 @@ bool run_grouped_mxfp8(
     if (gemm.initialize(arguments, gemm_workspace, stream) != cutlass::Status::kSuccess) {
         return false;
     }
-    return gemm.run(stream) == cutlass::Status::kSuccess;
+    return gemm.run(stream, nullptr, use_pdl) == cutlass::Status::kSuccess;
 #else
     (void)activations_raw;
     (void)activation_scales_raw;
@@ -333,6 +341,8 @@ bool run_grouped_mxfp8(
     (void)scale_group_m;
     (void)n;
     (void)k;
+    (void)along_n;
+    (void)use_pdl;
     (void)workspace;
     (void)workspace_size;
     (void)stream;
@@ -356,16 +366,26 @@ bool run_selected_grouped_mxfp8(
     void* workspace,
     size_t workspace_size,
     cudaStream_t stream) {
+    if (n == 1408 && k == 2816) {
+        static const bool along_n =
+            std::getenv("COMFY_KITCHEN_DG_MXFP8_FC1_ALONG_N") != nullptr;
+        static const bool use_pdl =
+            std::getenv("COMFY_KITCHEN_DG_MXFP8_FC1_PDL") != nullptr;
+        return run_grouped_mxfp8<128, 32, 128, ElementD>(
+            activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
+            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k,
+            along_n, use_pdl, workspace, workspace_size, stream);
+    }
     if (n == 2816 && k == 704) {
         return run_grouped_mxfp8<128, 64, 128, ElementD>(
             activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-            workspace_size, stream);
+            output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k,
+            false, false, workspace, workspace_size, stream);
     }
     return run_grouped_mxfp8<128, 32, 128, ElementD>(
         activations_raw, activation_scales_raw, weights_raw, weight_scales_raw,
-        output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k, workspace,
-        workspace_size, stream);
+        output_raw, num_groups, group_m, m_indptr, scale_group_m, n, k,
+        false, false, workspace, workspace_size, stream);
 }
 
 #endif
