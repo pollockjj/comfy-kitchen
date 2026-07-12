@@ -127,8 +127,9 @@ class BackendRegistry:
             }
         """
         result = {}
-        all_backend_names = (
-            set(self._priority) | set(self._backends.keys()) | set(self._unavailable.keys())
+        priority_names = set(self._priority)
+        all_backend_names = self._priority + sorted(
+            (set(self._backends) | set(self._unavailable)) - priority_names
         )
 
         for name in all_backend_names:
