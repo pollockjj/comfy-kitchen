@@ -449,6 +449,27 @@ class TestQuantizeMXFP8:
                 )
 
 
+@pytest.mark.parametrize("m", [256, 340])
+def test_gelu_tanh_multiply_quantize_mxfp8_exact(device, seed, m):
+    if device != "cuda" or "cuda" not in get_capable_backends(
+        "gelu_tanh_multiply_quantize_mxfp8", device
+    ):
+        pytest.skip("CUDA fused GELU MXFP8 quantization is unavailable")
+
+    gate = torch.randn(m, 2112, device=device, dtype=torch.bfloat16)
+    up = torch.randn_like(gate)
+    needs_padding = m % 32 != 0
+    with ck.use_backend("cuda"):
+        product = torch.nn.functional.gelu(gate, approximate="tanh") * up
+        expected_qdata, expected_scales = ck.quantize_mxfp8(
+            product, pad_32x=needs_padding)
+        actual_qdata, actual_scales = ck.gelu_tanh_multiply_quantize_mxfp8(
+            gate, up, pad_32x=needs_padding)
+
+    assert torch.equal(actual_qdata.view(torch.uint8), expected_qdata.view(torch.uint8))
+    assert torch.equal(actual_scales.view(torch.uint8), expected_scales.view(torch.uint8))
+
+
 class TestScaledMMNVFP4:
     """NVFP4 matrix multiplication tests."""
 
