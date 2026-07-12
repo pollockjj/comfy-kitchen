@@ -449,14 +449,18 @@ class TestQuantizeMXFP8:
                 )
 
 
-@pytest.mark.parametrize("m", [256, 340])
-def test_gelu_tanh_multiply_quantize_mxfp8_exact(device, seed, m):
+@pytest.mark.parametrize("m,dtype", [
+    (256, torch.bfloat16),
+    (340, torch.bfloat16),
+    (256, torch.float16),
+])
+def test_gelu_tanh_multiply_quantize_mxfp8_exact(device, seed, m, dtype):
     if device != "cuda" or "cuda" not in get_capable_backends(
         "gelu_tanh_multiply_quantize_mxfp8", device
     ):
         pytest.skip("CUDA fused GELU MXFP8 quantization is unavailable")
 
-    gate = torch.randn(m, 2112, device=device, dtype=torch.bfloat16)
+    gate = torch.randn(m, 2112, device=device, dtype=dtype)
     up = torch.randn_like(gate)
     needs_padding = m % 32 != 0
     with ck.use_backend("cuda"):
