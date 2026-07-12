@@ -27,7 +27,7 @@ def test_cuda_runtime_graph_lifecycle():
     graph.replay(torch.cuda.current_stream())
     replay_complete = torch.cuda.Event()
     replay_complete.record()
-    assert not replay_complete.query()
+    assert output_ref() is not None and not replay_complete.query()
     graph.reset()
     assert replay_complete.query()
     assert output_ref() is None
