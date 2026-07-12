@@ -57,6 +57,30 @@ constexpr int kQuantThreads = 256;
 constexpr int kScaleRowAlignment = 128;
 constexpr int kTopK = 8;
 
+__global__ void prepare_scaled_routes(
+    const int64_t* source_expert_ids,
+    const float* normalized_router_weights,
+    const __nv_bfloat16* expert_scale,
+    int32_t* expert_ids,
+    float* router_weights,
+    int routes,
+    int num_experts) {
+    for (int route = blockIdx.x * blockDim.x + threadIdx.x;
+         route < routes;
+         route += blockDim.x * gridDim.x) {
+        const int64_t expert = source_expert_ids[route];
+        if (expert >= 0 && expert < num_experts) {
+            expert_ids[route] = static_cast<int32_t>(expert);
+            router_weights[route] = __fmul_rn(
+                normalized_router_weights[route],
+                __bfloat162float(expert_scale[expert]));
+        } else {
+            expert_ids[route] = -1;
+            router_weights[route] = __int_as_float(0x7fc00000);
+        }
+    }
+}
+
 class WorkspaceArena {
 public:
     WorkspaceArena(void* ptr, size_t size)
@@ -373,6 +397,8 @@ bool run_fused_moe_mxfp8(
     const void* input,
     const int32_t* expert_ids,
     const float* router_weights,
+    const int64_t* source_expert_ids,
+    const __nv_bfloat16* expert_scale,
     const void* fc1_qdata,
     const void* fc1_block_scales,
     const void* fc2_qdata,
@@ -397,6 +423,12 @@ bool run_fused_moe_mxfp8(
 
     last_error_stage = 2;
     WorkspaceArena arena(workspace_ptr, workspace_size);
+    int32_t* prepared_expert_ids = nullptr;
+    float* prepared_router_weights = nullptr;
+    if (source_expert_ids != nullptr) {
+        prepared_expert_ids = arena.allocate<int32_t>(routes);
+        prepared_router_weights = arena.allocate<float>(routes);
+    }
     int32_t* counts = arena.allocate<int32_t>(e);
     int32_t* indptr = arena.allocate<int32_t>(e + 1);
     int32_t* route_rank = arena.allocate<int32_t>(routes);
@@ -413,12 +445,26 @@ bool run_fused_moe_mxfp8(
         arena.allocate<OutputType>(static_cast<size_t>(routes) * h);
     void* gemm_workspace = arena.tail(256);
     const size_t gemm_workspace_size = arena.remaining();
-    if (counts == nullptr || indptr == nullptr || route_rank == nullptr ||
+    if ((source_expert_ids != nullptr &&
+         (prepared_expert_ids == nullptr || prepared_router_weights == nullptr)) ||
+        counts == nullptr || indptr == nullptr || route_rank == nullptr ||
         route_dest == nullptr || qx == nullptr || input_block_scales == nullptr ||
         gate_up == nullptr || qi == nullptr || intermediate_block_scales == nullptr ||
         routed_down == nullptr || gemm_workspace == nullptr || gemm_workspace_size == 0 ||
         gemm_workspace_size > static_cast<size_t>(INT64_MAX)) {
         return false;
+    }
+
+    if (source_expert_ids != nullptr) {
+        const int route_blocks = (routes + 255) / 256;
+        prepare_scaled_routes<<<route_blocks, 256, 0, stream>>>(
+            source_expert_ids, router_weights, expert_scale, prepared_expert_ids,
+            prepared_router_weights, routes, e);
+        if (cudaPeekAtLastError() != cudaSuccess) {
+            return false;
+        }
+        expert_ids = prepared_expert_ids;
+        router_weights = prepared_router_weights;
     }
 
     last_error_stage = 3;
@@ -549,14 +595,14 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
 
     if (input_dtype_code == 1) {
         return run_fused_moe_mxfp8<__half>(
-            input, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
+            input, expert_ids, router_weights, nullptr, nullptr, fc1_qdata, fc1_block_scales, fc2_qdata,
             fc2_block_scales, output, static_cast<int>(num_tokens),
             static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
             static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
             static_cast<size_t>(workspace_size), input_dtype_code, stream);
     }
     return run_fused_moe_mxfp8<__nv_bfloat16>(
-        input, expert_ids, router_weights, fc1_qdata, fc1_block_scales, fc2_qdata,
+        input, expert_ids, router_weights, nullptr, nullptr, fc1_qdata, fc1_block_scales, fc2_qdata,
         fc2_block_scales, output, static_cast<int>(num_tokens),
         static_cast<int>(hidden_size), static_cast<int>(intermediate_size),
         static_cast<int>(num_experts), static_cast<int>(top_k), workspace_ptr,
@@ -565,6 +611,88 @@ extern "C" bool launch_cutlass_fused_moe_mxfp8(
     (void)input;
     (void)expert_ids;
     (void)router_weights;
+    (void)fc1_qdata;
+    (void)fc1_block_scales;
+    (void)fc2_qdata;
+    (void)fc2_block_scales;
+    (void)output;
+    (void)num_tokens;
+    (void)hidden_size;
+    (void)intermediate_size;
+    (void)num_experts;
+    (void)top_k;
+    (void)input_dtype_code;
+    (void)workspace_ptr;
+    (void)workspace_size;
+    (void)stream;
+    return false;
+#endif
+}
+
+extern "C" bool launch_cutlass_fused_moe_mxfp8_scaled(
+    const void* input,
+    const int64_t* expert_ids,
+    const float* normalized_router_weights,
+    const void* expert_scale_bf16,
+    const void* fc1_qdata,
+    const void* fc1_block_scales,
+    const void* fc2_qdata,
+    const void* fc2_block_scales,
+    void* output,
+    int64_t num_tokens,
+    int64_t hidden_size,
+    int64_t intermediate_size,
+    int64_t num_experts,
+    int64_t top_k,
+    int input_dtype_code,
+    void* workspace_ptr,
+    int64_t workspace_size,
+    cudaStream_t stream) {
+#if CUDA_VERSION >= 12080
+    using namespace comfy::fused_moe_mxfp8;
+    last_error_stage = 1;
+    if (input == nullptr || expert_ids == nullptr || normalized_router_weights == nullptr ||
+        expert_scale_bf16 == nullptr || fc1_qdata == nullptr ||
+        fc1_block_scales == nullptr || fc2_qdata == nullptr ||
+        fc2_block_scales == nullptr || output == nullptr || workspace_ptr == nullptr) {
+        return false;
+    }
+    if ((num_tokens != 256 && num_tokens != 340) || hidden_size != 2816 ||
+        intermediate_size != 704 || num_experts != 128 || top_k != kTopK ||
+        workspace_size <= 0 || input_dtype_code < 1 || input_dtype_code > 2 ||
+        hidden_size % kBlockSize != 0 || intermediate_size % kBlockSize != 0) {
+        return false;
+    }
+    if (!is_aligned(input, 2) || !is_aligned(expert_ids, 8) ||
+        !is_aligned(normalized_router_weights, 4) || !is_aligned(expert_scale_bf16, 2) ||
+        !is_aligned(fc1_qdata, 16) || !is_aligned(fc1_block_scales, 16) ||
+        !is_aligned(fc2_qdata, 16) || !is_aligned(fc2_block_scales, 16) ||
+        !is_aligned(output, 2) || !is_aligned(workspace_ptr, 16)) {
+        return false;
+    }
+
+    const auto* expert_scale = static_cast<const __nv_bfloat16*>(expert_scale_bf16);
+    if (input_dtype_code == 1) {
+        return run_fused_moe_mxfp8<__half>(
+            input, nullptr, normalized_router_weights, expert_ids, expert_scale, fc1_qdata,
+            fc1_block_scales, fc2_qdata, fc2_block_scales, output,
+            static_cast<int>(num_tokens), static_cast<int>(hidden_size),
+            static_cast<int>(intermediate_size), static_cast<int>(num_experts),
+            static_cast<int>(top_k), workspace_ptr, static_cast<size_t>(workspace_size),
+            input_dtype_code, stream);
+    }
+    return run_fused_moe_mxfp8<__nv_bfloat16>(
+        input, nullptr, normalized_router_weights, expert_ids, expert_scale, fc1_qdata,
+        fc1_block_scales, fc2_qdata, fc2_block_scales, output,
+        static_cast<int>(num_tokens), static_cast<int>(hidden_size),
+        static_cast<int>(intermediate_size), static_cast<int>(num_experts),
+        static_cast<int>(top_k), workspace_ptr, static_cast<size_t>(workspace_size),
+        input_dtype_code, stream);
+#else
+    (void)input;
+    (void)expert_ids;
+    (void)normalized_router_weights;
+    (void)expert_scale_bf16;
     (void)fc1_qdata;
     (void)fc1_block_scales;
     (void)fc2_qdata;

@@ -53,6 +53,7 @@ __all__ = [
     "grouped_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
+    "fused_moe_mxfp8_scaled",
     "reserve_cuda_stream_workspaces",
     "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
@@ -472,6 +473,31 @@ def fused_moe_mxfp8(
         "fc2_block_scales": fc2_block_scales,
     }
     impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_mxfp8_scaled(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    normalized_router_weights: torch.Tensor,
+    expert_scale: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run MXFP8 MoE with route scaling and ID conversion inside the native pipeline."""
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "normalized_router_weights": normalized_router_weights,
+        "expert_scale": expert_scale,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+    }
+    impl = registry.get_implementation("fused_moe_mxfp8_scaled", kwargs=kwargs)
     return impl(**kwargs)
 
 
