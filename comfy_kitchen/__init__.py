@@ -52,6 +52,7 @@ __all__ = [
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
     "grouped_scaled_mm_mxfp8",
+    "paired_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
@@ -650,6 +651,28 @@ def grouped_scaled_mm_mxfp8(
         weight_block_scales,
         group_size,
         DTYPE_TO_CODE[out_dtype],
+    )
+
+
+def paired_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    first_weight_qdata: torch.Tensor,
+    second_weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    first_weight_block_scales: torch.Tensor,
+    second_weight_block_scales: torch.Tensor,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run two same-shaped MXFP8 projections from one quantized activation."""
+    return _cuda_backend.paired_scaled_mm_mxfp8(
+        a_qdata,
+        first_weight_qdata,
+        second_weight_qdata,
+        a_block_scales,
+        first_weight_block_scales,
+        second_weight_block_scales,
+        out_dtype,
     )
 
 

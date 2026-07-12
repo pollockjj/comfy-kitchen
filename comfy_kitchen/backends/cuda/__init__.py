@@ -60,6 +60,7 @@ __all__ = [
     "scaled_mm_nvfp4",
     "grouped_scaled_mm_nvfp4",
     "grouped_scaled_mm_mxfp8",
+    "paired_scaled_mm_mxfp8",
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
@@ -1882,6 +1883,68 @@ def grouped_scaled_mm_mxfp8(
         _wrap_for_dlpack(out),
         _wrap_for_dlpack(get_cublas_workspace()),
         group_size,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
+
+
+def paired_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    first_weight_qdata: torch.Tensor,
+    second_weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    first_weight_block_scales: torch.Tensor,
+    second_weight_block_scales: torch.Tensor,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run two same-shaped SM120 MXFP8 projections from one activation matrix."""
+    if not a_qdata.is_cuda or torch.cuda.get_device_capability(a_qdata.device) != (12, 0):
+        raise RuntimeError("paired MXFP8 GEMM currently requires CUDA SM120")
+    qdata = (a_qdata, first_weight_qdata, second_weight_qdata)
+    scales = (a_block_scales, first_weight_block_scales, second_weight_block_scales)
+    if any(tensor.dtype != torch.float8_e4m3fn for tensor in qdata):
+        raise ValueError("paired MXFP8 qdata must be float8_e4m3fn")
+    if any(tensor.dtype != torch.float8_e8m0fnu for tensor in scales):
+        raise ValueError("paired MXFP8 block scales must be float8_e8m0fnu")
+    if a_qdata.ndim != 2 or first_weight_qdata.ndim != 2 or second_weight_qdata.ndim != 2:
+        raise ValueError("paired MXFP8 qdata must be 2D")
+    m, k = a_qdata.shape
+    n = first_weight_qdata.shape[0]
+    if first_weight_qdata.shape != (n, k) or second_weight_qdata.shape != (n, k):
+        raise ValueError("paired MXFP8 weights must have identical [N, K] shapes")
+    if m <= 0 or m % 32 or k <= 0 or k % 32:
+        raise ValueError("paired MXFP8 M and K must be positive multiples of 32")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("paired MXFP8 output must be float16 or bfloat16")
+    tensors = qdata + scales
+    if any(tensor.device != a_qdata.device for tensor in tensors):
+        raise ValueError("all paired MXFP8 tensors must be on the activation device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all paired MXFP8 tensors must be contiguous")
+
+    scale_m = roundup(m, 128)
+    scale_k = roundup(k // 32, 4)
+    scale_n = roundup(n, 128)
+    if a_block_scales.shape != (scale_m, scale_k):
+        raise ValueError("paired MXFP8 activation scale shape mismatch")
+    if (
+        first_weight_block_scales.shape != (scale_n, scale_k)
+        or second_weight_block_scales.shape != (scale_n, scale_k)
+    ):
+        raise ValueError("paired MXFP8 weight scale shapes must match")
+
+    out = torch.empty((2, m, n), device=a_qdata.device, dtype=out_dtype)
+    stream_ptr = torch.cuda.current_stream(a_qdata.device).cuda_stream
+    _C.cutlass_paired_gemm_mxfp8(
+        _wrap_for_dlpack(a_qdata),
+        _wrap_for_dlpack(a_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(first_weight_qdata),
+        _wrap_for_dlpack(first_weight_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(second_weight_qdata),
+        _wrap_for_dlpack(second_weight_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(get_cublas_workspace()),
         DTYPE_TO_CODE[out_dtype],
         stream_ptr,
     )
