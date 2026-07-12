@@ -58,7 +58,7 @@ def test_mxfp8_embedding_cuda_is_bit_exact(output_type):
 def test_mxfp8_weighted_embedding_cuda_is_bit_exact():
     torch.manual_seed(29)
     weight = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
-    probabilities = torch.randn(64, 128, dtype=torch.bfloat16, device="cuda")
+    probabilities = torch.randn(128, 128, dtype=torch.bfloat16, device="cuda")
     qweight, block_scales = ck.quantize_mxfp8(weight)
     dequantized = ck.dequantize_mxfp8(qweight, block_scales, torch.bfloat16)
     reference = torch.mm(probabilities, dequantized, out_dtype=torch.float32)

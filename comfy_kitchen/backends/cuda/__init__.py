@@ -1681,9 +1681,9 @@ def mxfp8_weighted_embedding(
         raise ValueError("mxfp8_weighted_embedding reduction dimensions must match")
     if m == 0 or k == 0 or n == 0:
         raise ValueError("mxfp8_weighted_embedding requires non-empty tensors")
-    if m % 64 != 0 or k % 64 != 0 or n % 128 != 0:
+    if m % 128 != 0 or k % 64 != 0 or n % 128 != 0:
         raise ValueError(
-            "native mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0"
+            "native mxfp8_weighted_embedding requires M%128 == 0, K%64 == 0, N%128 == 0"
         )
     scale_rows = roundup(k, 128)
     scale_cols = roundup(n // 32, 4)

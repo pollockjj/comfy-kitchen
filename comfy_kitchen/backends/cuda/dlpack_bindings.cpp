@@ -1337,9 +1337,9 @@ void mxfp8_weighted_embedding(
     if (m <= 0 || k <= 0 || n <= 0 || weights.shape(1) != k) {
         throw std::runtime_error("mxfp8_weighted_embedding shape mismatch");
     }
-    if (m % 64 || k % 64 || n % 128) {
+    if (m % 128 || k % 64 || n % 128) {
         throw std::runtime_error(
-            "mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0");
+            "mxfp8_weighted_embedding requires M%128 == 0, K%64 == 0, N%128 == 0");
     }
     if (map_dtype_to_code(qweight.dtype()) != 3
         || map_dtype_to_code(block_scales.dtype()) != 3
