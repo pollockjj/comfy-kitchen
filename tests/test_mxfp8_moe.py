@@ -22,6 +22,23 @@ INTERMEDIATE_SIZE = 704
 TOP_K = 8
 
 
+@pytest.fixture(scope="module")
+def paired_dense_weights():
+    generator = torch.Generator(device="cuda:0").manual_seed(5771201)
+    with ck.use_backend("cuda"):
+        weights = [
+            torch.randn(
+                2112,
+                HIDDEN_SIZE,
+                generator=generator,
+                dtype=torch.bfloat16,
+                device="cuda:0",
+            ).mul_(2**-5)
+            for _ in range(2)
+        ]
+        return tuple(ck.quantize_mxfp8(weight) for weight in weights)
+
+
 def _quantize_expert_templates(templates):
     quantized = [ck.quantize_mxfp8(template) for template in templates]
     qdata = torch.stack([item[0] for item in quantized]).repeat(64, 1, 1)
@@ -179,6 +196,69 @@ def test_grouped_scaled_mm_mxfp8_matches_scalar_mxfp8():
     assert delta.abs().max() <= 0.0625
     assert relative_rmse <= 1.0e-3
     assert cosine >= 0.99999
+
+
+@pytest.mark.skipif(not sm120_grouped_mxfp8_available, reason="SM120 grouped MXFP8 required")
+@pytest.mark.parametrize(("rows", "dtype"), [(256, torch.bfloat16), (340, torch.float16)])
+def test_paired_scaled_mm_mxfp8_matches_two_scalar_projections(
+    rows, dtype, paired_dense_weights
+):
+    generator = torch.Generator(device="cuda:0").manual_seed(5771202 + rows)
+    x = torch.randn(
+        rows, HIDDEN_SIZE, generator=generator, dtype=dtype, device="cuda:0"
+    ).mul_(2**-4)
+    with ck.use_backend("cuda"):
+        qx, scales = ck.quantize_mxfp8(x, pad_32x=rows % 32 != 0)
+        candidate = ck.paired_scaled_mm_mxfp8(
+            qx,
+            paired_dense_weights[0][0],
+            paired_dense_weights[1][0],
+            scales,
+            paired_dense_weights[0][1],
+            paired_dense_weights[1][1],
+            out_dtype=dtype,
+        )
+        reference = torch.stack(
+            [
+                ck.scaled_mm_mxfp8(qx, weight, scales, weight_scales, out_dtype=dtype)
+                for weight, weight_scales in paired_dense_weights
+            ]
+        )
+
+    assert candidate.shape == reference.shape
+    assert candidate[0].is_contiguous() and candidate[1].is_contiguous()
+    assert torch.equal(candidate, reference)
+
+
+@pytest.mark.skipif(not sm120_grouped_mxfp8_available, reason="SM120 grouped MXFP8 required")
+def test_paired_scaled_mm_mxfp8_cuda_graph_replay(paired_dense_weights):
+    generator = torch.Generator(device="cuda:0").manual_seed(5771801)
+    first = torch.randn(
+        256, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda:0"
+    )
+    second = torch.randn(
+        256, HIDDEN_SIZE, generator=generator, dtype=torch.bfloat16, device="cuda:0"
+    )
+    qx, scales = ck.quantize_mxfp8(first)
+    next_qx, next_scales = ck.quantize_mxfp8(second)
+    ck.paired_scaled_mm_mxfp8(
+        qx, paired_dense_weights[0][0], paired_dense_weights[1][0], scales,
+        paired_dense_weights[0][1], paired_dense_weights[1][1])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        output = ck.paired_scaled_mm_mxfp8(
+            qx, paired_dense_weights[0][0], paired_dense_weights[1][0], scales,
+            paired_dense_weights[0][1], paired_dense_weights[1][1])
+    qx.copy_(next_qx)
+    scales.copy_(next_scales)
+    graph.replay()
+    torch.cuda.synchronize()
+    reference = torch.stack([
+        ck.scaled_mm_mxfp8(qx, weight, scales, weight_scales)
+        for weight, weight_scales in paired_dense_weights
+    ])
+
+    assert torch.equal(output, reference)
 
 
 @pytest.mark.skipif(not sm120_grouped_mxfp8_available, reason="SM120 grouped MXFP8 required")
