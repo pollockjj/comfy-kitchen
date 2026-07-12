@@ -83,8 +83,10 @@ template <
 __global__ void prepare_grouped_mxfp8_args(
     ElementA* activations,
     ElementB* weights,
+    ElementB* secondary_weights,
     ElementSFA* activation_scales,
     ElementSFB* weight_scales,
+    ElementSFB* secondary_weight_scales,
     ElementD* output,
     int group_m,
     int n,
@@ -92,6 +94,7 @@ __global__ void prepare_grouped_mxfp8_args(
     int num_groups,
     const int32_t* m_indptr,
     int scale_group_m,
+    bool share_activation,
     ProblemShape* problem_sizes,
     const ElementA** a_ptr,
     const ElementB** b_ptr,
@@ -118,7 +121,8 @@ __global__ void prepare_grouped_mxfp8_args(
         scale_k_alignment;
     const size_t scale_k = swizzled_k / static_cast<size_t>(ScaleGranularity);
     int m = group_m;
-    size_t activation_row = static_cast<size_t>(group) * group_m;
+    size_t activation_row =
+        share_activation ? 0 : static_cast<size_t>(group) * group_m;
     if (m_indptr != nullptr) {
         const int32_t start = m_indptr[group];
         const int32_t end = m_indptr[group + 1];
@@ -132,18 +136,26 @@ __global__ void prepare_grouped_mxfp8_args(
     stride_a[group] = cutlass::make_cute_packed_stride(StrideA{}, {n, k, 1});
     stride_b[group] = cutlass::make_cute_packed_stride(StrideB{}, {m, k, 1});
     stride_d[group] = cutlass::make_cute_packed_stride(StrideD{}, {n, m, 1});
-    a_ptr[group] = weights + static_cast<size_t>(group) * n * k;
+    a_ptr[group] = secondary_weights != nullptr && group == 1
+        ? secondary_weights
+        : weights + (secondary_weights == nullptr ? static_cast<size_t>(group) * n * k : 0);
     b_ptr[group] = activations + activation_row * static_cast<size_t>(k);
-    output_ptr[group] = output + activation_row * static_cast<size_t>(n);
+    const size_t output_row =
+        share_activation ? static_cast<size_t>(group) * group_m : activation_row;
+    output_ptr[group] = output + output_row * static_cast<size_t>(n);
 
     layout_scale_a[group] = ScaleConfig::tile_atom_to_shape_SFA(
         make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
-    scale_a_ptr[group] =
-        weight_scales + static_cast<size_t>(group) * scale_n * scale_k;
+    scale_a_ptr[group] = secondary_weight_scales != nullptr && group == 1
+        ? secondary_weight_scales
+        : weight_scales +
+            (secondary_weight_scales == nullptr
+                 ? static_cast<size_t>(group) * scale_n * scale_k
+                 : 0);
     layout_scale_b[group] = ScaleConfig::tile_atom_to_shape_SFB(
         make_shape(static_cast<int>(scale_n), m, static_cast<int>(swizzled_k), 1));
-    scale_b_ptr[group] =
-        activation_scales + static_cast<size_t>(group) * scale_group_m * scale_k;
+    scale_b_ptr[group] = activation_scales +
+        (share_activation ? 0 : static_cast<size_t>(group) * scale_group_m * scale_k);
 }
 
 template <int TileM, int TileN, int TileK, class ElementD>
@@ -161,7 +173,10 @@ bool run_grouped_mxfp8(
     int k,
     void* workspace,
     size_t workspace_size,
-    cudaStream_t stream) {
+    cudaStream_t stream,
+    const void* secondary_weights_raw = nullptr,
+    const void* secondary_weight_scales_raw = nullptr,
+    bool share_activation = false) {
 #if defined(CUTLASS_ARCH_MMA_SM120_SUPPORTED)
     using ElementInput = cutlass::float_e4m3_t;
     using ElementScale = cutlass::float_ue8m0_t;
@@ -262,8 +277,12 @@ bool run_grouped_mxfp8(
         LayoutSFB><<<blocks, threads, 0, stream>>>(
         reinterpret_cast<typename Gemm::ElementA*>(const_cast<void*>(activations_raw)),
         reinterpret_cast<typename Gemm::ElementB*>(const_cast<void*>(weights_raw)),
+        reinterpret_cast<typename Gemm::ElementB*>(
+            const_cast<void*>(secondary_weights_raw)),
         reinterpret_cast<ElementScale*>(const_cast<void*>(activation_scales_raw)),
         reinterpret_cast<ElementScale*>(const_cast<void*>(weight_scales_raw)),
+        reinterpret_cast<ElementScale*>(
+            const_cast<void*>(secondary_weight_scales_raw)),
         static_cast<ElementD*>(output_raw),
         group_m,
         n,
@@ -271,6 +290,7 @@ bool run_grouped_mxfp8(
         num_groups,
         m_indptr,
         scale_group_m,
+        share_activation,
         problem_sizes,
         a_ptr,
         b_ptr,
@@ -326,6 +346,9 @@ bool run_grouped_mxfp8(
     (void)activation_scales_raw;
     (void)weights_raw;
     (void)weight_scales_raw;
+    (void)secondary_weights_raw;
+    (void)secondary_weight_scales_raw;
+    (void)share_activation;
     (void)output_raw;
     (void)num_groups;
     (void)group_m;
