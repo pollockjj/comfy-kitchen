@@ -143,8 +143,11 @@ __device__ __forceinline__ IType gelu_tanh_multiply(IType gate, IType up) {
     const float x = static_cast<float>(gate);
     constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
     constexpr float kCubicCoefficient = 0.044715f;
+    const float x_cube = x * x * x;
+    const float inner =
+        kSqrtTwoOverPi * (x + kCubicCoefficient * x_cube);
     const float gelu =
-        0.5f * x * (1.0f + tanhf(kSqrtTwoOverPi * (x + kCubicCoefficient * x * x * x)));
+        0.5f * x * (1.0f + tanhf(inner));
     const IType rounded_gelu = static_cast<IType>(gelu);
     return static_cast<IType>(static_cast<float>(rounded_gelu) * static_cast<float>(up));
 }
