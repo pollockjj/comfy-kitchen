@@ -10,6 +10,7 @@
 #include <mma.h>
 
 #include "float_utils.cuh"
+#include "svdquant_utils.cuh"
 
 #include <algorithm>
 #include <cstdint>
@@ -94,8 +95,9 @@ __global__ void mxfp8_weighted_embedding_kernel(
                 weights + (m_base + local_m) * k + k_base + local_k);
             auto* destination = reinterpret_cast<uint4*>(
                 shared_a + local_m * kSharedStrideA + local_k);
-            *destination = *source;
+            svdquant::cp_async_16b(destination, source);
         }
+        svdquant::cp_async_commit_group();
 
         if (threadIdx.x < kTileK) {
             const int64_t global_k = k_base + threadIdx.x;
@@ -142,6 +144,7 @@ __global__ void mxfp8_weighted_embedding_kernel(
             shared_vectors[0] = packed_bf16[0];
             shared_vectors[1] = packed_bf16[1];
         }
+        svdquant::cp_async_wait_group<0>();
         __syncthreads();
 
 #pragma unroll
