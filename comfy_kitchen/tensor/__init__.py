@@ -16,7 +16,7 @@ from .convrot_w4a4 import (
     dequantize_convrot_w4a4_weight,
     quantize_convrot_w4a4_weight,
 )
-from .fp8 import TensorCoreFP8Layout
+from .fp8 import TensorCoreFP8Layout, fp8_linear
 from .int8 import TensorWiseINT8Layout
 from .mxfp8 import TensorCoreMXFP8Layout
 from .nvfp4 import TensorCoreNVFP4Layout
@@ -44,6 +44,7 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "get_cuda_capability",
     "get_layout_class",
+    "fp8_linear",
     "register_layout_class",
     "register_layout_op",
     "quantize_convrot_w4a4_weight",

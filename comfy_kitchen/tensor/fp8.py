@@ -130,23 +130,24 @@ def _make_fp8_shape_handler(aten_op):
 
 # ==================== FP8 Matmul Operations ====================
 
-@register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8Layout)
-def _handle_fp8_linear(qt, args, kwargs):
+def fp8_linear(
+    input_tensor: torch.Tensor,
+    weight: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype | None = None,
+) -> torch.Tensor:
     """FP8 linear: output = input @ weight.T + bias
 
     Uses torch._scaled_mm for hardware-accelerated FP8 matmul when both
     input and weight are FP8 QuantizedTensors.
     """
-    input_tensor, weight = args[0], args[1]
-    bias = args[2] if len(args) > 2 else None
-
-    # Fast path: both operands are FP8 QuantizedTensors
     if not (isinstance(input_tensor, QuantizedTensor) and isinstance(weight, QuantizedTensor)):
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
 
     input_qdata, scale_a = TensorCoreFP8Layout.get_plain_tensors(input_tensor)
     weight_qdata, scale_b = TensorCoreFP8Layout.get_plain_tensors(weight)
-    out_dtype = kwargs.get("out_dtype", input_tensor._params.orig_dtype)
+    if out_dtype is None:
+        out_dtype = input_tensor._params.orig_dtype
 
     # Transpose weight for linear: output = input @ weight.T
     weight_t = weight_qdata.t()
@@ -167,6 +168,13 @@ def _handle_fp8_linear(qt, args, kwargs):
     except (RuntimeError, TypeError) as e:
         logger.warning(f"FP8 _scaled_mm failed: {e}, falling back to dequantization")
         return torch.nn.functional.linear(*dequantize_args((input_tensor, weight, bias)))
+
+
+@register_layout_op(torch.ops.aten.linear.default, TensorCoreFP8Layout)
+def _handle_fp8_linear(qt, args, kwargs):
+    input_tensor, weight = args[0], args[1]
+    bias = args[2] if len(args) > 2 else None
+    return fp8_linear(input_tensor, weight, bias, kwargs.get("out_dtype"))
 
 
 @register_layout_op(torch.ops.aten.mm.default, TensorCoreFP8Layout)
