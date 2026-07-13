@@ -60,6 +60,20 @@ class TestBackendSystem:
             cuda_caps = backends["cuda"]["capabilities"]
             assert "int8_linear" in cuda_caps
 
+    @pytest.mark.parametrize("available", [False, True])
+    def test_cutlass_capabilities_follow_build(self, available, monkeypatch):
+        from comfy_kitchen.backends import cuda as backend
+
+        monkeypatch.setattr(backend, "_CUBLASLT_AVAILABLE", False)
+        monkeypatch.setattr(backend, "_CUTLASS_AVAILABLE", available)
+        capabilities = backend._build_constraints()
+
+        assert ("grouped_scaled_mm_nvfp4" in capabilities) is available
+        assert ("fused_moe_nvfp4" in capabilities) is available
+        assert ("grouped_scaled_mm_mxfp8" in capabilities) is (
+            available and hasattr(torch, "float8_e8m0fnu")
+        )
+
     def test_backend_context_manager_override(self, small_tensor):
         """Test that use_backend context manager correctly overrides backend selection."""
         import comfy_kitchen as ck

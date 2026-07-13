@@ -1,6 +1,8 @@
+import math
+
 import torch
 
-from .backends import cuda as _cuda_backend  # noqa: F401
+from .backends import cuda as _cuda_backend
 
 # Import backends to trigger auto-registration
 from .backends import eager as _eager_backend  # noqa: F401
@@ -23,11 +25,15 @@ from .tensor.convrot_w4a4 import (
     quantize_convrot_w4a4_weight,
 )
 
-__version__ = "0.1.0"
+__version__ = "0.2.19"
 
 __all__ = [
     # Normalization
     "adaln",
+    "categorical_stats",
+    "categorical_stats_sample",
+    "softcap_scale",
+    "softcap_categorical_stats_sample",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -35,6 +41,9 @@ __all__ = [
     "dequantize_nvfp4",
     "quantize_mxfp8",
     "dequantize_mxfp8",
+    "mxfp8_embedding",
+    "mxfp8_weighted_embedding",
+    "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
@@ -42,6 +51,17 @@ __all__ = [
     "dequantize_int8_simple",
     # Fused matmul
     "scaled_mm_nvfp4",
+    "grouped_scaled_mm_nvfp4",
+    "grouped_scaled_mm_mxfp8",
+    "fused_moe_nvfp4",
+    "fused_moe_mxfp8",
+    "fused_moe_mxfp8_scaled",
+    "CudaGraph",
+    "begin_cuda_graph_capture",
+    "end_cuda_graph_capture",
+    "abort_cuda_graph_capture",
+    "reserve_cuda_stream_workspaces",
+    "release_cuda_stream_workspaces",
     "scaled_mm_mxfp8",
     "scaled_mm_svdquant_w4a4",
     "convrot_w4a4_linear",
@@ -80,6 +100,26 @@ __all__ = [
 # Public API Functions
 # =============================================================================
 
+CudaGraph = _cuda_backend.CudaGraph
+
+
+def begin_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """Begin thread-local CUDA Runtime graph capture on ``stream``."""
+    return _cuda_backend.begin_cuda_graph_capture(stream)
+
+
+def end_cuda_graph_capture(
+    stream: torch.cuda.Stream,
+    *captured_objects: object,
+) -> CudaGraph:
+    """End capture, retaining ``captured_objects`` until the graph is reset."""
+    return _cuda_backend.end_cuda_graph_capture(stream, *captured_objects)
+
+
+def abort_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """End and destroy an active capture without instantiating it."""
+    return _cuda_backend.abort_cuda_graph_capture(stream)
+
 
 def adaln(
     x: torch.Tensor,
@@ -99,6 +139,128 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def categorical_stats(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return normalized categorical probabilities, entropy, and argmax.
+
+    The final dimension is the vocabulary. Leading dimensions are flattened
+    for backend dispatch and restored on return.
+    """
+    if logits.dtype != torch.float32:
+        raise ValueError("categorical_stats requires float32 logits")
+    if logits.ndim < 1 or logits.numel() == 0 or logits.shape[-1] == 0:
+        raise ValueError("categorical_stats requires a non-empty vocabulary and rows")
+    if not logits.is_contiguous():
+        raise ValueError("categorical_stats requires contiguous logits")
+
+    leading_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    probs, entropy, argmax = torch.ops.comfy_kitchen.categorical_stats(logits_2d)
+    return (
+        probs.reshape(logits.shape),
+        entropy.reshape(leading_shape),
+        argmax.reshape(leading_shape),
+    )
+
+
+def categorical_stats_sample(
+    logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return categorical entropy, argmax, and an exponential-race sample.
+
+    ``exponential_noise`` must contain independent, finite, positive Exp(1)
+    samples. The caller owns its generator and all generator-state advancement.
+    """
+    if logits.dtype != torch.float32 or exponential_noise.dtype != torch.float32:
+        raise ValueError("categorical_stats_sample requires float32 tensors")
+    if logits.shape != exponential_noise.shape:
+        raise ValueError("categorical_stats_sample requires matching logits and noise shapes")
+    if logits.device != exponential_noise.device:
+        raise ValueError("categorical_stats_sample requires logits and noise on the same device")
+    if logits.ndim < 1 or logits.numel() == 0 or logits.shape[-1] == 0:
+        raise ValueError("categorical_stats_sample requires a non-empty vocabulary and rows")
+    if not logits.is_contiguous() or not exponential_noise.is_contiguous():
+        raise ValueError("categorical_stats_sample requires contiguous tensors")
+
+    leading_shape = logits.shape[:-1]
+    logits_2d = logits.reshape(-1, logits.shape[-1])
+    noise_2d = exponential_noise.reshape(logits_2d.shape)
+    entropy, argmax, sample, invalid = torch.ops.comfy_kitchen.categorical_stats_sample(logits_2d, noise_2d)
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(invalid == 0, "categorical_stats_sample received an invalid distribution")
+    elif invalid.item() != 0:
+        raise RuntimeError("categorical_stats_sample received an invalid distribution")
+    return entropy.reshape(leading_shape), argmax.reshape(leading_shape), sample.reshape(leading_shape)
+
+
+def softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    """Apply FP32 logit softcapping followed by inverse-temperature scaling."""
+    if raw_logits.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError("softcap_scale requires floating-point logits")
+    if raw_logits.numel() == 0:
+        raise ValueError("softcap_scale requires non-empty logits")
+    if not raw_logits.is_contiguous():
+        raise ValueError("softcap_scale requires contiguous logits")
+    cap = float(cap)
+    inverse_temperature = float(inverse_temperature)
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError("softcap_scale requires a finite positive cap")
+    if not math.isfinite(inverse_temperature) or inverse_temperature <= 0:
+        raise ValueError("softcap_scale requires a finite positive inverse temperature")
+    return torch.ops.comfy_kitchen.softcap_scale(raw_logits, cap, inverse_temperature)
+
+
+def softcap_categorical_stats_sample(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Return DG processed/self-conditioning logits, entropy, argmax, and sample."""
+    if raw_logits.dtype != torch.bfloat16 or exponential_noise.dtype != torch.float32:
+        raise ValueError("softcap_categorical_stats_sample requires BF16 logits and FP32 noise")
+    if raw_logits.shape != exponential_noise.shape:
+        raise ValueError("softcap_categorical_stats_sample requires matching logits and noise shapes")
+    if raw_logits.device != exponential_noise.device:
+        raise ValueError("softcap_categorical_stats_sample requires logits and noise on the same device")
+    if raw_logits.ndim < 1 or raw_logits.numel() == 0 or raw_logits.shape[-1] == 0:
+        raise ValueError("softcap_categorical_stats_sample requires a non-empty vocabulary and rows")
+    if not raw_logits.is_contiguous() or not exponential_noise.is_contiguous():
+        raise ValueError("softcap_categorical_stats_sample requires contiguous tensors")
+    cap = float(cap)
+    inverse_temperature = float(inverse_temperature)
+    if not math.isfinite(cap) or cap <= 0:
+        raise ValueError("softcap_categorical_stats_sample requires a finite positive cap")
+    if not math.isfinite(inverse_temperature) or inverse_temperature <= 0:
+        raise ValueError("softcap_categorical_stats_sample requires a finite positive inverse temperature")
+
+    leading_shape = raw_logits.shape[:-1]
+    raw_logits_2d = raw_logits.reshape(-1, raw_logits.shape[-1])
+    noise_2d = exponential_noise.reshape(raw_logits_2d.shape)
+    processed, self_conditioning, entropy, argmax, sample, invalid = (
+        torch.ops.comfy_kitchen.softcap_categorical_stats_sample(
+            raw_logits_2d, noise_2d, cap, inverse_temperature
+        )
+    )
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(invalid == 0, "softcap_categorical_stats_sample received invalid inputs")
+    elif invalid.item() != 0:
+        raise RuntimeError("softcap_categorical_stats_sample received invalid inputs")
+    return (
+        processed.reshape(raw_logits.shape),
+        self_conditioning.reshape(raw_logits.shape),
+        entropy.reshape(leading_shape),
+        argmax.reshape(leading_shape),
+        sample.reshape(leading_shape),
+    )
 
 
 def quantize_per_tensor_fp8(
@@ -246,6 +408,139 @@ def scaled_mm_nvfp4(
     )
 
 
+def grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Grouped NVFP4 linear over a fixed-size activation bucket for each expert.
+
+    ``a`` stores all expert activation buckets flattened as
+    ``[num_experts * group_size, K // 2]``. ``b`` stores the expert weight bank as
+    ``[num_experts, N, K // 2]``. The result is ``[num_experts, group_size, N]``.
+    ``group_size`` must be a multiple of 128 so each expert's activation scales are
+    independently aligned in the SM120 block-scale layout.
+    """
+    return torch.ops.comfy_kitchen.grouped_scaled_mm_nvfp4(
+        a,
+        b,
+        tensor_scale_a,
+        tensor_scale_b,
+        block_scale_a,
+        block_scale_b,
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        alpha,
+    )
+
+
+def fused_moe_nvfp4(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+    input_decode_scale: torch.Tensor,
+    intermediate_decode_scale: torch.Tensor,
+    alpha1: torch.Tensor,
+    alpha2: torch.Tensor,
+) -> torch.Tensor:
+    """Run a routed NVFP4 MoE layer entirely inside the Kitchen backend.
+
+    The current SM120 specialization applies ``GELU_tanh(gate) * up`` between
+    two compact expert GEMMs and returns the FP32 router-weighted BF16 sum.
+    Packed weights use low-first NVFP4 nibbles and CUTLASS-swizzled E4M3 block
+    scales. ``alpha1`` and ``alpha2`` contain one decode alpha per expert.
+    """
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+        "input_decode_scale": input_decode_scale,
+        "intermediate_decode_scale": intermediate_decode_scale,
+        "alpha1": alpha1,
+        "alpha2": alpha2,
+    }
+    impl = registry.get_implementation("fused_moe_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_mxfp8(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run a routed MXFP8 MoE layer entirely inside the Kitchen backend.
+
+    The SM120 specialization dynamically quantizes float16 or bfloat16
+    activations, consumes E4M3 expert weights with UE8M0 1x32 block scales,
+    applies ``GELU_tanh(gate) * up``, and returns the FP32 router-weighted sum
+    in the input dtype. The gate/up projection is stored in ``[gate, up]`` order.
+    """
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+    }
+    impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_mxfp8_scaled(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    normalized_router_weights: torch.Tensor,
+    expert_scale: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run MXFP8 MoE with route scaling and ID conversion inside the native pipeline."""
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "normalized_router_weights": normalized_router_weights,
+        "expert_scale": expert_scale,
+        "fc1_qdata": fc1_qdata,
+        "fc1_block_scales": fc1_block_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_block_scales": fc2_block_scales,
+    }
+    impl = registry.get_implementation("fused_moe_mxfp8_scaled", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def reserve_cuda_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Reserve Kitchen workspaces before a caller captures work on a CUDA stream."""
+    return _cuda_backend.reserve_stream_workspaces(stream)
+
+
+def release_cuda_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Release Kitchen workspaces after a caller has synchronized and retired a CUDA stream."""
+    return _cuda_backend.release_stream_workspaces(stream)
+
+
 def quantize_mxfp8(
     x: torch.Tensor,
     pad_32x: bool = False,
@@ -266,6 +561,16 @@ def quantize_mxfp8(
     return torch.ops.comfy_kitchen.quantize_mxfp8(x, pad_32x)
 
 
+def gelu_tanh_multiply_quantize_mxfp8(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply tanh GELU, multiply by ``up``, and quantize to MXFP8 on CUDA."""
+    return _cuda_backend.gelu_tanh_multiply_quantize_mxfp8(
+        gate, up, pad_32x=pad_32x)
+
+
 def dequantize_mxfp8(
     qx: torch.Tensor,
     block_scales: torch.Tensor,
@@ -283,6 +588,63 @@ def dequantize_mxfp8(
     """
     dtype_code = DTYPE_TO_CODE[output_type]
     return torch.ops.comfy_kitchen.dequantize_mxfp8(qx, block_scales, dtype_code)
+
+
+def mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Return selected rows from an MXFP8 embedding without full dequantization."""
+    if qweight.dtype != torch.float8_e4m3fn or qweight.ndim != 2:
+        raise ValueError("mxfp8_embedding requires a 2D float8_e4m3fn qweight")
+    if block_scales.dtype != torch.float8_e8m0fnu or block_scales.ndim != 2:
+        raise ValueError("mxfp8_embedding requires 2D float8_e8m0fnu block scales")
+    if indices.dtype not in (torch.int32, torch.int64):
+        raise ValueError("mxfp8_embedding indices must be int32 or int64")
+    if indices.numel() == 0:
+        raise ValueError("mxfp8_embedding requires at least one index")
+    if qweight.device != block_scales.device or qweight.device != indices.device:
+        raise ValueError("mxfp8_embedding tensors must share one device")
+    if output_type not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("mxfp8_embedding output_type must be float32, float16, or bfloat16")
+
+    leading_shape = tuple(indices.shape)
+    flat_indices = indices.reshape(-1).contiguous()
+    output, invalid = torch.ops.comfy_kitchen.mxfp8_embedding(
+        qweight,
+        block_scales,
+        flat_indices,
+        DTYPE_TO_CODE[output_type],
+    )
+    if invalid.device.type in {"cpu", "cuda", "meta"}:
+        torch._assert_async(invalid == 0, "mxfp8_embedding index out of range")
+    elif invalid.item() != 0:
+        raise IndexError("mxfp8_embedding index out of range")
+    return output.reshape(*leading_shape, qweight.shape[1])
+
+
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply BF16 weights by an MXFP8 embedding and accumulate in FP32."""
+    if qweight.dtype != torch.float8_e4m3fn or qweight.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires a 2D float8_e4m3fn qweight")
+    if block_scales.dtype != torch.float8_e8m0fnu or block_scales.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires 2D float8_e8m0fnu block scales")
+    if weights.dtype != torch.bfloat16 or weights.ndim != 2:
+        raise ValueError("mxfp8_weighted_embedding requires 2D bfloat16 weights")
+    if weights.shape[1] != qweight.shape[0]:
+        raise ValueError("mxfp8_weighted_embedding reduction dimensions must match")
+    if qweight.device != block_scales.device or qweight.device != weights.device:
+        raise ValueError("mxfp8_weighted_embedding tensors must share one device")
+    if qweight.numel() == 0 or weights.shape[0] == 0:
+        raise ValueError("mxfp8_weighted_embedding requires non-empty tensors")
+    return torch.ops.comfy_kitchen.mxfp8_weighted_embedding(
+        qweight, block_scales, weights)
 
 
 def scaled_mm_mxfp8(
@@ -313,6 +675,32 @@ def scaled_mm_mxfp8(
     dtype_code = DTYPE_TO_CODE[out_dtype]
     return torch.ops.comfy_kitchen.scaled_mm_mxfp8(
         a, b, block_scale_a, block_scale_b, bias, dtype_code
+    )
+
+
+def grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Grouped SM120 MXFP8 linear over one fixed activation bucket per expert.
+
+    ``a_qdata`` is ``[num_experts * group_size, K]`` and ``weight_qdata`` is
+    ``[num_experts, N, K]``. Both operands use E4M3 data with E8M0 1x32 block
+    scales in the CUTLASS 128x4 swizzled layout. The result is
+    ``[num_experts, group_size, N]``.
+    """
+    return torch.ops.comfy_kitchen.grouped_scaled_mm_mxfp8(
+        a_qdata,
+        weight_qdata,
+        a_block_scales,
+        weight_block_scales,
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
     )
 
 

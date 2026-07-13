@@ -8,6 +8,10 @@ __all__ = [
     "rms_rope1",
     "rms_rope_split_half",
     "rms_rope_split_half1",
+    "categorical_stats",
+    "categorical_stats_sample",
+    "softcap_scale",
+    "softcap_categorical_stats_sample",
     "dequantize_mxfp8",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
@@ -17,6 +21,8 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
+    "mxfp8_embedding",
+    "mxfp8_weighted_embedding",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
     "quantize_mxfp8",
@@ -61,6 +67,8 @@ from .quantization import (
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
     int8_linear,
+    mxfp8_embedding,
+    mxfp8_weighted_embedding,
     quantize_and_rotate_rowwise,
     quantize_int8_convrot_weight,
     quantize_int8_rowwise,
@@ -82,6 +90,12 @@ from .rope import (
     rms_rope_split_half,
     rms_rope_split_half1,
 )
+from .sampling import (
+    categorical_stats,
+    categorical_stats_sample,
+    softcap_categorical_stats_sample,
+    softcap_scale,
+)
 from .svdquant import quantize_svdquant_w4a4, scaled_mm_svdquant_w4a4
 
 
@@ -91,6 +105,47 @@ def _build_constraints() -> dict:
     scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "categorical_stats": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "categorical_stats_sample": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
+        "softcap_scale": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
+        "softcap_categorical_stats_sample": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=all_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),
@@ -449,6 +504,41 @@ def _build_constraints() -> dict:
                         dtypes=frozenset({torch.float8_e8m0fnu}),
                     ),
                     "output_type": ParamConstraint(dtypes=standard_floats),
+                },
+                default_devices=all_devices)
+
+        out["mxfp8_embedding"] = FunctionConstraints(
+                params={
+                    "qweight": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "indices": ParamConstraint(
+                        dtypes=frozenset({torch.int32, torch.int64}),
+                        shape_rules=(ExactDims(1),),
+                    ),
+                    "output_type": ParamConstraint(dtypes=standard_floats),
+                },
+                default_devices=all_devices)
+
+        out["mxfp8_weighted_embedding"] = FunctionConstraints(
+                params={
+                    "qweight": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "weights": ParamConstraint(
+                        dtypes=frozenset({torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
                 },
                 default_devices=all_devices)
 

@@ -366,6 +366,52 @@ def dequantize_mxfp8(
     return data_dequantized.reshape(orig_shape).to(output_type)
 
 
+def mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize only the requested MXFP8 rows using native swizzled scales."""
+    cols = qweight.shape[1]
+    block_cols = cols // MXFP8_BLOCK_SIZE
+    selected = qweight.index_select(0, indices).to(torch.float32)
+
+    row_ids = indices.to(torch.int64)
+    block_ids = torch.arange(block_cols, dtype=torch.int64, device=indices.device)
+    row_block = row_ids // 128
+    row_remainder = row_ids % 128
+    d4 = row_remainder // 32
+    d3 = row_remainder % 32
+    column_block_group = block_ids // 4
+    d5 = block_ids % 4
+    column_block_group_count = (block_cols + 3) // 4
+    offsets = (
+        ((row_block[:, None] * column_block_group_count + column_block_group[None, :]) * 32
+         + d3[:, None]) * 16
+        + d4[:, None] * 4
+        + d5[None, :]
+    )
+    scale_bytes = block_scales.view(torch.uint8).flatten()[offsets]
+    scales = e8m0_to_f32(scale_bytes)
+    output = (
+        selected.reshape(indices.numel(), block_cols, MXFP8_BLOCK_SIZE)
+        * scales.unsqueeze(-1)
+    ).reshape(indices.numel(), cols).to(output_type)
+    invalid = torch.zeros((), dtype=torch.int32, device=qweight.device)
+    return output, invalid
+
+
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Reference BF16 dequantize-then-matmul path for an MXFP8 embedding."""
+    dequantized = dequantize_mxfp8(qweight, block_scales, torch.bfloat16)
+    return torch.mm(weights, dequantized, out_dtype=torch.float32)
+
+
 def scaled_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -598,6 +644,43 @@ def _op_scaled_mm_nvfp4_fake(
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
 
 
+@torch.library.custom_op("comfy_kitchen::grouped_scaled_mm_nvfp4", mutates_args=())
+def _op_grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+    alpha: torch.Tensor | None,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a": a,
+        "b": b,
+        "tensor_scale_a": tensor_scale_a,
+        "tensor_scale_b": tensor_scale_b,
+        "block_scale_a": block_scale_a,
+        "block_scale_b": block_scale_b,
+        "group_size": group_size,
+        "out_dtype": out_dtype,
+        "alpha": alpha,
+    }
+    impl = registry.get_implementation("grouped_scaled_mm_nvfp4", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_grouped_scaled_mm_nvfp4.register_fake
+def _op_grouped_scaled_mm_nvfp4_fake(
+    a, b, tensor_scale_a, tensor_scale_b, block_scale_a, block_scale_b,
+    group_size, output_dtype_code, alpha
+):
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty((b.shape[0], group_size, b.shape[1]), dtype=out_dtype, device=a.device)
+
+
 # =============================================================================
 # MXFP8 Custom Ops
 # =============================================================================
@@ -672,6 +755,60 @@ def _op_dequantize_mxfp8_fake(qx, block_scales, output_dtype_code):
     return torch.empty_like(qx, dtype=output_dtype)
 
 
+@torch.library.custom_op("comfy_kitchen::mxfp8_embedding", mutates_args=())
+def _op_mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_dtype_code: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    output_type = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "qweight": qweight,
+        "block_scales": block_scales,
+        "indices": indices,
+        "output_type": output_type,
+    }
+    impl = registry.get_implementation("mxfp8_embedding", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_mxfp8_embedding.register_fake
+def _op_mxfp8_embedding_fake(qweight, block_scales, indices, output_dtype_code):
+    output_type = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    output = torch.empty(
+        (indices.numel(), qweight.shape[1]),
+        dtype=output_type,
+        device=qweight.device,
+    )
+    invalid = torch.empty((), dtype=torch.int32, device=qweight.device)
+    return output, invalid
+
+
+@torch.library.custom_op("comfy_kitchen::mxfp8_weighted_embedding", mutates_args=())
+def _op_mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    kwargs = {
+        "qweight": qweight,
+        "block_scales": block_scales,
+        "weights": weights,
+    }
+    impl = registry.get_implementation("mxfp8_weighted_embedding", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_mxfp8_weighted_embedding.register_fake
+def _op_mxfp8_weighted_embedding_fake(qweight, block_scales, weights):
+    return torch.empty(
+        (weights.shape[0], qweight.shape[1]),
+        dtype=torch.float32,
+        device=weights.device,
+    )
+
+
 @torch.library.custom_op("comfy_kitchen::scaled_mm_mxfp8", mutates_args=())
 def _op_scaled_mm_mxfp8(
     a: torch.Tensor,
@@ -714,6 +851,46 @@ def _op_scaled_mm_mxfp8_fake(
     m = a.shape[0]
     n = b.shape[0]
     return torch.empty((m, n), dtype=out_dtype, device=a.device)
+
+
+@torch.library.custom_op("comfy_kitchen::grouped_scaled_mm_mxfp8", mutates_args=())
+def _op_grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    output_dtype_code: int,
+) -> torch.Tensor:
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    kwargs = {
+        "a_qdata": a_qdata,
+        "weight_qdata": weight_qdata,
+        "a_block_scales": a_block_scales,
+        "weight_block_scales": weight_block_scales,
+        "group_size": group_size,
+        "out_dtype": out_dtype,
+    }
+    impl = registry.get_implementation("grouped_scaled_mm_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+@_op_grouped_scaled_mm_mxfp8.register_fake
+def _op_grouped_scaled_mm_mxfp8_fake(
+    a_qdata,
+    weight_qdata,
+    a_block_scales,
+    weight_block_scales,
+    group_size,
+    output_dtype_code,
+):
+    del a_block_scales, weight_block_scales
+    out_dtype = DTYPE_CODE_TO_DTYPE[output_dtype_code]
+    return torch.empty(
+        (weight_qdata.shape[0], group_size, weight_qdata.shape[1]),
+        dtype=out_dtype,
+        device=a_qdata.device,
+    )
 # =============================================================================
 # INT8 Tensor-wise Quantization (from dxqb/OneTrainer)
 # =============================================================================

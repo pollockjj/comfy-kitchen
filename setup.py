@@ -117,7 +117,9 @@ class CMakeBuildExt(build_ext):
 
         build_args = ["--config", config]
 
-        max_jobs = os.cpu_count() or 1
+        max_jobs = int(os.environ.get("MAX_JOBS", os.cpu_count() or 1))
+        if max_jobs < 1:
+            raise ValueError("MAX_JOBS must be a positive integer")
         # Use appropriate parallel build syntax for the platform
         if os.name == "nt":
             # Windows MSBuild uses /m:N for parallel builds
@@ -150,6 +152,7 @@ class CMakeBuildExt(build_ext):
         # Run CMake build
         print(f"Building {ext.name} with CMake...")
         build_cmd = ["cmake", "--build", ".", *build_args]
+        print(f"  Build command: {' '.join(build_cmd)}")
         try:
             subprocess.run(
                 build_cmd,

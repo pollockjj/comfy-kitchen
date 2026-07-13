@@ -17,11 +17,165 @@
 #include <nanobind/nanobind.h>
 #include <nanobind/ndarray.h>
 #include <cuda_runtime.h>
+#include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <string>
+#include <utility>
+#include <vector>
 
 #include "cublaslt_runtime.h"
 
 namespace nb = nanobind;
+
+namespace {
+
+std::string cuda_error_message(const char* operation, cudaError_t error) {
+    return std::string(operation) + " failed: " + cudaGetErrorName(error) + " (" +
+        cudaGetErrorString(error) + ")";
+}
+
+void check_cuda(cudaError_t error, const char* operation) {
+    if (error != cudaSuccess) {
+        throw std::runtime_error(cuda_error_message(operation, error));
+    }
+}
+
+class CudaGraphExec {
+public:
+    CudaGraphExec(cudaGraphExec_t graph_exec, nb::object retained_objects)
+        : graph_exec_(graph_exec), retained_objects_(std::move(retained_objects)) {}
+
+    CudaGraphExec(const CudaGraphExec&) = delete;
+    CudaGraphExec& operator=(const CudaGraphExec&) = delete;
+
+    ~CudaGraphExec() noexcept {
+        synchronize_replays_noexcept();
+        if (graph_exec_ != nullptr) {
+            cudaGraphExecDestroy(graph_exec_);
+            graph_exec_ = nullptr;
+        }
+    }
+
+    bool valid() const noexcept {
+        return graph_exec_ != nullptr;
+    }
+
+    void replay(uintptr_t stream_ptr) {
+        if (graph_exec_ == nullptr) {
+            throw std::runtime_error("CUDA graph executable has been reset");
+        }
+        const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+        check_cuda(
+            cudaGraphLaunch(graph_exec_, stream),
+            "cudaGraphLaunch");
+        if (std::find(replay_streams_.begin(), replay_streams_.end(), stream) ==
+            replay_streams_.end()) {
+            replay_streams_.push_back(stream);
+        }
+    }
+
+    void reset() {
+        if (graph_exec_ == nullptr) {
+            return;
+        }
+        synchronize_replays();
+        cudaGraphExec_t graph_exec = graph_exec_;
+        check_cuda(cudaGraphExecDestroy(graph_exec), "cudaGraphExecDestroy");
+        graph_exec_ = nullptr;
+        retained_objects_ = nb::none();
+    }
+
+private:
+    void synchronize_replays() {
+        for (const cudaStream_t stream : replay_streams_) {
+            check_cuda(cudaStreamSynchronize(stream), "cudaStreamSynchronize");
+        }
+        replay_streams_.clear();
+    }
+
+    void synchronize_replays_noexcept() noexcept {
+        for (const cudaStream_t stream : replay_streams_) {
+            cudaStreamSynchronize(stream);
+        }
+        replay_streams_.clear();
+    }
+
+    cudaGraphExec_t graph_exec_ = nullptr;
+    nb::object retained_objects_;
+    std::vector<cudaStream_t> replay_streams_;
+};
+
+void begin_cuda_graph_capture(uintptr_t stream_ptr) {
+    check_cuda(
+        cudaStreamBeginCapture(
+            reinterpret_cast<cudaStream_t>(stream_ptr),
+            cudaStreamCaptureModeThreadLocal),
+        "cudaStreamBeginCapture");
+}
+
+CudaGraphExec* end_cuda_graph_capture(
+    uintptr_t stream_ptr,
+    nb::object retained_objects) {
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end_error = cudaStreamEndCapture(
+        reinterpret_cast<cudaStream_t>(stream_ptr), &graph);
+    if (end_error != cudaSuccess) {
+        if (graph != nullptr) {
+            cudaGraphDestroy(graph);
+        }
+        throw std::runtime_error(cuda_error_message("cudaStreamEndCapture", end_error));
+    }
+    if (graph == nullptr) {
+        throw std::runtime_error("cudaStreamEndCapture returned no graph");
+    }
+
+    cudaGraphExec_t graph_exec = nullptr;
+    const cudaError_t instantiate_error = cudaGraphInstantiate(
+        &graph_exec, graph, cudaGraphInstantiateFlagAutoFreeOnLaunch);
+    const cudaError_t destroy_error = cudaGraphDestroy(graph);
+    if (instantiate_error != cudaSuccess) {
+        std::string message = cuda_error_message("cudaGraphInstantiate", instantiate_error);
+        if (destroy_error != cudaSuccess) {
+            message += "; cleanup " + cuda_error_message("cudaGraphDestroy", destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    if (destroy_error != cudaSuccess) {
+        const cudaError_t exec_destroy_error = cudaGraphExecDestroy(graph_exec);
+        std::string message = cuda_error_message("cudaGraphDestroy", destroy_error);
+        if (exec_destroy_error != cudaSuccess) {
+            message += "; cleanup " +
+                cuda_error_message("cudaGraphExecDestroy", exec_destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    return new CudaGraphExec(graph_exec, std::move(retained_objects));
+}
+
+void abort_cuda_graph_capture(uintptr_t stream_ptr) {
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    cudaStreamCaptureStatus status = cudaStreamCaptureStatusNone;
+    check_cuda(cudaStreamIsCapturing(stream, &status), "cudaStreamIsCapturing");
+    if (status == cudaStreamCaptureStatusNone) {
+        throw std::runtime_error("CUDA graph capture is not active on this stream");
+    }
+
+    cudaGraph_t graph = nullptr;
+    const cudaError_t end_error = cudaStreamEndCapture(stream, &graph);
+    const cudaError_t destroy_error =
+        graph == nullptr ? cudaSuccess : cudaGraphDestroy(graph);
+    if (end_error != cudaSuccess) {
+        std::string message = cuda_error_message("cudaStreamEndCapture", end_error);
+        if (destroy_error != cudaSuccess) {
+            message += "; cleanup " + cuda_error_message("cudaGraphDestroy", destroy_error);
+        }
+        throw std::runtime_error(message);
+    }
+    check_cuda(destroy_error, "cudaGraphDestroy");
+}
+
+}  // namespace
 
 // Helper: Map nanobind dtype to internal dtype code
 // Returns: 0=float32, 1=float16, 2=bfloat16, 3=uint8, 4=int8, 5=float8_e4m3fn, 6=float8_e5m2
@@ -52,6 +206,51 @@ extern "C" {
                                       int input_dtype_code, int output_dtype_code,
                                       cudaStream_t stream);
 
+    void launch_categorical_stats_kernel(
+        const float* logits,
+        float* probs,
+        float* entropy,
+        int64_t* argmax,
+        float* row_stats,
+        int64_t rows,
+        int64_t vocab_size,
+        cudaStream_t stream);
+
+    void launch_categorical_stats_sample_kernel(
+        const float* logits,
+        const float* exponential_noise,
+        float* entropy,
+        int64_t* argmax,
+        int64_t* sample,
+        float* row_stats,
+        int32_t* invalid,
+        int64_t rows,
+        int64_t vocab_size,
+        cudaStream_t stream);
+
+    void launch_softcap_scale_kernel(
+        const void* raw_logits,
+        float* output,
+        int64_t numel,
+        float cap,
+        float inverse_temperature,
+        cudaStream_t stream);
+
+    void launch_softcap_categorical_stats_sample_kernel(
+        const void* raw_logits,
+        const float* exponential_noise,
+        float* processed_logits,
+        void* self_conditioning_logits,
+        float* entropy,
+        int64_t* argmax,
+        int64_t* sample,
+        int32_t* invalid,
+        int64_t rows,
+        int64_t vocab_size,
+        float cap,
+        float inverse_temperature,
+        cudaStream_t stream);
+
     void launch_stochastic_round_fp8_kernel(void* rng_and_output,
                                             const void* input,
                                             int64_t numel,
@@ -75,6 +274,119 @@ extern "C" {
         void* workspace_ptr,
         bool accumulate,
         cudaStream_t stream);
+
+    bool launch_cutlass_grouped_gemm_nvfp4(
+        const void* a_ptr,
+        const void* block_scale_a_ptr,
+        const void* b_ptr,
+        const void* block_scale_b_ptr,
+        void* d_ptr,
+        const float* alpha_ptr,
+        int64_t num_groups,
+        int64_t group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    bool launch_cutlass_grouped_gemm_nvfp4_variable(
+        const void* a_ptr,
+        const void* block_scale_a_ptr,
+        const void* b_ptr,
+        const void* block_scale_b_ptr,
+        void* d_ptr,
+        const float* alpha_ptr,
+        const int32_t* m_indptr_ptr,
+        int64_t num_groups,
+        int64_t scale_group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    bool launch_cutlass_grouped_gemm_mxfp8(
+        const void* activation_ptr,
+        const void* activation_scale_ptr,
+        const void* weight_ptr,
+        const void* weight_scale_ptr,
+        void* output_ptr,
+        int64_t num_groups,
+        int64_t group_m,
+        int64_t n,
+        int64_t k,
+        int out_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    bool launch_cutlass_fused_moe_mxfp8(
+        const void* input,
+        const int32_t* expert_ids,
+        const float* router_weights,
+        const void* fc1_qdata,
+        const void* fc1_block_scales,
+        const void* fc2_qdata,
+        const void* fc2_block_scales,
+        void* output,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        int input_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    bool launch_cutlass_fused_moe_mxfp8_scaled(
+        const void* input,
+        const int64_t* expert_ids,
+        const float* normalized_router_weights,
+        const void* expert_scale_bf16,
+        const void* fc1_qdata,
+        const void* fc1_block_scales,
+        const void* fc2_qdata,
+        const void* fc2_block_scales,
+        void* output,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        int input_dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    int cutlass_fused_moe_mxfp8_last_error_stage();
+
+    bool launch_cutlass_fused_moe_nvfp4(
+        const void* input_bf16,
+        const int32_t* expert_ids,
+        const float* router_weights,
+        const void* fc1_qdata,
+        const void* fc1_block_scales,
+        const void* fc2_qdata,
+        const void* fc2_block_scales,
+        const float* input_decode_scale,
+        const float* intermediate_decode_scale,
+        const float* alpha1,
+        const float* alpha2,
+        void* output_bf16,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    int cutlass_fused_moe_nvfp4_last_error_stage();
 
     void launch_apply_rope_kernel(
         const void* xq,
@@ -171,6 +483,43 @@ extern "C" {
         int64_t orig_rows,
         int64_t orig_cols,
         int input_dtype_code,
+        cudaStream_t stream);
+
+    void launch_gelu_tanh_multiply_quantize_mxfp8_kernel(
+        const void* gate,
+        const void* up,
+        void* output,
+        void* block_scales,
+        int64_t num_rows,
+        int64_t num_cols,
+        int64_t orig_rows,
+        int64_t orig_cols,
+        int input_dtype_code,
+        cudaStream_t stream);
+
+    void launch_mxfp8_embedding_kernel(
+        const void* qweight,
+        const void* block_scales,
+        const void* indices,
+        void* output,
+        int32_t* invalid,
+        int64_t num_embeddings,
+        int64_t embedding_dim,
+        int64_t num_indices,
+        int index_bits,
+        int output_dtype_code,
+        cudaStream_t stream);
+
+    void launch_mxfp8_weighted_embedding_kernel(
+        const void* qweight,
+        const void* block_scales,
+        const void* weights,
+        float* partials,
+        float* output,
+        int64_t m,
+        int64_t k,
+        int64_t n,
+        int split_k,
         cudaStream_t stream);
 
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
@@ -323,6 +672,199 @@ void stochastic_round_fp8(
         stream);
 }
 
+void categorical_stats(
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> probs,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> row_stats,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(logits.shape(0));
+    if (rows <= 0 || vocab_size <= 0 || static_cast<int64_t>(logits.shape(1)) != vocab_size) {
+        throw std::runtime_error("categorical_stats requires non-empty [rows, vocab] logits");
+    }
+    if (
+        static_cast<int64_t>(probs.shape(0)) != rows
+        || static_cast<int64_t>(probs.shape(1)) != vocab_size
+        || static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(1)) != 2
+    ) {
+        throw std::runtime_error("categorical_stats output shape mismatch");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_categorical_stats_kernel(
+        logits.data(),
+        probs.data(),
+        entropy.data(),
+        argmax.data(),
+        row_stats.data(),
+        rows,
+        vocab_size,
+        stream);
+}
+
+void categorical_stats_sample(
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> exponential_noise,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> sample,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> row_stats,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(logits.shape(0));
+    if (
+        rows <= 0
+        || vocab_size <= 0
+        || static_cast<int64_t>(logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(exponential_noise.shape(0)) != rows
+        || static_cast<int64_t>(exponential_noise.shape(1)) != vocab_size
+    ) {
+        throw std::runtime_error("categorical_stats_sample requires matching non-empty [rows, vocab] inputs");
+    }
+    const int logits_device = logits.device_id();
+    if (
+        exponential_noise.device_id() != logits_device
+        || entropy.device_id() != logits_device
+        || argmax.device_id() != logits_device
+        || sample.device_id() != logits_device
+        || row_stats.device_id() != logits_device
+        || invalid.device_id() != logits_device
+    ) {
+        throw std::runtime_error("categorical_stats_sample tensors must share one CUDA device");
+    }
+    if (
+        static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(sample.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(0)) != rows
+        || static_cast<int64_t>(row_stats.shape(1)) != 2
+        || static_cast<int64_t>(invalid.size()) != 1
+    ) {
+        throw std::runtime_error("categorical_stats_sample output shape mismatch");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_categorical_stats_sample_kernel(
+        logits.data(),
+        exponential_noise.data(),
+        entropy.data(),
+        argmax.data(),
+        sample.data(),
+        row_stats.data(),
+        invalid.data(),
+        rows,
+        vocab_size,
+        stream);
+}
+
+void softcap_scale(
+    nb::ndarray<nb::device::cuda> raw_logits,
+    nb::ndarray<float, nb::device::cuda> output,
+    float cap,
+    float inverse_temperature,
+    int64_t numel,
+    uintptr_t stream_ptr)
+{
+    if (map_dtype_to_code(raw_logits.dtype()) != 2) {
+        throw std::runtime_error("softcap_scale requires bfloat16 logits");
+    }
+    if (
+        numel <= 0
+        || static_cast<int64_t>(raw_logits.size()) != numel
+        || static_cast<int64_t>(output.size()) != numel
+    ) {
+        throw std::runtime_error("softcap_scale input and output size mismatch");
+    }
+    if (!std::isfinite(cap) || cap <= 0.0f || !std::isfinite(inverse_temperature) || inverse_temperature <= 0.0f) {
+        throw std::runtime_error("softcap_scale requires finite positive scales");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_softcap_scale_kernel(
+        raw_logits.data(), output.data(), numel, cap, inverse_temperature, stream);
+}
+
+void softcap_categorical_stats_sample(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> raw_logits,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> exponential_noise,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> processed_logits,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> self_conditioning_logits,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> entropy,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> argmax,
+    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> sample,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    float cap,
+    float inverse_temperature,
+    int64_t vocab_size,
+    uintptr_t stream_ptr)
+{
+    const int64_t rows = static_cast<int64_t>(raw_logits.shape(0));
+    if (map_dtype_to_code(raw_logits.dtype()) != 2 || map_dtype_to_code(self_conditioning_logits.dtype()) != 2) {
+        throw std::runtime_error("softcap_categorical_stats_sample requires bfloat16 logits outputs");
+    }
+    if (
+        rows <= 0
+        || vocab_size <= 0
+        || static_cast<int64_t>(raw_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(exponential_noise.shape(0)) != rows
+        || static_cast<int64_t>(exponential_noise.shape(1)) != vocab_size
+    ) {
+        throw std::runtime_error(
+            "softcap_categorical_stats_sample requires matching non-empty [rows, vocab] inputs");
+    }
+    const int logits_device = raw_logits.device_id();
+    if (
+        exponential_noise.device_id() != logits_device
+        || processed_logits.device_id() != logits_device
+        || self_conditioning_logits.device_id() != logits_device
+        || entropy.device_id() != logits_device
+        || argmax.device_id() != logits_device
+        || sample.device_id() != logits_device
+        || invalid.device_id() != logits_device
+    ) {
+        throw std::runtime_error("softcap_categorical_stats_sample tensors must share one CUDA device");
+    }
+    if (
+        static_cast<int64_t>(processed_logits.shape(0)) != rows
+        || static_cast<int64_t>(processed_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(self_conditioning_logits.shape(0)) != rows
+        || static_cast<int64_t>(self_conditioning_logits.shape(1)) != vocab_size
+        || static_cast<int64_t>(entropy.shape(0)) != rows
+        || static_cast<int64_t>(argmax.shape(0)) != rows
+        || static_cast<int64_t>(sample.shape(0)) != rows
+        || static_cast<int64_t>(invalid.size()) != 1
+    ) {
+        throw std::runtime_error("softcap_categorical_stats_sample output shape mismatch");
+    }
+    if (!std::isfinite(cap) || cap <= 0.0f || !std::isfinite(inverse_temperature) || inverse_temperature <= 0.0f) {
+        throw std::runtime_error("softcap_categorical_stats_sample requires finite positive scales");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_softcap_categorical_stats_sample_kernel(
+        raw_logits.data(),
+        exponential_noise.data(),
+        processed_logits.data(),
+        self_conditioning_logits.data(),
+        entropy.data(),
+        argmax.data(),
+        sample.data(),
+        invalid.data(),
+        rows,
+        vocab_size,
+        cap,
+        inverse_temperature,
+        stream);
+}
+
 // Nanobind wrapper for cublas_gemm_blockwise_fp4
 void cublas_gemm_blockwise_fp4(
     nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> b,
@@ -381,6 +923,367 @@ void cublas_gemm_blockwise_fp4(
         workspace.data(),
         accumulate,
         stream);
+}
+
+void cutlass_grouped_gemm_nvfp4(
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> a,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> block_scale_a,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> b,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> block_scale_b,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> out,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int64_t group_m,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_groups = b.shape(0);
+    const int64_t n = b.shape(1);
+    const int64_t packed_k = b.shape(2);
+    const int64_t k = packed_k * 2;
+    const int64_t scale_k = ((k / 16) + 3) / 4 * 4;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+
+    if (group_m <= 0 || group_m % 128 != 0) {
+        throw std::runtime_error("group_m must be a positive multiple of 128");
+    }
+    if (a.shape(0) != num_groups * group_m || a.shape(1) != packed_k) {
+        throw std::runtime_error("grouped NVFP4 activation shape mismatch");
+    }
+    if (block_scale_a.shape(0) != num_groups * group_m || block_scale_a.shape(1) != scale_k) {
+        throw std::runtime_error("grouped NVFP4 activation scale shape mismatch");
+    }
+    if (block_scale_b.shape(0) != num_groups || block_scale_b.shape(1) != scale_n ||
+        block_scale_b.shape(2) != scale_k) {
+        throw std::runtime_error("grouped NVFP4 weight scale shape mismatch");
+    }
+    if (out.shape(0) != num_groups || out.shape(1) != group_m || out.shape(2) != n) {
+        throw std::runtime_error("grouped NVFP4 output shape mismatch");
+    }
+    if (alpha.shape(0) != num_groups) {
+        throw std::runtime_error("grouped NVFP4 alpha must contain one value per group");
+    }
+    if (out_dtype_code != 1 && out_dtype_code != 2) {
+        throw std::runtime_error("grouped NVFP4 output must be float16 or bfloat16");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_grouped_gemm_nvfp4(
+            a.data(), block_scale_a.data(), b.data(), block_scale_b.data(), out.data(), alpha.data(),
+            num_groups, group_m, n, k, out_dtype_code, workspace.data(), workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS grouped NVFP4 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_grouped_gemm_nvfp4_variable(
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> a,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> block_scale_a,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> b,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> block_scale_b,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> m_indptr,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> out,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_groups = b.shape(0);
+    const int64_t n = b.shape(1);
+    const int64_t packed_k = b.shape(2);
+    const int64_t k = packed_k * 2;
+    const int64_t scale_k = ((k / 16) + 3) / 4 * 4;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+    const int64_t scale_group_m = block_scale_a.shape(1);
+
+    if (scale_group_m <= 0 || scale_group_m % 128 != 0) {
+        throw std::runtime_error("variable grouped NVFP4 scale bucket must be a positive multiple of 128");
+    }
+    if (a.shape(1) != packed_k) {
+        throw std::runtime_error("variable grouped NVFP4 activation shape mismatch");
+    }
+    if (block_scale_a.shape(0) != num_groups || block_scale_a.shape(2) != scale_k) {
+        throw std::runtime_error("variable grouped NVFP4 activation scale shape mismatch");
+    }
+    if (block_scale_b.shape(0) != num_groups || block_scale_b.shape(1) != scale_n ||
+        block_scale_b.shape(2) != scale_k) {
+        throw std::runtime_error("variable grouped NVFP4 weight scale shape mismatch");
+    }
+    if (m_indptr.shape(0) != num_groups + 1) {
+        throw std::runtime_error("variable grouped NVFP4 indptr shape mismatch");
+    }
+    if (out.shape(0) != a.shape(0) || out.shape(1) != n) {
+        throw std::runtime_error("variable grouped NVFP4 output shape mismatch");
+    }
+    if (alpha.shape(0) != num_groups) {
+        throw std::runtime_error("variable grouped NVFP4 alpha must contain one value per group");
+    }
+    if (out_dtype_code != 1 && out_dtype_code != 2) {
+        throw std::runtime_error("variable grouped NVFP4 output must be float16 or bfloat16");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_grouped_gemm_nvfp4_variable(
+            a.data(), block_scale_a.data(), b.data(), block_scale_b.data(), out.data(), alpha.data(),
+            m_indptr.data(), num_groups, scale_group_m, n, k, out_dtype_code, workspace.data(),
+            workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS variable grouped NVFP4 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_grouped_gemm_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> activations,
+    nb::ndarray<uint8_t, nb::ndim<2>, nb::device::cuda> activation_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> weights,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> weight_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int64_t group_m,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_groups = weights.shape(0);
+    const int64_t n = weights.shape(1);
+    const int64_t k = weights.shape(2);
+    const int64_t scale_k = ((k / 32) + 3) / 4 * 4;
+    const int64_t scale_n = ((n + 127) / 128) * 128;
+
+    if (group_m <= 0 || group_m % 128 != 0) {
+        throw std::runtime_error("group_m must be a positive multiple of 128");
+    }
+    if (k <= 0 || k % 32 != 0) {
+        throw std::runtime_error("grouped MXFP8 K must be a positive multiple of 32");
+    }
+    if (activations.shape(0) != num_groups * group_m || activations.shape(1) != k) {
+        throw std::runtime_error("grouped MXFP8 activation shape mismatch");
+    }
+    if (activation_scales.shape(0) != num_groups * group_m ||
+        activation_scales.shape(1) != scale_k) {
+        throw std::runtime_error("grouped MXFP8 activation scale shape mismatch");
+    }
+    if (weight_scales.shape(0) != num_groups || weight_scales.shape(1) != scale_n ||
+        weight_scales.shape(2) != scale_k) {
+        throw std::runtime_error("grouped MXFP8 weight scale shape mismatch");
+    }
+    if (output.shape(0) != num_groups || output.shape(1) != group_m ||
+        output.shape(2) != n) {
+        throw std::runtime_error("grouped MXFP8 output shape mismatch");
+    }
+    if (out_dtype_code != 1 && out_dtype_code != 2) {
+        throw std::runtime_error("grouped MXFP8 output must be float16 or bfloat16");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_grouped_gemm_mxfp8(
+            activations.data(), activation_scales.data(), weights.data(), weight_scales.data(),
+            output.data(), num_groups, group_m, n, k, out_dtype_code, workspace.data(),
+            workspace.size(), stream)) {
+        throw std::runtime_error("CUTLASS grouped MXFP8 GEMM is unavailable for this configuration");
+    }
+}
+
+void cutlass_fused_moe_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> router_weights,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_block_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_tokens = input.shape(0);
+    const int64_t hidden_size = input.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t fc1_output = fc1_qdata.shape(1);
+    const int64_t intermediate_size = fc1_output / 2;
+    const int64_t input_scale_cols = ((hidden_size / 32) + 3) / 4 * 4;
+    const int64_t intermediate_scale_cols = ((intermediate_size / 32) + 3) / 4 * 4;
+    const int64_t fc1_scale_rows = ((fc1_output + 127) / 128) * 128;
+    const int64_t fc2_scale_rows = ((hidden_size + 127) / 128) * 128;
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        map_dtype_to_code(output.dtype()) != input_dtype_code) {
+        throw std::runtime_error(
+            "fused MXFP8 MoE input and output must be matching float16 or bfloat16");
+    }
+    if (expert_ids.shape(0) != num_tokens || router_weights.shape(0) != num_tokens ||
+        router_weights.shape(1) != top_k) {
+        throw std::runtime_error("fused MXFP8 MoE routing shape mismatch");
+    }
+    if (fc1_output <= 0 || fc1_output % 2 != 0 || fc1_qdata.shape(2) != hidden_size) {
+        throw std::runtime_error("fused MXFP8 MoE gate/up weight shape mismatch");
+    }
+    if (fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) != intermediate_size) {
+        throw std::runtime_error("fused MXFP8 MoE down weight shape mismatch");
+    }
+    if (fc1_block_scales.shape(0) != num_experts ||
+        fc1_block_scales.shape(1) != fc1_scale_rows ||
+        fc1_block_scales.shape(2) != input_scale_cols ||
+        fc2_block_scales.shape(0) != num_experts ||
+        fc2_block_scales.shape(1) != fc2_scale_rows ||
+        fc2_block_scales.shape(2) != intermediate_scale_cols) {
+        throw std::runtime_error("fused MXFP8 MoE weight scale shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size) {
+        throw std::runtime_error("fused MXFP8 MoE output shape mismatch");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_mxfp8(
+            input.data(), expert_ids.data(), router_weights.data(), fc1_qdata.data(),
+            fc1_block_scales.data(), fc2_qdata.data(), fc2_block_scales.data(),
+            output.data(), num_tokens, hidden_size, intermediate_size, num_experts, top_k,
+            input_dtype_code, workspace.data(), static_cast<int64_t>(workspace.size()),
+            stream)) {
+        throw std::runtime_error(
+            "native CUTLASS fused MXFP8 MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
+    }
+}
+
+void cutlass_fused_moe_mxfp8_scaled(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int64_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> normalized_router_weights,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> expert_scale,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_block_scales,
+    nb::ndarray<nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_tokens = input.shape(0);
+    const int64_t hidden_size = input.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t fc1_output = fc1_qdata.shape(1);
+    const int64_t intermediate_size = fc1_output / 2;
+    const int64_t input_scale_cols = ((hidden_size / 32) + 3) / 4 * 4;
+    const int64_t intermediate_scale_cols = ((intermediate_size / 32) + 3) / 4 * 4;
+    const int64_t fc1_scale_rows = ((fc1_output + 127) / 128) * 128;
+    const int64_t fc2_scale_rows = ((hidden_size + 127) / 128) * 128;
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        map_dtype_to_code(output.dtype()) != input_dtype_code ||
+        map_dtype_to_code(expert_scale.dtype()) != 2) {
+        throw std::runtime_error(
+            "scaled fused MXFP8 MoE requires matching FP16/BF16 input/output and BF16 expert scale");
+    }
+    if (expert_ids.shape(0) != num_tokens ||
+        normalized_router_weights.shape(0) != num_tokens ||
+        normalized_router_weights.shape(1) != top_k ||
+        expert_scale.shape(0) != num_experts) {
+        throw std::runtime_error("scaled fused MXFP8 MoE routing shape mismatch");
+    }
+    if (fc1_output <= 0 || fc1_output % 2 != 0 || fc1_qdata.shape(2) != hidden_size) {
+        throw std::runtime_error("scaled fused MXFP8 MoE gate/up weight shape mismatch");
+    }
+    if (fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) != intermediate_size) {
+        throw std::runtime_error("scaled fused MXFP8 MoE down weight shape mismatch");
+    }
+    if (fc1_block_scales.shape(0) != num_experts ||
+        fc1_block_scales.shape(1) != fc1_scale_rows ||
+        fc1_block_scales.shape(2) != input_scale_cols ||
+        fc2_block_scales.shape(0) != num_experts ||
+        fc2_block_scales.shape(1) != fc2_scale_rows ||
+        fc2_block_scales.shape(2) != intermediate_scale_cols) {
+        throw std::runtime_error("scaled fused MXFP8 MoE weight scale shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size) {
+        throw std::runtime_error("scaled fused MXFP8 MoE output shape mismatch");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_mxfp8_scaled(
+            input.data(), expert_ids.data(), normalized_router_weights.data(),
+            expert_scale.data(), fc1_qdata.data(), fc1_block_scales.data(),
+            fc2_qdata.data(), fc2_block_scales.data(), output.data(), num_tokens,
+            hidden_size, intermediate_size, num_experts, top_k, input_dtype_code,
+            workspace.data(), static_cast<int64_t>(workspace.size()), stream)) {
+        throw std::runtime_error(
+            "native scaled CUTLASS fused MXFP8 MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
+    }
+}
+
+void cutlass_fused_moe_nvfp4(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> router_weights,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc1_block_scales,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<uint8_t, nb::ndim<3>, nb::device::cuda> fc2_block_scales,
+    nb::ndarray<float, nb::device::cuda> input_decode_scale,
+    nb::ndarray<float, nb::device::cuda> intermediate_decode_scale,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha1,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> alpha2,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    uintptr_t stream_ptr) {
+
+    const int64_t num_tokens = input.shape(0);
+    const int64_t hidden_size = input.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t fc1_output = fc1_qdata.shape(1);
+    const int64_t intermediate_size = fc1_output / 2;
+    const int64_t input_scale_cols = ((hidden_size / 16) + 3) / 4 * 4;
+    const int64_t intermediate_scale_cols = ((intermediate_size / 16) + 3) / 4 * 4;
+    const int64_t fc1_scale_rows = ((fc1_output + 127) / 128) * 128;
+    const int64_t fc2_scale_rows = ((hidden_size + 127) / 128) * 128;
+
+    if (map_dtype_to_code(input.dtype()) != 2 || map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("fused NVFP4 MoE input and output must be bfloat16");
+    }
+    if (expert_ids.shape(0) != num_tokens || router_weights.shape(0) != num_tokens ||
+        router_weights.shape(1) != top_k) {
+        throw std::runtime_error("fused NVFP4 MoE routing shape mismatch");
+    }
+    if (fc1_output <= 0 || fc1_output % 2 != 0 || fc1_qdata.shape(2) * 2 != hidden_size) {
+        throw std::runtime_error("fused NVFP4 MoE gate/up weight shape mismatch");
+    }
+    if (fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) * 2 != intermediate_size) {
+        throw std::runtime_error("fused NVFP4 MoE down weight shape mismatch");
+    }
+    if (fc1_block_scales.shape(0) != num_experts ||
+        fc1_block_scales.shape(1) != fc1_scale_rows ||
+        fc1_block_scales.shape(2) != input_scale_cols ||
+        fc2_block_scales.shape(0) != num_experts ||
+        fc2_block_scales.shape(1) != fc2_scale_rows ||
+        fc2_block_scales.shape(2) != intermediate_scale_cols) {
+        throw std::runtime_error("fused NVFP4 MoE weight scale shape mismatch");
+    }
+    if (input_decode_scale.size() != 1 || intermediate_decode_scale.size() != 1 ||
+        alpha1.shape(0) != num_experts || alpha2.shape(0) != num_experts) {
+        throw std::runtime_error("fused NVFP4 MoE global scale shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size) {
+        throw std::runtime_error("fused NVFP4 MoE output shape mismatch");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_nvfp4(
+            input.data(), expert_ids.data(), router_weights.data(), fc1_qdata.data(),
+            fc1_block_scales.data(), fc2_qdata.data(), fc2_block_scales.data(),
+            input_decode_scale.data(), intermediate_decode_scale.data(), alpha1.data(),
+            alpha2.data(), output.data(), num_tokens, hidden_size, intermediate_size,
+            num_experts, top_k, workspace.data(), static_cast<int64_t>(workspace.size()),
+            stream)) {
+        throw std::runtime_error(
+            "native CUTLASS fused NVFP4 MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_nvfp4_last_error_stage()));
+    }
 }
 
 // Nanobind wrapper for quantize_nvfp4
@@ -501,6 +1404,156 @@ void quantize_mxfp8(
         orig_cols,
         input_dtype_code,
         stream);
+}
+
+void gelu_tanh_multiply_quantize_mxfp8(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> gate,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> up,
+    nb::ndarray<nb::device::cuda> output,
+    nb::ndarray<nb::device::cuda> block_scales,
+    bool pad_32x,
+    uintptr_t stream_ptr) {
+
+    const int64_t orig_rows = gate.shape(0);
+    const int64_t orig_cols = gate.shape(1);
+    if (up.shape(0) != orig_rows || up.shape(1) != orig_cols) {
+        throw std::runtime_error("gate and up tensors must have identical shapes");
+    }
+    const int input_dtype_code = map_dtype_to_code(gate.dtype());
+    if ((input_dtype_code != 1 && input_dtype_code != 2) ||
+        map_dtype_to_code(up.dtype()) != input_dtype_code) {
+        throw std::runtime_error(
+            "fused GELU MXFP8 quantization requires matching float16 or bfloat16 inputs");
+    }
+
+    int64_t num_rows = orig_rows;
+    int64_t num_cols = orig_cols;
+    if (pad_32x) {
+        num_rows = (orig_rows + 31) / 32 * 32;
+        num_cols = (orig_cols + 31) / 32 * 32;
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_gelu_tanh_multiply_quantize_mxfp8_kernel(
+        gate.data(), up.data(), output.data(), block_scales.data(), num_rows,
+        num_cols, orig_rows, orig_cols, input_dtype_code, stream);
+}
+
+void mxfp8_embedding(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> qweight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> block_scales,
+    nb::ndarray<nb::ndim<1>, nb::device::cuda> indices,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<int32_t, nb::device::cuda> invalid,
+    int output_dtype_code,
+    uintptr_t stream_ptr)
+{
+    const int64_t num_embeddings = static_cast<int64_t>(qweight.shape(0));
+    const int64_t embedding_dim = static_cast<int64_t>(qweight.shape(1));
+    const int64_t num_indices = static_cast<int64_t>(indices.shape(0));
+    if (num_embeddings <= 0 || embedding_dim <= 0 || num_indices <= 0) {
+        throw std::runtime_error("mxfp8_embedding requires non-empty weights and indices");
+    }
+    if (embedding_dim % 32 != 0) {
+        throw std::runtime_error("mxfp8_embedding requires embedding_dim divisible by 32");
+    }
+    if (map_dtype_to_code(qweight.dtype()) != 3 || map_dtype_to_code(block_scales.dtype()) != 3) {
+        throw std::runtime_error("mxfp8_embedding requires uint8 E4M3 and E8M0 storage views");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2
+        || map_dtype_to_code(output.dtype()) != output_dtype_code) {
+        throw std::runtime_error("mxfp8_embedding output dtype mismatch");
+    }
+
+    const nb::dlpack::dtype index_dtype = indices.dtype();
+    if (index_dtype.code != static_cast<uint8_t>(nb::dlpack::dtype_code::Int)
+        || (index_dtype.bits != 32 && index_dtype.bits != 64)) {
+        throw std::runtime_error("mxfp8_embedding indices must be int32 or int64");
+    }
+    const int index_bits = static_cast<int>(index_dtype.bits);
+
+    const int64_t scale_rows = ((num_embeddings + 127) / 128) * 128;
+    const int64_t scale_block_cols = embedding_dim / 32;
+    const int64_t scale_cols = ((scale_block_cols + 3) / 4) * 4;
+    if (static_cast<int64_t>(block_scales.size()) < scale_rows * scale_cols) {
+        throw std::runtime_error("mxfp8_embedding block scale storage is too small");
+    }
+    if (static_cast<int64_t>(output.shape(0)) != num_indices
+        || static_cast<int64_t>(output.shape(1)) != embedding_dim
+        || static_cast<int64_t>(invalid.size()) != 1) {
+        throw std::runtime_error("mxfp8_embedding output shape mismatch");
+    }
+
+    const int device = qweight.device_id();
+    if (block_scales.device_id() != device
+        || indices.device_id() != device
+        || output.device_id() != device
+        || invalid.device_id() != device) {
+        throw std::runtime_error("mxfp8_embedding tensors must share one CUDA device");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_mxfp8_embedding_kernel(
+        qweight.data(),
+        block_scales.data(),
+        indices.data(),
+        output.data(),
+        invalid.data(),
+        num_embeddings,
+        embedding_dim,
+        num_indices,
+        index_bits,
+        output_dtype_code,
+        stream);
+}
+
+void mxfp8_weighted_embedding(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> qweight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> block_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
+    nb::ndarray<nb::device::cuda> partials,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int split_k,
+    uintptr_t stream_ptr)
+{
+    const int64_t k = static_cast<int64_t>(qweight.shape(0));
+    const int64_t n = static_cast<int64_t>(qweight.shape(1));
+    const int64_t m = static_cast<int64_t>(weights.shape(0));
+    if (m <= 0 || k <= 0 || n <= 0 || weights.shape(1) != k) {
+        throw std::runtime_error("mxfp8_weighted_embedding shape mismatch");
+    }
+    if (m % 64 || k % 64 || n % 128) {
+        throw std::runtime_error(
+            "mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0");
+    }
+    if (map_dtype_to_code(qweight.dtype()) != 3
+        || map_dtype_to_code(block_scales.dtype()) != 3
+        || map_dtype_to_code(weights.dtype()) != 2
+        || map_dtype_to_code(partials.dtype()) != 0
+        || map_dtype_to_code(output.dtype()) != 0) {
+        throw std::runtime_error("mxfp8_weighted_embedding dtype mismatch");
+    }
+    if (split_k <= 0
+        || static_cast<int64_t>(partials.size()) != split_k * m * n
+        || static_cast<int64_t>(output.size()) != m * n) {
+        throw std::runtime_error("mxfp8_weighted_embedding workspace shape mismatch");
+    }
+    const int64_t scale_rows = ((k + 127) / 128) * 128;
+    const int64_t scale_cols = (((n / 32) + 3) / 4) * 4;
+    if (static_cast<int64_t>(block_scales.size()) < scale_rows * scale_cols) {
+        throw std::runtime_error("mxfp8_weighted_embedding block scale storage is too small");
+    }
+    const int device = qweight.device_id();
+    if (block_scales.device_id() != device
+        || weights.device_id() != device
+        || partials.device_id() != device
+        || output.device_id() != device) {
+        throw std::runtime_error("mxfp8_weighted_embedding tensors must share one CUDA device");
+    }
+    launch_mxfp8_weighted_embedding_kernel(
+        qweight.data(), block_scales.data(), weights.data(),
+        static_cast<float*>(partials.data()), static_cast<float*>(output.data()),
+        m, k, n, split_k, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -2169,6 +3222,23 @@ void dequantize_int8_convrot_weight(
 
 NB_MODULE(_C, m) {
     m.doc() = "comfy_kitchen CUDA kernels - nanobind + DLPack interface (NO PyTorch C++ dependencies)";
+
+    nb::class_<CudaGraphExec>(m, "_CudaGraphExec")
+        .def_prop_ro("valid", &CudaGraphExec::valid)
+        .def("replay", &CudaGraphExec::replay, nb::arg("stream_ptr"))
+        .def("reset", &CudaGraphExec::reset);
+
+    m.def("begin_cuda_graph_capture", &begin_cuda_graph_capture,
+          "Begin thread-local CUDA Runtime graph capture on a stream",
+          nb::arg("stream_ptr"));
+    m.def("end_cuda_graph_capture", &end_cuda_graph_capture,
+          "End capture and instantiate an executable CUDA graph",
+          nb::arg("stream_ptr"),
+          nb::arg("retained_objects"),
+          nb::rv_policy::take_ownership);
+    m.def("abort_cuda_graph_capture", &abort_cuda_graph_capture,
+          "End and destroy a CUDA graph capture without instantiating it",
+          nb::arg("stream_ptr"));
     
     m.def("quantize_per_tensor_fp8", &quantize_per_tensor_fp8,
           "Quantize to FP8 using nanobind ndarrays",
@@ -2197,6 +3267,52 @@ NB_MODULE(_C, m) {
           nb::arg("output_dtype_code"),
           nb::arg("numel"),
           nb::arg("stream_ptr"));
+
+    m.def("categorical_stats", &categorical_stats,
+          "Categorical probabilities, entropy, and argmax for contiguous FP32 rows",
+          nb::arg("logits"),
+          nb::arg("probs"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("row_stats"),
+          nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("categorical_stats_sample", &categorical_stats_sample,
+          "Categorical entropy, argmax, and exponential-race sample for FP32 rows",
+          nb::arg("logits"),
+          nb::arg("exponential_noise"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("sample"),
+          nb::arg("row_stats"),
+          nb::arg("invalid"),
+          nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
+
+    m.def("softcap_scale", &softcap_scale,
+          "Strict FP32 softcap and inverse-temperature scaling for BF16 logits",
+          nb::arg("raw_logits"),
+          nb::arg("output"),
+          nb::arg("cap"),
+          nb::arg("inverse_temperature"),
+          nb::arg("numel"),
+          nb::arg("stream_ptr"));
+
+    m.def("softcap_categorical_stats_sample", &softcap_categorical_stats_sample,
+          "Strict BF16 softcap, self-conditioning cast, categorical stats, and sample",
+          nb::arg("raw_logits"),
+          nb::arg("exponential_noise"),
+          nb::arg("processed_logits"),
+          nb::arg("self_conditioning_logits"),
+          nb::arg("entropy"),
+          nb::arg("argmax"),
+          nb::arg("sample"),
+          nb::arg("invalid"),
+          nb::arg("cap"),
+          nb::arg("inverse_temperature"),
+          nb::arg("vocab_size"),
+          nb::arg("stream_ptr"));
     
     m.def("cublas_gemm_blockwise_fp4", &cublas_gemm_blockwise_fp4,
           "cuBLAS FP4 GEMM with block-wise scaling",
@@ -2210,6 +3326,88 @@ NB_MODULE(_C, m) {
           nb::arg("workspace"),
           nb::arg("accumulate"),
           nb::arg("alpha"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_gemm_nvfp4", &cutlass_grouped_gemm_nvfp4,
+          "CUTLASS SM120 grouped NVFP4 GEMM with one fixed-size activation bucket per expert",
+          nb::arg("a"),
+          nb::arg("block_scale_a"),
+          nb::arg("b"),
+          nb::arg("block_scale_b"),
+          nb::arg("out"),
+          nb::arg("alpha"),
+          nb::arg("workspace"),
+          nb::arg("group_m"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_gemm_nvfp4_variable", &cutlass_grouped_gemm_nvfp4_variable,
+          "CUTLASS SM120 grouped NVFP4 GEMM with per-expert activation row counts",
+          nb::arg("a"),
+          nb::arg("block_scale_a"),
+          nb::arg("b"),
+          nb::arg("block_scale_b"),
+          nb::arg("m_indptr"),
+          nb::arg("out"),
+          nb::arg("alpha"),
+          nb::arg("workspace"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_gemm_mxfp8", &cutlass_grouped_gemm_mxfp8,
+          "CUTLASS SM120 grouped MXFP8 GEMM with one fixed-size activation bucket per expert",
+          nb::arg("activations"),
+          nb::arg("activation_scales"),
+          nb::arg("weights"),
+          nb::arg("weight_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("group_m"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_mxfp8", &cutlass_fused_moe_mxfp8,
+          "Native SM120 routed MXFP8 MoE with GEGLU and weighted reduction",
+          nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("router_weights"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_block_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_block_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_mxfp8_scaled", &cutlass_fused_moe_mxfp8_scaled,
+          "Native SM120 MXFP8 MoE with fused expert scaling and ID conversion",
+          nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("normalized_router_weights"),
+          nb::arg("expert_scale"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_block_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_block_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_nvfp4", &cutlass_fused_moe_nvfp4,
+          "Native SM120 routed NVFP4 MoE with GEGLU and weighted reduction",
+          nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("router_weights"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_block_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_block_scales"),
+          nb::arg("input_decode_scale"),
+          nb::arg("intermediate_decode_scale"),
+          nb::arg("alpha1"),
+          nb::arg("alpha2"),
+          nb::arg("output"),
+          nb::arg("workspace"),
           nb::arg("stream_ptr"));
 
     m.def("cublas_gemm_int8", &cublas_gemm_int8,
@@ -2496,6 +3694,36 @@ NB_MODULE(_C, m) {
           nb::arg("pad_32x") = false,
           nb::arg("stream_ptr"));
 
+    m.def("gelu_tanh_multiply_quantize_mxfp8",
+          &gelu_tanh_multiply_quantize_mxfp8,
+          "Apply tanh GELU, multiply, and quantize to MXFP8 in one kernel",
+          nb::arg("gate"),
+          nb::arg("up"),
+          nb::arg("output"),
+          nb::arg("block_scales"),
+          nb::arg("pad_32x") = false,
+          nb::arg("stream_ptr"));
+
+    m.def("mxfp8_embedding", &mxfp8_embedding,
+          "Dequantize selected MXFP8 embedding rows without materializing the full matrix",
+          nb::arg("qweight"),
+          nb::arg("block_scales"),
+          nb::arg("indices"),
+          nb::arg("output"),
+          nb::arg("invalid"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("mxfp8_weighted_embedding", &mxfp8_weighted_embedding,
+          "Multiply BF16 probabilities by an MXFP8 embedding into FP32",
+          nb::arg("qweight"),
+          nb::arg("block_scales"),
+          nb::arg("weights"),
+          nb::arg("partials"),
+          nb::arg("output"),
+          nb::arg("split_k"),
+          nb::arg("stream_ptr"));
+
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
           "SVDQuant W4A4: smooth + int4 quantize (LoRA-down is external). "
           "act_unsigned selects scale=max/15 + clamp [0,15] for u4 MMA downstream; "
@@ -2553,9 +3781,14 @@ NB_MODULE(_C, m) {
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();
+#ifdef COMFY_HAVE_CUTLASS
+    m.attr("HAS_CUTLASS") = true;
+#else
+    m.attr("HAS_CUTLASS") = false;
+#endif
 
     // Add version info
-    m.attr("__version__") = "0.1.0";
+    m.attr("__version__") = "0.2.19";
     m.attr("__nanobind__") = true;
     m.attr("__stable_abi__") = true;
 }

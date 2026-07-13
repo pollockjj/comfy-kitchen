@@ -104,7 +104,12 @@ set(CUDA_SOURCES
     ops/per_tensor_quantize.cu
     ops/quantize_nvfp4.cu
     ops/quantize_mxfp8.cu
+    ops/mxfp8_embedding.cu
     ops/cublas_gemm_nvfp4.cu
+    ops/cutlass_grouped_gemm_nvfp4.cu
+    ops/cutlass_grouped_gemm_mxfp8.cu
+    ops/cutlass_fused_moe_nvfp4.cu
+    ops/cutlass_fused_moe_mxfp8.cu
     ops/cublas_gemm_int8.cu
     ops/cutlass_gemm_int8.cu
     ops/turing_int8.cu
@@ -117,6 +122,30 @@ set(CUDA_SOURCES
     ops/scaled_mm_svdquant_w4a4.cu
     ops/awq_w4a16.cu
     ops/adaln.cu
+    ops/categorical_stats.cu
+)
+
+# DiffusionGemma self-conditioning and GELU parity require strict FP32 behavior.
+# Compile those kernels separately because the other CUDA kernels use
+# --use_fast_math globally.
+set(STRICT_CUDA_NVCC_FLAGS ${CUDA_NVCC_FLAGS})
+list(REMOVE_ITEM STRICT_CUDA_NVCC_FLAGS --use_fast_math)
+list(APPEND STRICT_CUDA_NVCC_FLAGS --ftz=false --prec-div=true --prec-sqrt=true)
+add_library(comfy_kitchen_strict_cuda OBJECT
+    ops/softcap_scale.cu
+    ops/gelu_tanh_multiply_quantize_mxfp8.cu
+    ops/mxfp8_weighted_embedding.cu
+)
+set_target_properties(comfy_kitchen_strict_cuda PROPERTIES
+    POSITION_INDEPENDENT_CODE ON
+    CUDA_ARCHITECTURES "${COMFY_CUDA_ARCHS}"
+)
+target_compile_options(comfy_kitchen_strict_cuda PRIVATE
+    $<$<COMPILE_LANGUAGE:CUDA>:${STRICT_CUDA_NVCC_FLAGS}>
+)
+target_include_directories(comfy_kitchen_strict_cuda PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}
+    ${CUDAToolkit_INCLUDE_DIRS}
 )
 
 set(CPP_SOURCES
@@ -141,6 +170,8 @@ else()
     nanobind_add_module(_C NB_STATIC LTO ${CPP_SOURCES} ${CUDA_SOURCES})
 endif()
 
+target_sources(_C PRIVATE $<TARGET_OBJECTS:comfy_kitchen_strict_cuda>)
+
 target_compile_definitions(_C PRIVATE NB_STATIC)
 
 # Set target properties
@@ -162,7 +193,11 @@ if(NOT DEFINED COMFY_CUTLASS_DIR)
 endif()
 if(EXISTS "${COMFY_CUTLASS_DIR}/cutlass/version.h")
     message(STATUS "CUTLASS found: ${COMFY_CUTLASS_DIR}")
-    target_include_directories(_C PRIVATE ${COMFY_CUTLASS_DIR})
+    get_filename_component(COMFY_CUTLASS_ROOT "${COMFY_CUTLASS_DIR}" DIRECTORY)
+    target_include_directories(_C PRIVATE
+        ${COMFY_CUTLASS_DIR}
+        ${COMFY_CUTLASS_ROOT}/tools/util/include
+    )
     target_compile_definitions(_C PRIVATE COMFY_HAVE_CUTLASS)
 else()
     message(STATUS "CUTLASS not found at ${COMFY_CUTLASS_DIR} - int8 GEMM uses cuBLAS only")

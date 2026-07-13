@@ -208,4 +208,3 @@ void launch_quantize_mxfp8_kernel(
 }
 
 } // extern "C"
-

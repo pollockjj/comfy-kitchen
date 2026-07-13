@@ -30,6 +30,10 @@ __all__ = [
     "rms_rope1",
     "rms_rope_split_half",
     "rms_rope_split_half1",
+    "categorical_stats",
+    "categorical_stats_sample",
+    "softcap_scale",
+    "softcap_categorical_stats_sample",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "dequantize_int8_simple",
@@ -51,11 +55,25 @@ __all__ = [
     "quantize_int8_rowwise_convrot64",
     "quantize_and_rotate_rowwise",
     "gemv_awq_w4a16",
+    "mxfp8_embedding",
+    "mxfp8_weighted_embedding",
+    "gelu_tanh_multiply_quantize_mxfp8",
     "quantize_mxfp8",
     "quantize_nvfp4",
     "quantize_per_tensor_fp8",
     "quantize_svdquant_w4a4",
     "scaled_mm_nvfp4",
+    "grouped_scaled_mm_nvfp4",
+    "grouped_scaled_mm_mxfp8",
+    "fused_moe_nvfp4",
+    "fused_moe_mxfp8",
+    "fused_moe_mxfp8_scaled",
+    "CudaGraph",
+    "begin_cuda_graph_capture",
+    "end_cuda_graph_capture",
+    "abort_cuda_graph_capture",
+    "reserve_stream_workspaces",
+    "release_stream_workspaces",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
 ]
@@ -159,7 +177,9 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 )
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
+_CUTLASS_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUTLASS", False)
 _cublas_workspaces: dict[int, torch.Tensor] = {}
+_fused_moe_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
@@ -341,6 +361,93 @@ def get_cublas_workspace() -> torch.Tensor:
     return workspace
 
 
+def _get_fused_moe_workspace(x: torch.Tensor, stream_ptr: int) -> torch.Tensor:
+    device_index = x.device.index if x.device.index is not None else torch.cuda.current_device()
+    key = (device_index, int(stream_ptr))
+    workspace = _fused_moe_workspaces.get(key)
+    if workspace is None:
+        workspace = torch.empty(64 * 1024 * 1024, dtype=torch.uint8, device=x.device)
+        _fused_moe_workspaces[key] = workspace
+    return workspace
+
+
+def _stream_workspace_key(stream: torch.cuda.Stream) -> tuple[int, int]:
+    if not isinstance(stream, torch.cuda.Stream):
+        raise TypeError("stream must be a torch.cuda.Stream")
+    device = stream.device
+    device_index = device.index if isinstance(device, torch.device) else int(device)
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    return device_index, int(stream.cuda_stream)
+
+
+class CudaGraph:
+    """Executable CUDA Runtime graph with explicit replay and lifetime control."""
+
+    __slots__ = ("_graph_exec",)
+
+    def __init__(self, graph_exec: object):
+        self._graph_exec = graph_exec
+
+    @property
+    def valid(self) -> bool:
+        """Return whether this graph still owns an executable CUDA graph."""
+        return bool(self._graph_exec.valid)
+
+    def replay(self, stream: torch.cuda.Stream) -> None:
+        """Launch this graph asynchronously on ``stream``."""
+        self._graph_exec.replay(_stream_workspace_key(stream)[1])
+
+    def reset(self) -> None:
+        """Wait for submitted replays, then destroy the graph and release retained objects."""
+        self._graph_exec.reset()
+
+
+def _require_cuda_graph_extension() -> None:
+    if not _EXT_AVAILABLE:
+        raise RuntimeError(f"Comfy Kitchen CUDA extension is unavailable: {_EXT_ERROR}")
+
+
+def begin_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """Begin thread-local CUDA Runtime graph capture on ``stream``."""
+    _require_cuda_graph_extension()
+    _C.begin_cuda_graph_capture(_stream_workspace_key(stream)[1])
+
+
+def end_cuda_graph_capture(
+    stream: torch.cuda.Stream,
+    *captured_objects: object,
+) -> CudaGraph:
+    """End capture, retaining ``captured_objects`` until the graph is reset."""
+    _require_cuda_graph_extension()
+    graph_exec = _C.end_cuda_graph_capture(
+        _stream_workspace_key(stream)[1], captured_objects
+    )
+    return CudaGraph(graph_exec)
+
+
+def abort_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    """End and destroy an active capture without instantiating it."""
+    _require_cuda_graph_extension()
+    _C.abort_cuda_graph_capture(_stream_workspace_key(stream)[1])
+
+
+def reserve_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Reserve cached workspaces before a caller captures work on a CUDA stream."""
+    key = _stream_workspace_key(stream)
+    if key in _fused_moe_workspaces:
+        return False
+    _fused_moe_workspaces[key] = torch.empty(
+        64 * 1024 * 1024, dtype=torch.uint8, device=torch.device("cuda", key[0])
+    )
+    return True
+
+
+def release_stream_workspaces(stream: torch.cuda.Stream) -> bool:
+    """Release cached workspaces owned by a synchronized CUDA stream."""
+    return _fused_moe_workspaces.pop(_stream_workspace_key(stream), None) is not None
+
+
 def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
     key = (device.type, device.index, dtype)
     empty = _empty_cuda_tensors.get(key)
@@ -383,6 +490,145 @@ def _wrap_for_dlpack(tensor: torch.Tensor):
     if tensor.requires_grad:
         tensor = tensor.detach()
     return tensor.__dlpack__(stream=-1)
+
+
+def categorical_stats(
+    logits: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute categorical probabilities, entropy, and argmax on CUDA."""
+    if logits.dtype != torch.float32 or logits.ndim != 2 or not logits.is_contiguous():
+        raise ValueError("categorical_stats requires contiguous 2D float32 logits")
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("categorical_stats requires non-empty rows and vocabulary")
+
+    rows, vocab_size = logits.shape
+    probs = torch.empty_like(logits)
+    entropy = torch.empty((rows,), dtype=torch.float32, device=logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    row_stats = torch.empty((rows, 2), dtype=torch.float32, device=logits.device)
+    stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
+    _C.categorical_stats(
+        _wrap_for_dlpack(logits),
+        _wrap_for_dlpack(probs),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(row_stats),
+        vocab_size,
+        stream_ptr,
+    )
+    return probs, entropy, argmax
+
+
+def categorical_stats_sample(
+    logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Compute categorical entropy, argmax, and an exponential-race sample on CUDA."""
+    if (
+        logits.dtype != torch.float32
+        or exponential_noise.dtype != torch.float32
+        or logits.ndim != 2
+        or exponential_noise.shape != logits.shape
+        or not logits.is_contiguous()
+        or not exponential_noise.is_contiguous()
+    ):
+        raise ValueError("categorical_stats_sample requires matching contiguous 2D float32 tensors")
+    if exponential_noise.device != logits.device:
+        raise ValueError("categorical_stats_sample requires logits and noise on the same CUDA device")
+    if logits.shape[0] == 0 or logits.shape[1] == 0:
+        raise ValueError("categorical_stats_sample requires non-empty rows and vocabulary")
+
+    rows, vocab_size = logits.shape
+    entropy = torch.empty((rows,), dtype=torch.float32, device=logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    sample = torch.empty((rows,), dtype=torch.int64, device=logits.device)
+    row_stats = torch.empty((rows, 2), dtype=torch.float32, device=logits.device)
+    invalid = torch.zeros((), dtype=torch.int32, device=logits.device)
+    stream_ptr = torch.cuda.current_stream(logits.device).cuda_stream
+    _C.categorical_stats_sample(
+        _wrap_for_dlpack(logits),
+        _wrap_for_dlpack(exponential_noise),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(sample),
+        _wrap_for_dlpack(row_stats),
+        _wrap_for_dlpack(invalid),
+        vocab_size,
+        stream_ptr,
+    )
+    return entropy, argmax, sample, invalid
+
+
+def softcap_scale(
+    raw_logits: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> torch.Tensor:
+    """Apply strict-math FP32 softcapping and inverse-temperature scaling."""
+    if raw_logits.dtype != torch.bfloat16 or not raw_logits.is_contiguous():
+        raise ValueError("CUDA softcap_scale requires contiguous bfloat16 logits")
+    if raw_logits.numel() == 0:
+        raise ValueError("softcap_scale requires non-empty logits")
+
+    output = torch.empty_like(raw_logits, dtype=torch.float32)
+    stream_ptr = torch.cuda.current_stream(raw_logits.device).cuda_stream
+    _C.softcap_scale(
+        _wrap_for_dlpack(raw_logits),
+        _wrap_for_dlpack(output),
+        cap,
+        inverse_temperature,
+        raw_logits.numel(),
+        stream_ptr,
+    )
+    return output
+
+
+def softcap_categorical_stats_sample(
+    raw_logits: torch.Tensor,
+    exponential_noise: torch.Tensor,
+    cap: float,
+    inverse_temperature: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Fuse strict BF16 softcapping, self-conditioning, stats, and sampling."""
+    if (
+        raw_logits.dtype != torch.bfloat16
+        or exponential_noise.dtype != torch.float32
+        or raw_logits.ndim != 2
+        or exponential_noise.shape != raw_logits.shape
+        or not raw_logits.is_contiguous()
+        or not exponential_noise.is_contiguous()
+    ):
+        raise ValueError(
+            "softcap_categorical_stats_sample requires matching contiguous BF16/FP32 2D tensors"
+        )
+    if exponential_noise.device != raw_logits.device:
+        raise ValueError("softcap_categorical_stats_sample tensors must share one CUDA device")
+    if raw_logits.shape[0] == 0 or raw_logits.shape[1] == 0:
+        raise ValueError("softcap_categorical_stats_sample requires non-empty rows and vocabulary")
+
+    rows, vocab_size = raw_logits.shape
+    processed_logits = torch.empty_like(raw_logits, dtype=torch.float32)
+    self_conditioning_logits = torch.empty_like(raw_logits)
+    entropy = torch.empty((rows,), dtype=torch.float32, device=raw_logits.device)
+    argmax = torch.empty((rows,), dtype=torch.int64, device=raw_logits.device)
+    sample = torch.empty((rows,), dtype=torch.int64, device=raw_logits.device)
+    invalid = torch.zeros((), dtype=torch.int32, device=raw_logits.device)
+    stream_ptr = torch.cuda.current_stream(raw_logits.device).cuda_stream
+    _C.softcap_categorical_stats_sample(
+        _wrap_for_dlpack(raw_logits),
+        _wrap_for_dlpack(exponential_noise),
+        _wrap_for_dlpack(processed_logits),
+        _wrap_for_dlpack(self_conditioning_logits),
+        _wrap_for_dlpack(entropy),
+        _wrap_for_dlpack(argmax),
+        _wrap_for_dlpack(sample),
+        _wrap_for_dlpack(invalid),
+        cap,
+        inverse_temperature,
+        vocab_size,
+        stream_ptr,
+    )
+    return processed_logits, self_conditioning_logits, entropy, argmax, sample, invalid
 
 
 def quantize_per_tensor_fp8(
@@ -1486,6 +1732,151 @@ def quantize_mxfp8(
     return qx, sx
 
 
+def gelu_tanh_multiply_quantize_mxfp8(
+    gate: torch.Tensor,
+    up: torch.Tensor,
+    pad_32x: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply tanh GELU, multiply by ``up``, and quantize the result to MXFP8."""
+    if gate.shape != up.shape or gate.dtype != up.dtype or gate.device != up.device:
+        raise ValueError("gate and up tensors must have identical shape, dtype, and device")
+    if gate.dtype not in (torch.float16, torch.bfloat16) or gate.ndim != 2:
+        raise ValueError("fused GELU MXFP8 quantization requires 2D float16 or bfloat16 inputs")
+    if not gate.is_contiguous() or not up.is_contiguous():
+        raise ValueError("gate and up tensors must be contiguous")
+
+    orig_rows, orig_cols = gate.shape
+    if pad_32x:
+        num_rows = roundup(orig_rows, 32)
+        num_cols = roundup(orig_cols, 32)
+    else:
+        num_rows, num_cols = orig_rows, orig_cols
+        if num_rows % 32 != 0 or num_cols % 32 != 0:
+            raise ValueError("gate and up dimensions must be divisible by 32 unless pad_32x is true")
+
+    qx = torch.empty(
+        (num_rows, num_cols), device=gate.device, dtype=torch.float8_e4m3fn)
+    scale_rows = roundup(num_rows, 128)
+    scale_cols = roundup(num_cols // 32, 4)
+    sx_uint8 = torch.zeros(
+        (scale_rows, scale_cols), device=gate.device, dtype=torch.uint8)
+    stream_ptr = torch.cuda.current_stream(gate.device).cuda_stream
+    _C.gelu_tanh_multiply_quantize_mxfp8(
+        _wrap_for_dlpack(gate),
+        _wrap_for_dlpack(up),
+        _wrap_for_dlpack(qx),
+        _wrap_for_dlpack(sx_uint8),
+        pad_32x,
+        stream_ptr,
+    )
+    return qx, sx_uint8.view(torch.float8_e8m0fnu)
+
+
+def mxfp8_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    indices: torch.Tensor,
+    output_type: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Dequantize selected rows from a native MXFP8 embedding matrix."""
+    if (
+        qweight.dtype != torch.float8_e4m3fn
+        or block_scales.dtype != torch.float8_e8m0fnu
+        or qweight.ndim != 2
+        or block_scales.ndim != 2
+        or indices.ndim != 1
+        or indices.dtype not in (torch.int32, torch.int64)
+        or not qweight.is_contiguous()
+        or not block_scales.is_contiguous()
+        or not indices.is_contiguous()
+    ):
+        raise ValueError(
+            "mxfp8_embedding requires contiguous 2D E4M3 weights, 2D E8M0 scales, "
+            "and 1D int32/int64 indices"
+        )
+    if qweight.device != block_scales.device or qweight.device != indices.device:
+        raise ValueError("mxfp8_embedding tensors must share one CUDA device")
+    if qweight.shape[0] == 0 or qweight.shape[1] == 0 or indices.numel() == 0:
+        raise ValueError("mxfp8_embedding requires non-empty weights and indices")
+    if qweight.shape[1] % 32 != 0:
+        raise ValueError("mxfp8_embedding requires embedding_dim divisible by 32")
+    if output_type not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("mxfp8_embedding output_type must be float32, float16, or bfloat16")
+
+    output = torch.empty(
+        (indices.numel(), qweight.shape[1]),
+        dtype=output_type,
+        device=qweight.device,
+    )
+    invalid = torch.empty((), dtype=torch.int32, device=qweight.device)
+    stream_ptr = torch.cuda.current_stream(qweight.device).cuda_stream
+    _C.mxfp8_embedding(
+        _wrap_for_dlpack(qweight.view(torch.uint8)),
+        _wrap_for_dlpack(block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(indices),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(invalid),
+        DTYPE_TO_CODE[output_type],
+        stream_ptr,
+    )
+    return output, invalid
+
+
+def mxfp8_weighted_embedding(
+    qweight: torch.Tensor,
+    block_scales: torch.Tensor,
+    weights: torch.Tensor,
+) -> torch.Tensor:
+    """Direct BF16-by-MXFP8 matrix product with FP32 accumulation."""
+    if (
+        qweight.dtype != torch.float8_e4m3fn
+        or block_scales.dtype != torch.float8_e8m0fnu
+        or weights.dtype != torch.bfloat16
+        or qweight.ndim != 2
+        or block_scales.ndim != 2
+        or weights.ndim != 2
+        or not qweight.is_contiguous()
+        or not block_scales.is_contiguous()
+        or not weights.is_contiguous()
+    ):
+        raise ValueError(
+            "mxfp8_weighted_embedding requires contiguous 2D E4M3 weights, "
+            "2D E8M0 scales, and 2D BF16 probabilities"
+        )
+    if qweight.device != block_scales.device or qweight.device != weights.device:
+        raise ValueError("mxfp8_weighted_embedding tensors must share one CUDA device")
+    k, n = qweight.shape
+    m = weights.shape[0]
+    if weights.shape[1] != k:
+        raise ValueError("mxfp8_weighted_embedding reduction dimensions must match")
+    if m == 0 or k == 0 or n == 0:
+        raise ValueError("mxfp8_weighted_embedding requires non-empty tensors")
+    if m % 64 != 0 or k % 64 != 0 or n % 128 != 0:
+        raise ValueError(
+            "native mxfp8_weighted_embedding requires M%64 == 0, K%64 == 0, N%128 == 0"
+        )
+    scale_rows = roundup(k, 128)
+    scale_cols = roundup(n // 32, 4)
+    if block_scales.numel() < scale_rows * scale_cols:
+        raise ValueError("mxfp8_weighted_embedding block scale storage is too small")
+
+    output = torch.empty((m, n), dtype=torch.float32, device=weights.device)
+    split_k = 9 if (m, k, n) == (256, 262144, 2816) else 1
+    partials = output.unsqueeze(0) if split_k == 1 else torch.empty(
+        (split_k, m, n), dtype=torch.float32, device=weights.device)
+    stream_ptr = torch.cuda.current_stream(weights.device).cuda_stream
+    _C.mxfp8_weighted_embedding(
+        _wrap_for_dlpack(qweight.view(torch.uint8)),
+        _wrap_for_dlpack(block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(partials),
+        _wrap_for_dlpack(output),
+        split_k,
+        stream_ptr,
+    )
+    return output
+
+
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -1611,6 +2002,331 @@ def scaled_mm_nvfp4(
     )
 
     return out
+
+
+def grouped_scaled_mm_nvfp4(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    tensor_scale_a: torch.Tensor,
+    tensor_scale_b: torch.Tensor,
+    block_scale_a: torch.Tensor,
+    block_scale_b: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype,
+    alpha: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run one SM120 CUTLASS NVFP4 GEMM for a fixed token bucket per expert."""
+    if torch.cuda.get_device_capability(a.device) != (12, 0):
+        raise RuntimeError("grouped NVFP4 GEMM currently requires SM120")
+    if a.ndim != 2 or b.ndim != 3:
+        raise ValueError("a must be 2D and b must be a 3D expert bank")
+    groups, n, packed_k = b.shape
+    if a.shape != (groups * group_size, packed_k):
+        raise ValueError("activation shape must be [groups * group_size, packed_k]")
+    if group_size <= 0 or group_size % 128:
+        raise ValueError("group_size must be a positive multiple of 128")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("grouped NVFP4 output must be float16 or bfloat16")
+
+    if alpha is None:
+        alpha = tensor_scale_a * tensor_scale_b
+    alpha = alpha.to(device=a.device, dtype=torch.float32).reshape(-1)
+    if alpha.numel() == 1:
+        alpha = alpha.expand(groups).contiguous()
+    elif alpha.numel() != groups:
+        raise ValueError("alpha must be scalar or contain one value per group")
+    elif not alpha.is_contiguous():
+        alpha = alpha.contiguous()
+
+    out = torch.empty((groups, group_size, n), device=a.device, dtype=out_dtype)
+    stream_ptr = torch.cuda.current_stream(a.device).cuda_stream
+    _C.cutlass_grouped_gemm_nvfp4(
+        _wrap_for_dlpack(a),
+        _wrap_for_dlpack(block_scale_a.view(torch.uint8)),
+        _wrap_for_dlpack(b),
+        _wrap_for_dlpack(block_scale_b.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(alpha),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
+
+
+def grouped_scaled_mm_mxfp8(
+    a_qdata: torch.Tensor,
+    weight_qdata: torch.Tensor,
+    a_block_scales: torch.Tensor,
+    weight_block_scales: torch.Tensor,
+    group_size: int,
+    out_dtype: torch.dtype,
+) -> torch.Tensor:
+    """Run one SM120 CUTLASS MXFP8 GEMM for a fixed token bucket per expert."""
+    if not a_qdata.is_cuda or torch.cuda.get_device_capability(a_qdata.device) != (12, 0):
+        raise RuntimeError("grouped MXFP8 GEMM currently requires CUDA SM120")
+    if a_qdata.dtype != torch.float8_e4m3fn or weight_qdata.dtype != torch.float8_e4m3fn:
+        raise ValueError("grouped MXFP8 qdata must be float8_e4m3fn")
+    if (
+        a_block_scales.dtype != torch.float8_e8m0fnu
+        or weight_block_scales.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("grouped MXFP8 block scales must be float8_e8m0fnu")
+    if a_qdata.ndim != 2 or weight_qdata.ndim != 3:
+        raise ValueError("a_qdata must be 2D and weight_qdata must be a 3D expert bank")
+    groups, n, k = weight_qdata.shape
+    if a_qdata.shape != (groups * group_size, k):
+        raise ValueError("activation shape must be [groups * group_size, K]")
+    if group_size <= 0 or group_size % 128:
+        raise ValueError("group_size must be a positive multiple of 128")
+    if k <= 0 or k % 32:
+        raise ValueError("MXFP8 K must be a positive multiple of 32")
+    if out_dtype not in (torch.float16, torch.bfloat16):
+        raise ValueError("grouped MXFP8 output must be float16 or bfloat16")
+
+    tensors = (a_qdata, weight_qdata, a_block_scales, weight_block_scales)
+    if any(tensor.device != a_qdata.device for tensor in tensors):
+        raise ValueError("all grouped MXFP8 tensors must be on the activation device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all grouped MXFP8 tensors must be contiguous")
+
+    scale_k = roundup(k // 32, 4)
+    scale_n = roundup(n, 128)
+    if a_block_scales.shape != (groups * group_size, scale_k):
+        raise ValueError("grouped MXFP8 activation scale shape mismatch")
+    if weight_block_scales.shape != (groups, scale_n, scale_k):
+        raise ValueError("grouped MXFP8 weight scale shape mismatch")
+
+    out = torch.empty((groups, group_size, n), device=a_qdata.device, dtype=out_dtype)
+    stream_ptr = torch.cuda.current_stream(a_qdata.device).cuda_stream
+    _C.cutlass_grouped_gemm_mxfp8(
+        _wrap_for_dlpack(a_qdata),
+        _wrap_for_dlpack(a_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(weight_qdata),
+        _wrap_for_dlpack(weight_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(out),
+        _wrap_for_dlpack(get_cublas_workspace()),
+        group_size,
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    )
+    return out
+
+
+def fused_moe_nvfp4(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+    input_decode_scale: torch.Tensor,
+    intermediate_decode_scale: torch.Tensor,
+    alpha1: torch.Tensor,
+    alpha2: torch.Tensor,
+) -> torch.Tensor:
+    """Run the native SM120 routed NVFP4 GEGLU pipeline."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device) != (12, 0):
+        raise RuntimeError("fused NVFP4 MoE currently requires CUDA SM120")
+    if x.dtype != torch.bfloat16 or x.ndim != 2 or not x.is_contiguous():
+        raise ValueError("fused NVFP4 MoE input must be contiguous 2D bfloat16")
+    if expert_ids.ndim != 2 or expert_ids.shape[0] != x.shape[0]:
+        raise ValueError("expert_ids must be [num_tokens, top_k]")
+    if (
+        router_weights.dtype != torch.float32
+        or router_weights.shape != expert_ids.shape
+        or not router_weights.is_contiguous()
+    ):
+        raise ValueError("router_weights must be contiguous float32 with the expert_ids shape")
+
+    tensors = (
+        fc1_qdata,
+        fc1_block_scales,
+        fc2_qdata,
+        fc2_block_scales,
+        input_decode_scale,
+        intermediate_decode_scale,
+        alpha1,
+        alpha2,
+    )
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("all fused NVFP4 MoE tensors must be on the input device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all fused NVFP4 MoE tensors must be contiguous")
+    if fc1_qdata.dtype != torch.uint8 or fc2_qdata.dtype != torch.uint8:
+        raise ValueError("fused NVFP4 MoE qdata must be uint8")
+    if (
+        fc1_block_scales.dtype != torch.float8_e4m3fn
+        or fc2_block_scales.dtype != torch.float8_e4m3fn
+    ):
+        raise ValueError("fused NVFP4 MoE block scales must be float8_e4m3fn")
+    if any(
+        tensor.dtype != torch.float32
+        for tensor in (input_decode_scale, intermediate_decode_scale, alpha1, alpha2)
+    ):
+        raise ValueError("fused NVFP4 MoE global scales and alphas must be float32")
+
+    expert_ids_i32 = (
+        expert_ids
+        if expert_ids.dtype == torch.int32 and expert_ids.is_contiguous()
+        else expert_ids.to(dtype=torch.int32).contiguous()
+    )
+    output = torch.empty_like(x)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    workspace = _get_fused_moe_workspace(x, stream_ptr)
+    _C.cutlass_fused_moe_nvfp4(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(expert_ids_i32),
+        _wrap_for_dlpack(router_weights),
+        _wrap_for_dlpack(fc1_qdata),
+        _wrap_for_dlpack(fc1_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(fc2_qdata),
+        _wrap_for_dlpack(fc2_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(input_decode_scale),
+        _wrap_for_dlpack(intermediate_decode_scale),
+        _wrap_for_dlpack(alpha1),
+        _wrap_for_dlpack(alpha2),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
+        stream_ptr,
+    )
+    return output
+
+
+def fused_moe_mxfp8(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run the native SM120 routed MXFP8 GEGLU pipeline."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device) != (12, 0):
+        raise RuntimeError("fused MXFP8 MoE currently requires CUDA SM120")
+    if x.dtype not in (torch.float16, torch.bfloat16) or x.ndim != 2 or not x.is_contiguous():
+        raise ValueError("fused MXFP8 MoE input must be contiguous 2D float16 or bfloat16")
+    if x.shape[0] not in (256, 340) or x.shape[1] != 2816:
+        raise ValueError("fused MXFP8 MoE input shape must be [256|340, 2816]")
+    if expert_ids.shape != (x.shape[0], 8):
+        raise ValueError("expert_ids must be [num_tokens, 8]")
+    if (
+        router_weights.dtype != torch.float32
+        or router_weights.shape != expert_ids.shape
+        or not router_weights.is_contiguous()
+    ):
+        raise ValueError("router_weights must be contiguous float32 with the expert_ids shape")
+
+    tensors = (fc1_qdata, fc1_block_scales, fc2_qdata, fc2_block_scales)
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("all fused MXFP8 MoE tensors must be on the input device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all fused MXFP8 MoE tensors must be contiguous")
+    if fc1_qdata.dtype != torch.float8_e4m3fn or fc2_qdata.dtype != torch.float8_e4m3fn:
+        raise ValueError("fused MXFP8 MoE qdata must be float8_e4m3fn")
+    if (
+        fc1_block_scales.dtype != torch.float8_e8m0fnu
+        or fc2_block_scales.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("fused MXFP8 MoE block scales must be float8_e8m0fnu")
+    if fc1_qdata.shape != (128, 1408, 2816):
+        raise ValueError("fc1_qdata must have shape [128, 1408, 2816]")
+    if fc1_block_scales.shape != (128, 1408, 88):
+        raise ValueError("fc1_block_scales must have shape [128, 1408, 88]")
+    if fc2_qdata.shape != (128, 2816, 704):
+        raise ValueError("fc2_qdata must have shape [128, 2816, 704]")
+    if fc2_block_scales.shape != (128, 2816, 24):
+        raise ValueError("fc2_block_scales must have shape [128, 2816, 24]")
+
+    expert_ids_i32 = (
+        expert_ids
+        if expert_ids.dtype == torch.int32 and expert_ids.is_contiguous()
+        else expert_ids.to(dtype=torch.int32).contiguous()
+    )
+    output = torch.empty_like(x)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    workspace = _get_fused_moe_workspace(x, stream_ptr)
+    _C.cutlass_fused_moe_mxfp8(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(expert_ids_i32),
+        _wrap_for_dlpack(router_weights),
+        _wrap_for_dlpack(fc1_qdata),
+        _wrap_for_dlpack(fc1_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(fc2_qdata),
+        _wrap_for_dlpack(fc2_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
+        stream_ptr,
+    )
+    return output
+
+
+def fused_moe_mxfp8_scaled(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    normalized_router_weights: torch.Tensor,
+    expert_scale: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_block_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_block_scales: torch.Tensor,
+) -> torch.Tensor:
+    """Run native MXFP8 MoE while scaling routes and converting IDs in its workspace."""
+    if not x.is_cuda or torch.cuda.get_device_capability(x.device) != (12, 0):
+        raise RuntimeError("scaled fused MXFP8 MoE currently requires CUDA SM120")
+    if x.dtype not in (torch.float16, torch.bfloat16) or x.ndim != 2 or not x.is_contiguous():
+        raise ValueError("scaled fused MXFP8 MoE input must be contiguous 2D float16 or bfloat16")
+    if x.shape[0] not in (256, 340) or x.shape[1] != 2816:
+        raise ValueError("scaled fused MXFP8 MoE input shape must be [256|340, 2816]")
+    if expert_ids.dtype != torch.int64 or expert_ids.shape != (x.shape[0], 8) or not expert_ids.is_contiguous():
+        raise ValueError("scaled fused MXFP8 expert_ids must be contiguous int64 [num_tokens, 8]")
+    if (
+        normalized_router_weights.dtype != torch.float32
+        or normalized_router_weights.shape != expert_ids.shape
+        or not normalized_router_weights.is_contiguous()
+    ):
+        raise ValueError("normalized_router_weights must be contiguous float32 with the expert_ids shape")
+    if expert_scale.dtype != torch.bfloat16 or expert_scale.shape != (128,) or not expert_scale.is_contiguous():
+        raise ValueError("expert_scale must be contiguous bfloat16 [128]")
+
+    tensors = (expert_ids, normalized_router_weights, expert_scale, fc1_qdata,
+               fc1_block_scales, fc2_qdata, fc2_block_scales)
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("all scaled fused MXFP8 MoE tensors must be on the input device")
+    if any(not tensor.is_contiguous() for tensor in tensors):
+        raise ValueError("all scaled fused MXFP8 MoE tensors must be contiguous")
+    if fc1_qdata.dtype != torch.float8_e4m3fn or fc2_qdata.dtype != torch.float8_e4m3fn:
+        raise ValueError("scaled fused MXFP8 MoE qdata must be float8_e4m3fn")
+    if (
+        fc1_block_scales.dtype != torch.float8_e8m0fnu
+        or fc2_block_scales.dtype != torch.float8_e8m0fnu
+    ):
+        raise ValueError("scaled fused MXFP8 MoE block scales must be float8_e8m0fnu")
+    if fc1_qdata.shape != (128, 1408, 2816) or fc1_block_scales.shape != (128, 1408, 88):
+        raise ValueError("scaled fused MXFP8 MoE gate/up bank shape mismatch")
+    if fc2_qdata.shape != (128, 2816, 704) or fc2_block_scales.shape != (128, 2816, 24):
+        raise ValueError("scaled fused MXFP8 MoE down bank shape mismatch")
+
+    output = torch.empty_like(x)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    workspace = _get_fused_moe_workspace(x, stream_ptr)
+    _C.cutlass_fused_moe_mxfp8_scaled(
+        _wrap_for_dlpack(x),
+        _wrap_for_dlpack(expert_ids),
+        _wrap_for_dlpack(normalized_router_weights),
+        _wrap_for_dlpack(expert_scale),
+        _wrap_for_dlpack(fc1_qdata),
+        _wrap_for_dlpack(fc1_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(fc2_qdata),
+        _wrap_for_dlpack(fc2_block_scales.view(torch.uint8)),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
+        stream_ptr,
+    )
+    return output
 
 
 def int8_linear(
@@ -2440,6 +3156,47 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "categorical_stats": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "categorical_stats_sample": FunctionConstraints(
+            params={
+                "logits": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "softcap_scale": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+        ),
+        "softcap_categorical_stats_sample": FunctionConstraints(
+            params={
+                "raw_logits": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "exponential_noise": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(
@@ -2514,6 +3271,44 @@ def _build_constraints() -> dict:
                 ),
             },
             default_devices=cuda_devices,
+        ),
+        "mxfp8_embedding": FunctionConstraints(
+            params={
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e8m0fnu}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "indices": ParamConstraint(
+                    dtypes=frozenset({torch.int32, torch.int64}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "output_type": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                ),
+            },
+            default_devices=cuda_devices,
+        ),
+        "mxfp8_weighted_embedding": FunctionConstraints(
+            params={
+                "qweight": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e8m0fnu}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "weights": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
         ),
         "dequantize_nvfp4": FunctionConstraints(
             params={
@@ -2942,6 +3737,163 @@ def _build_constraints() -> dict:
             default_devices=cuda_devices,
             min_compute_capability=(10, 0),
         )
+
+    if _CUTLASS_AVAILABLE:
+        constraints["grouped_scaled_mm_nvfp4"] = FunctionConstraints(
+            params={
+                "a": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=16)),
+                ),
+                "b": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(3), DivisibleBy(dim=2, factor=16)),
+                ),
+                "tensor_scale_a": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "tensor_scale_b": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "block_scale_a": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "block_scale_b": ParamConstraint(dtypes=frozenset({torch.float8_e4m3fn})),
+                "group_size": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(dtypes=frozenset({torch.float16, torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(12, 0),
+        )
+        constraints["fused_moe_nvfp4"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_ids": ParamConstraint(
+                    dtypes=frozenset({torch.int32, torch.int64}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "router_weights": ParamConstraint(
+                    dtypes=frozenset({torch.float32}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "fc1_qdata": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "fc1_block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "fc2_qdata": ParamConstraint(
+                    dtypes=frozenset({torch.uint8}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "fc2_block_scales": ParamConstraint(
+                    dtypes=frozenset({torch.float8_e4m3fn}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "input_decode_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "intermediate_decode_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "alpha1": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "alpha2": ParamConstraint(dtypes=frozenset({torch.float32})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(12, 0),
+        )
+        if hasattr(torch, "float8_e8m0fnu"):
+            constraints["grouped_scaled_mm_mxfp8"] = FunctionConstraints(
+                params={
+                    "a_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=32)),
+                    ),
+                    "weight_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3), DivisibleBy(dim=2, factor=32)),
+                    ),
+                    "a_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu})
+                    ),
+                    "weight_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu})
+                    ),
+                    "group_size": ParamConstraint(dtypes=frozenset({int})),
+                    "out_dtype": ParamConstraint(
+                        dtypes=frozenset({torch.float16, torch.bfloat16})
+                    ),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
+            constraints["fused_moe_mxfp8"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(
+                        dtypes=frozenset({torch.float16, torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "expert_ids": ParamConstraint(
+                        dtypes=frozenset({torch.int32, torch.int64}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "router_weights": ParamConstraint(
+                        dtypes=frozenset({torch.float32}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "fc1_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc1_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
+            constraints["fused_moe_mxfp8_scaled"] = FunctionConstraints(
+                params={
+                    "x": ParamConstraint(
+                        dtypes=frozenset({torch.float16, torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "expert_ids": ParamConstraint(
+                        dtypes=frozenset({torch.int64}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "normalized_router_weights": ParamConstraint(
+                        dtypes=frozenset({torch.float32}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "expert_scale": ParamConstraint(
+                        dtypes=frozenset({torch.bfloat16}),
+                        shape_rules=(ExactDims(1),),
+                    ),
+                    "fc1_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc1_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_qdata": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e4m3fn}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                    "fc2_block_scales": ParamConstraint(
+                        dtypes=frozenset({torch.float8_e8m0fnu}),
+                        shape_rules=(ExactDims(3),),
+                    ),
+                },
+                default_devices=cuda_devices,
+                min_compute_capability=(12, 0),
+            )
 
     return constraints
 
