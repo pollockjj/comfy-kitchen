@@ -42,6 +42,8 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "int8_linear",
+    "grouped_int8_convrot_linear",
+    "grouped_int8_convrot_linear_packed",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -273,7 +275,11 @@ def _max_dynamic_shared_memory_per_block(x: torch.Tensor) -> int:
     return getattr(props, "shared_memory_per_block_optin", props.shared_memory_per_block)
 
 
-def _convrot_int8_fused_shared_memory_bytes(m: int, k: int) -> int:
+def _convrot_int8_fused_shared_memory_bytes(m: int, k: int, group_size: int = 256) -> int:
+    if group_size == 64:
+        block_threads = 128
+        groups_in_flight = block_threads // (group_size // 4)
+        return (k + groups_in_flight * 2 * group_size) * 4
     if m == 1:
         block_threads = 512
     elif k == 256:
@@ -311,9 +317,9 @@ def _convrot_int4_fused_shared_memory_bytes(m: int, k: int, group_size: int, dty
 
 
 def _convrot_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: int) -> bool:
-    if not x.is_cuda or group_size != 256:
+    if not x.is_cuda or group_size not in (64, 256):
         return True
-    requested_shared = _convrot_int8_fused_shared_memory_bytes(x.shape[0], k)
+    requested_shared = _convrot_int8_fused_shared_memory_bytes(x.shape[0], k, group_size)
     return requested_shared < _max_dynamic_shared_memory_per_block(x)
 
 
@@ -325,6 +331,8 @@ def _convrot_int4_fused_shared_memory_fits(x: torch.Tensor, k: int, group_size: 
 
 
 def _should_use_convrot_fused_kernel(x: torch.Tensor, k: int, group_size: int) -> bool:
+    if group_size == 64:
+        return k % 64 == 0 and _convrot_fused_shared_memory_fits(x, k, group_size)
     return (
         group_size == 256
         and k % 256 == 0
@@ -1613,8 +1621,8 @@ def quantize_int8_convrot_weight(
     weight_2d = weight.contiguous()
     k = weight_2d.shape[-1]
     if (
-        group_size == 256
-        and k % 256 == 0
+        group_size in (64, 256)
+        and k % group_size == 0
         and 256 <= k <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(weight_2d, k, group_size)
     ):
@@ -2354,9 +2362,9 @@ def int8_linear(
     convrot_m1_supported = (
         m == 1
         and convrot
-        and convrot_groupsize == 256
-        and k % 256 == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and convrot_groupsize in (64, 256)
+        and k % convrot_groupsize == 0
+        and 64 <= k <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
     )
     nonconvrot_m1_supported = (
@@ -2395,9 +2403,9 @@ def int8_linear(
         # 5120 < K < 8192 band loses to the rotate-matmul path on both, so skip
         # it. (Real model hidden dims avoid that band anyway.)
         if (
-            convrot_groupsize == 256
-            and k % 256 == 0
-            and 256 <= k <= _CONVROT_FUSED_MAX_K
+            convrot_groupsize in (64, 256)
+            and k % convrot_groupsize == 0
+            and 64 <= k <= _CONVROT_FUSED_MAX_K
             and _convrot_fused_shared_memory_fits(x_2d, k, convrot_groupsize)
         ):
             x_qdata = torch.empty((m, k), dtype=torch.int8, device=x.device)
@@ -2523,6 +2531,138 @@ def int8_linear(
         )
 
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
+
+
+def grouped_int8_convrot_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dispatch fixed expert buckets through CK's native rank-2 INT8 path."""
+    if x.dim() != 3 or weight.dim() != 3:
+        raise ValueError("Grouped INT8 ConvRot expects x [E, C, K] and weight [E, N, K]")
+    if x.shape[0] != weight.shape[0] or x.shape[2] != weight.shape[2]:
+        raise ValueError(f"Grouped INT8 ConvRot shape mismatch: x {tuple(x.shape)}, weight {tuple(weight.shape)}")
+    expected_scales = weight.shape[:2]
+    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
+        raise ValueError(f"Grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
+    if convrot_groupsize not in (64, 256) or x.shape[2] % convrot_groupsize != 0:
+        raise ValueError("Grouped INT8 ConvRot requires group size 64 or 256 dividing K")
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("Grouped INT8 ConvRot input must be float32, float16, or bfloat16")
+    if weight.dtype != torch.int8 or weight_scale.dtype != torch.float32:
+        raise ValueError("Grouped INT8 ConvRot requires int8 weights and float32 scales")
+    if weight.device != x.device or weight_scale.device != x.device:
+        raise ValueError("Grouped INT8 ConvRot tensors must share one CUDA device")
+
+    experts, bucket, k = x.shape
+    n = weight.shape[1]
+    x_flat = x.reshape(experts * bucket, k)
+    if not x_flat.is_contiguous():
+        x_flat = x_flat.contiguous()
+    qdata_flat = torch.empty_like(x_flat, dtype=torch.int8)
+    activation_scales_flat = torch.empty(
+        (experts * bucket, 1), dtype=torch.float32, device=x.device
+    )
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int8_rowwise_convrot64(
+        _wrap_for_dlpack(x_flat),
+        _wrap_for_dlpack(qdata_flat),
+        _wrap_for_dlpack(activation_scales_flat),
+        convrot_groupsize,
+        False,
+        0,
+        stream_ptr,
+    )
+
+    qdata = qdata_flat.view(experts, bucket, k)
+    weights = weight if weight.is_contiguous() else weight.contiguous()
+    activation_scales = activation_scales_flat.view(experts, bucket)
+    weight_scales = weight_scale.reshape(experts, n).contiguous()
+    output = torch.empty((experts, bucket, n), dtype=out_dtype, device=x.device)
+    if not _C.cutlass_grouped_int8_dequant(
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(activation_scales),
+        _wrap_for_dlpack(weight_scales),
+        _wrap_for_dlpack(output),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    ):
+        raise RuntimeError("Native grouped INT8 ConvRot CUTLASS GEMM is unavailable")
+    return output
+
+
+def grouped_int8_convrot_linear_packed(
+    x: torch.Tensor,
+    expert_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Dispatch packed expert rows through a variable-M CUTLASS INT8 GEMM."""
+    if x.dim() != 2 or weight.dim() != 3:
+        raise ValueError("Packed grouped INT8 ConvRot expects x [R, K] and weight [E, N, K]")
+    experts, n, k = weight.shape
+    if x.shape[1] != k:
+        raise ValueError(f"Packed grouped INT8 ConvRot shape mismatch: x {tuple(x.shape)}, weight {tuple(weight.shape)}")
+    if expert_indptr.dim() != 1 or expert_indptr.numel() != experts + 1:
+        raise ValueError("Packed grouped INT8 ConvRot indptr must be [E + 1]")
+    if expert_indptr.dtype != torch.int32:
+        raise ValueError("Packed grouped INT8 ConvRot indptr must be int32")
+    expected_scales = weight.shape[:2]
+    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
+        raise ValueError(f"Packed grouped INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
+    if convrot_groupsize not in (64, 256) or k % convrot_groupsize != 0:
+        raise ValueError("Packed grouped INT8 ConvRot requires group size 64 or 256 dividing K")
+    if x.dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("Packed grouped INT8 ConvRot input must be float32, float16, or bfloat16")
+    if weight.dtype != torch.int8 or weight_scale.dtype != torch.float32:
+        raise ValueError("Packed grouped INT8 ConvRot requires int8 weights and float32 scales")
+    if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
+        raise ValueError("Packed grouped INT8 ConvRot output must be float32, float16, or bfloat16")
+    tensors = (expert_indptr, weight, weight_scale)
+    if any(tensor.device != x.device for tensor in tensors):
+        raise ValueError("Packed grouped INT8 ConvRot tensors must share one CUDA device")
+
+    activations = x if x.is_contiguous() else x.contiguous()
+    weights = weight if weight.is_contiguous() else weight.contiguous()
+    indptr = expert_indptr if expert_indptr.is_contiguous() else expert_indptr.contiguous()
+    weight_scales = weight_scale.reshape(experts, n).contiguous()
+    rows = activations.shape[0]
+    qdata = torch.empty_like(activations, dtype=torch.int8)
+    activation_scales = torch.empty((rows, 1), dtype=torch.float32, device=x.device)
+    output = torch.empty((rows, n), dtype=out_dtype, device=x.device)
+    accumulator = torch.empty((rows, n), dtype=torch.int32, device=x.device)
+    workspace_bytes = _C.cutlass_grouped_int8_dequant_packed_workspace_bytes(experts, rows)
+    workspace = torch.empty(max(1, workspace_bytes), dtype=torch.uint8, device=x.device)
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.quantize_int8_rowwise_convrot64(
+        _wrap_for_dlpack(activations),
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(activation_scales),
+        convrot_groupsize,
+        False,
+        0,
+        stream_ptr,
+    )
+    if not _C.cutlass_grouped_int8_dequant_packed(
+        _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(weights),
+        _wrap_for_dlpack(activation_scales),
+        _wrap_for_dlpack(weight_scales),
+        _wrap_for_dlpack(indptr),
+        _wrap_for_dlpack(accumulator),
+        _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
+        DTYPE_TO_CODE[out_dtype],
+        stream_ptr,
+    ):
+        raise RuntimeError("Native packed grouped INT8 ConvRot CUTLASS GEMM is unavailable")
+    return output
 
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
@@ -3707,6 +3847,48 @@ def _build_constraints() -> dict:
             },
             default_devices=cuda_devices,
             min_compute_capability=(7, 5),
+        )
+        constraints["grouped_int8_convrot_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        )
+        constraints["grouped_int8_convrot_linear_packed"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+                "expert_indptr": ParamConstraint(
+                    dtypes=frozenset({torch.int32}),
+                    shape_rules=(ExactDims(1),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.int8}),
+                    shape_rules=(ExactDims(3),),
+                ),
+                "weight_scale": ParamConstraint(dtypes=frozenset({torch.float32})),
+                "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+                "out_dtype": ParamConstraint(
+                    dtypes=frozenset({torch.float32, torch.float16, torch.bfloat16})
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
         )
         constraints["scaled_mm_nvfp4"] = FunctionConstraints(
             params={

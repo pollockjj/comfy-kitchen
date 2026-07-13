@@ -15,6 +15,7 @@
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
 #include <climits>
+#include <cstddef>
 #include <cstdint>
 
 #ifdef COMFY_HAVE_CUTLASS
@@ -24,7 +25,10 @@
 #include <mutex>
 
 #include "cutlass/cutlass.h"
+#include "cutlass/epilogue/thread/linear_combination.h"
+#include "cutlass/gemm/device/gemm_grouped.h"
 #include "cutlass/gemm/device/gemm_universal_adapter.h"
+#include "cutlass/gemm/kernel/default_gemm_grouped.h"
 #include "cutlass/gemm/kernel/default_gemm_universal_with_visitor.h"
 #include "cutlass/epilogue/threadblock/fusion/visitors.hpp"
 
@@ -182,6 +186,27 @@ struct FusedInt8GemmNoBias {
             cutlass::gemm::GemmUniversalMode::kGemm, problem, 1, cb,
             const_cast<int8_t*>(A), const_cast<int8_t*>(B), nullptr, nullptr,
             (int64_t)M * K, (int64_t)N * K, 0, 0, K, K, 0, 0);
+
+        Gemm gemm;
+        if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
+        if (Gemm::get_workspace_size(args) != 0) return false;
+        if (gemm.initialize(args, nullptr, stream) != cutlass::Status::kSuccess) return false;
+        return gemm(stream) == cutlass::Status::kSuccess;
+    }
+
+    static bool run_batched(const int8_t* A, const int8_t* B, const float* xs,
+                            const float* ws, ElementOutput* D, int groups, int M,
+                            int N, int K, cudaStream_t stream) {
+        cutlass::gemm::GemmCoord problem(M, N, K);
+        typename EVTD::Arguments cb{
+            { { {}, {const_cast<float*>(xs), 0.f, {_1{}, _0{}, M}}, {} },
+              {const_cast<float*>(ws), 0.f, {_0{}, _1{}, N}}, {} },
+            {D, {N, _1{}, M * N}} };
+        typename Gemm::Arguments args(
+            cutlass::gemm::GemmUniversalMode::kBatched, problem, groups, cb,
+            const_cast<int8_t*>(A), const_cast<int8_t*>(B), nullptr, nullptr,
+            static_cast<int64_t>(M) * K, static_cast<int64_t>(N) * K, 0, 0,
+            K, K, 0, 0);
 
         Gemm gemm;
         if (gemm.can_implement(args) != cutlass::Status::kSuccess) return false;
@@ -389,7 +414,277 @@ bool dispatch_fused_no_bias_strided(const int8_t* A, const int8_t* B, const floa
     if (best < 0) return false;
     return runners[best](A, B, xs, ws, D, M, N, K, output_stride, stream);
 }
+
+template <typename OutT>
+bool dispatch_fused_no_bias_batched(
+    const int8_t* A, const int8_t* B, const float* xs, const float* ws,
+    OutT* D, int groups, int M, int N, int K, cudaStream_t stream) {
+    using Fn = bool (*)(
+        const int8_t*, const int8_t*, const float*, const float*, OutT*,
+        int, int, int, int, cudaStream_t);
+    static const Fn small_m_runners[] = {
+        &FusedInt8GemmNoBias<OutT,  64, 128, 64, 32, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 128, 64, 64, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 256, 64, 64, 64, 64, 3>::run_batched,
+    };
+    static const Fn large_m_runners[] = {
+        &FusedInt8GemmNoBias<OutT, 128, 128, 64, 64, 64, 64, 4>::run_batched,
+        &FusedInt8GemmNoBias<OutT, 128, 256, 64, 64, 64, 64, 3>::run_batched,
+        &FusedInt8GemmNoBias<OutT,  64, 128, 64, 32, 64, 64, 4>::run_batched,
+    };
+    const Fn* runners = M <= 64 ? small_m_runners : large_m_runners;
+    for (int index = 0; index < 3; ++index) {
+        if (runners[index](A, B, xs, ws, D, groups, M, N, K, stream)) {
+            return true;
+        }
+    }
+    return false;
+}
 }  // namespace
+
+namespace packed_int8 {
+
+using PackedInt8Epilogue = cutlass::epilogue::thread::LinearCombination<
+    int32_t, 4, int32_t, int32_t>;
+using PackedInt8Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
+    int8_t,
+    cutlass::layout::RowMajor,
+    cutlass::ComplexTransform::kNone,
+    16,
+    int8_t,
+    cutlass::layout::ColumnMajor,
+    cutlass::ComplexTransform::kNone,
+    16,
+    int32_t,
+    cutlass::layout::RowMajor,
+    int32_t,
+    cutlass::arch::OpClassTensorOp,
+    cutlass::arch::Sm80,
+    cutlass::gemm::GemmShape<64, 128, 64>,
+    cutlass::gemm::GemmShape<32, 64, 64>,
+    cutlass::gemm::GemmShape<16, 8, 32>,
+    PackedInt8Epilogue,
+    cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
+    4,
+    cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly,
+    cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
+using PackedInt8Gemm = cutlass::gemm::device::GemmGrouped<PackedInt8Kernel>;
+
+constexpr size_t kPackedWorkspaceAlignment = 16;
+
+size_t align_packed_workspace(size_t offset) {
+    return (offset + kPackedWorkspaceAlignment - 1) & ~(kPackedWorkspaceAlignment - 1);
+}
+
+template <typename T>
+size_t append_packed_workspace(size_t offset, size_t count) {
+    return align_packed_workspace(offset) + sizeof(T) * count;
+}
+
+size_t packed_grouped_int8_workspace_size(int64_t groups, int64_t rows) {
+    if (groups < 0 || rows < 0) {
+        return 0;
+    }
+    size_t offset = 0;
+    offset = append_packed_workspace<cutlass::gemm::GemmCoord>(offset, groups);
+    offset = append_packed_workspace<int8_t*>(offset, groups);
+    offset = append_packed_workspace<int8_t*>(offset, groups);
+    offset = append_packed_workspace<int32_t*>(offset, groups);
+    offset = append_packed_workspace<int32_t*>(offset, groups);
+    offset = append_packed_workspace<int64_t>(offset, groups);
+    offset = append_packed_workspace<int64_t>(offset, groups);
+    offset = append_packed_workspace<int64_t>(offset, groups);
+    offset = append_packed_workspace<int64_t>(offset, groups);
+    offset = append_packed_workspace<int32_t>(offset, rows);
+    return align_packed_workspace(offset);
+}
+
+class PackedWorkspaceArena {
+public:
+    PackedWorkspaceArena(void* workspace, size_t workspace_size)
+        : base_(static_cast<uint8_t*>(workspace)), size_(workspace_size) {}
+
+    template <typename T>
+    T* allocate(size_t count) {
+        offset_ = align_packed_workspace(offset_);
+        const size_t bytes = sizeof(T) * count;
+        if (offset_ > size_ || bytes > size_ - offset_) {
+            return nullptr;
+        }
+        T* result = reinterpret_cast<T*>(base_ + offset_);
+        offset_ += bytes;
+        return result;
+    }
+
+private:
+    uint8_t* base_;
+    size_t size_;
+    size_t offset_{0};
+};
+
+__global__ void prepare_packed_grouped_int8_args(
+    int8_t* activations,
+    int8_t* weights,
+    int32_t* accumulator,
+    const int32_t* expert_indptr,
+    int32_t* row_expert,
+    int groups,
+    int rows,
+    int n,
+    int k,
+    cutlass::gemm::GemmCoord* problem_sizes,
+    int8_t** activation_ptrs,
+    int8_t** weight_ptrs,
+    int32_t** accumulator_c_ptrs,
+    int32_t** accumulator_d_ptrs,
+    int64_t* lda,
+    int64_t* ldb,
+    int64_t* ldc,
+    int64_t* ldd) {
+    const int expert = blockIdx.x;
+    if (expert >= groups) {
+        return;
+    }
+
+    const int32_t start = expert_indptr[expert];
+    const int32_t end = expert_indptr[expert + 1];
+    if (threadIdx.x == 0) {
+        problem_sizes[expert] = cutlass::gemm::GemmCoord(end - start, n, k);
+        activation_ptrs[expert] = activations + static_cast<size_t>(start) * k;
+        weight_ptrs[expert] = weights + static_cast<size_t>(expert) * n * k;
+        accumulator_c_ptrs[expert] = accumulator + static_cast<size_t>(start) * n;
+        accumulator_d_ptrs[expert] = accumulator + static_cast<size_t>(start) * n;
+        lda[expert] = k;
+        ldb[expert] = k;
+        ldc[expert] = n;
+        ldd[expert] = n;
+    }
+    for (int row = start + threadIdx.x; row < end && row < rows; row += blockDim.x) {
+        row_expert[row] = expert;
+    }
+}
+
+template <typename ElementOutput>
+__global__ void dequantize_packed_grouped_int8(
+    const int32_t* accumulator,
+    const float* activation_scales,
+    const float* weight_scales,
+    const int32_t* row_expert,
+    ElementOutput* output,
+    int64_t elements,
+    int n) {
+    const int64_t index = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index >= elements) {
+        return;
+    }
+    const int row = static_cast<int>(index / n);
+    const int column = static_cast<int>(index - static_cast<int64_t>(row) * n);
+    const int expert = row_expert[row];
+    float value = static_cast<float>(accumulator[index]) * activation_scales[row];
+    value = value * weight_scales[static_cast<size_t>(expert) * n + column];
+    output[index] = static_cast<ElementOutput>(value);
+}
+
+template <typename ElementOutput>
+bool run_packed_grouped_int8(
+    const void* activations_raw,
+    const void* weights_raw,
+    const void* activation_scales_raw,
+    const void* weight_scales_raw,
+    const int32_t* expert_indptr,
+    void* accumulator_raw,
+    void* output_raw,
+    int groups,
+    int rows,
+    int n,
+    int k,
+    void* workspace,
+    size_t workspace_size,
+    cudaStream_t stream) {
+    if (rows == 0) {
+        return true;
+    }
+    if (groups <= 0 || n <= 0 || k <= 0) {
+        return false;
+    }
+
+    PackedWorkspaceArena arena(workspace, workspace_size);
+    auto problem_sizes = arena.allocate<cutlass::gemm::GemmCoord>(groups);
+    auto activation_ptrs = arena.allocate<int8_t*>(groups);
+    auto weight_ptrs = arena.allocate<int8_t*>(groups);
+    auto accumulator_c_ptrs = arena.allocate<int32_t*>(groups);
+    auto accumulator_d_ptrs = arena.allocate<int32_t*>(groups);
+    auto lda = arena.allocate<int64_t>(groups);
+    auto ldb = arena.allocate<int64_t>(groups);
+    auto ldc = arena.allocate<int64_t>(groups);
+    auto ldd = arena.allocate<int64_t>(groups);
+    auto row_expert = arena.allocate<int32_t>(rows);
+    if (problem_sizes == nullptr || activation_ptrs == nullptr || weight_ptrs == nullptr ||
+        accumulator_c_ptrs == nullptr || accumulator_d_ptrs == nullptr || lda == nullptr ||
+        ldb == nullptr || ldc == nullptr || ldd == nullptr || row_expert == nullptr) {
+        return false;
+    }
+
+    constexpr int prepare_threads = 128;
+    prepare_packed_grouped_int8_args<<<groups, prepare_threads, 0, stream>>>(
+        const_cast<int8_t*>(static_cast<const int8_t*>(activations_raw)),
+        const_cast<int8_t*>(static_cast<const int8_t*>(weights_raw)),
+        static_cast<int32_t*>(accumulator_raw),
+        expert_indptr,
+        row_expert,
+        groups,
+        rows,
+        n,
+        k,
+        problem_sizes,
+        activation_ptrs,
+        weight_ptrs,
+        accumulator_c_ptrs,
+        accumulator_d_ptrs,
+        lda,
+        ldb,
+        ldc,
+        ldd);
+    if (cudaGetLastError() != cudaSuccess) {
+        return false;
+    }
+
+    constexpr int threadblock_count = 256;
+    typename PackedInt8Gemm::EpilogueOutputOp::Params epilogue(1, 0);
+    typename PackedInt8Gemm::Arguments arguments(
+        problem_sizes,
+        groups,
+        threadblock_count,
+        epilogue,
+        activation_ptrs,
+        weight_ptrs,
+        accumulator_c_ptrs,
+        accumulator_d_ptrs,
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        nullptr);
+    PackedInt8Gemm gemm;
+    if (gemm.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess ||
+        gemm.run(stream) != cutlass::Status::kSuccess) {
+        return false;
+    }
+
+    constexpr int dequant_threads = 256;
+    const int64_t elements = static_cast<int64_t>(rows) * n;
+    const int blocks = static_cast<int>((elements + dequant_threads - 1) / dequant_threads);
+    dequantize_packed_grouped_int8<<<blocks, dequant_threads, 0, stream>>>(
+        static_cast<const int32_t*>(accumulator_raw),
+        static_cast<const float*>(activation_scales_raw),
+        static_cast<const float*>(weight_scales_raw),
+        row_expert,
+        static_cast<ElementOutput*>(output_raw),
+        elements,
+        n);
+    return cudaGetLastError() == cudaSuccess;
+}
+}  // namespace packed_int8
 
 extern "C" {
 bool launch_cutlass_int8_dequant(
@@ -445,6 +740,79 @@ bool launch_cutlass_int8_dequant_strided(
         default: return false;
     }
 }
+
+bool launch_cutlass_grouped_int8_dequant(
+    const void* A, const void* B, const void* xs, const void* ws, void* D,
+    int64_t groups, int64_t M, int64_t N, int64_t K, int out_dtype_code,
+    cudaStream_t stream) {
+    if (groups == 0 || M == 0 || N == 0 || K == 0) return true;
+    if (groups < 0 || M < 0 || N < 0 || K < 0 ||
+        groups > INT32_MAX || M > INT32_MAX || N > INT32_MAX || K > INT32_MAX) {
+        return false;
+    }
+    const int8_t* a = static_cast<const int8_t*>(A);
+    const int8_t* b = static_cast<const int8_t*>(B);
+    const float* x = static_cast<const float*>(xs);
+    const float* w = static_cast<const float*>(ws);
+    switch (out_dtype_code) {
+        case 0:
+            return dispatch_fused_no_bias_batched<float>(
+                a, b, x, w, static_cast<float*>(D), groups, M, N, K, stream);
+        case 1:
+            return dispatch_fused_no_bias_batched<cutlass::half_t>(
+                a, b, x, w, static_cast<cutlass::half_t*>(D), groups, M, N, K, stream);
+        case 2:
+            return dispatch_fused_no_bias_batched<cutlass::bfloat16_t>(
+                a, b, x, w, static_cast<cutlass::bfloat16_t*>(D), groups, M, N, K, stream);
+        default:
+            return false;
+    }
+}
+
+size_t cutlass_grouped_int8_dequant_packed_workspace_size(int64_t groups, int64_t rows) {
+    return packed_int8::packed_grouped_int8_workspace_size(groups, rows);
+}
+
+bool launch_cutlass_grouped_int8_dequant_packed(
+    const void* activations,
+    const void* weights,
+    const void* activation_scales,
+    const void* weight_scales,
+    const int32_t* expert_indptr,
+    void* accumulator,
+    void* output,
+    int64_t groups,
+    int64_t rows,
+    int64_t n,
+    int64_t k,
+    void* workspace,
+    size_t workspace_size,
+    int out_dtype_code,
+    cudaStream_t stream) {
+    if (groups < 0 || rows < 0 || n < 0 || k < 0 || groups > INT32_MAX ||
+        rows > INT32_MAX || n > INT32_MAX || k > INT32_MAX) {
+        return false;
+    }
+    if (workspace_size < packed_int8::packed_grouped_int8_workspace_size(groups, rows)) {
+        return false;
+    }
+    switch (out_dtype_code) {
+        case 0:
+            return packed_int8::run_packed_grouped_int8<float>(
+                activations, weights, activation_scales, weight_scales, expert_indptr,
+                accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
+        case 1:
+            return packed_int8::run_packed_grouped_int8<cutlass::half_t>(
+                activations, weights, activation_scales, weight_scales, expert_indptr,
+                accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
+        case 2:
+            return packed_int8::run_packed_grouped_int8<cutlass::bfloat16_t>(
+                activations, weights, activation_scales, weight_scales, expert_indptr,
+                accumulator, output, groups, rows, n, k, workspace, workspace_size, stream);
+        default:
+            return false;
+    }
+}
 }  // extern "C"
 
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
@@ -458,6 +826,22 @@ extern "C" bool launch_cutlass_int8_dequant(
 extern "C" bool launch_cutlass_int8_dequant_strided(
     const void*, const void*, const void*, const void*, const void*,
     void*, int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_cutlass_grouped_int8_dequant(
+    const void*, const void*, const void*, const void*, void*,
+    int64_t, int64_t, int64_t, int64_t, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" size_t cutlass_grouped_int8_dequant_packed_workspace_size(int64_t, int64_t) {
+    return 0;
+}
+
+extern "C" bool launch_cutlass_grouped_int8_dequant_packed(
+    const void*, const void*, const void*, const void*, const int32_t*, void*, void*,
+    int64_t, int64_t, int64_t, int64_t, void*, size_t, int, cudaStream_t) {
     return false;
 }
 

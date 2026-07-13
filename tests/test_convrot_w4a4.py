@@ -101,6 +101,10 @@ def test_convrot_int8_fused_shared_memory_bytes(m, k, expected):
     assert cuda_backend._convrot_int8_fused_shared_memory_bytes(m, k) == expected
 
 
+def test_convrot_int8_group64_shared_memory_bytes():
+    assert cuda_backend._convrot_int8_fused_shared_memory_bytes(256, 704, 64) == (704 + 8 * 2 * 64) * 4
+
+
 @pytest.mark.parametrize(
     ("m", "k", "group_size", "dtype_size", "expected"),
     [

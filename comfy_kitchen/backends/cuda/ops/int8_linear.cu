@@ -989,6 +989,88 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
+__global__ void quantize_int8_rowwise_convrot_group64_kernel(
+    const InputType* __restrict__ x,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K,
+    uint64_t seed)
+{
+    constexpr int kGroupSize = 64;
+    constexpr int kGroupThreads = kGroupSize / 4;
+    constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+
+    extern __shared__ float smem[];
+    float* row_buf = smem;
+    float* tmp = smem + K;
+
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int sub = tid / kGroupThreads;
+    const int lane = tid % kGroupThreads;
+    const int64_t row_offset = static_cast<int64_t>(row) * K;
+    const int n_groups = K / kGroupSize;
+    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
+
+    float* buf0 = tmp + sub * (2 * kGroupSize);
+    float* buf1 = buf0 + kGroupSize;
+    float abs_max = 0.0f;
+
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsInFlight + sub;
+        const bool active = group < n_groups;
+        const int base = lane * 4;
+        const int group_col = group * kGroupSize;
+        const int64_t x_offset = row_offset + group_col + base;
+
+        const float x0 = active ? to_float(x[x_offset]) : 0.0f;
+        const float x1 = active ? to_float(x[x_offset + 1]) : 0.0f;
+        const float x2 = active ? to_float(x[x_offset + 2]) : 0.0f;
+        const float x3 = active ? to_float(x[x_offset + 3]) : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
+
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        if (active) {
+            abs_max = fmaxf(
+                abs_max,
+                convrot_fht_stage64_store_absmax<16, float>(buf0, row_buf + group_col, lane));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+
+    for (int col = tid; col < K; col += BLOCK_THREADS) {
+        const int64_t idx = row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        float quantized;
+        if constexpr (STOCHASTIC) {
+            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+        } else {
+            quantized = nearbyintf(scaled);
+        }
+        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+        q[idx] = static_cast<int8_t>(quantized);
+    }
+}
+
 } // namespace
 
 } // namespace comfy
@@ -1266,17 +1348,46 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     if (num_rows == 0 || num_cols == 0) {
         return;
     }
-    if (group_size != comfy::kConvRotGroup) {
-        throw std::runtime_error("convrot64 fused kernel only supports group_size 256");
+    if (group_size != 64 && group_size != comfy::kConvRotGroup) {
+        throw std::runtime_error("convrot fused kernel only supports group_size 64 or 256");
     }
-    if (num_cols % comfy::kConvRotGroup != 0) {
-        throw std::runtime_error("convrot64 fused kernel requires K divisible by 256");
+    if (num_cols % group_size != 0) {
+        throw std::runtime_error("convrot fused kernel requires K divisible by group_size");
     }
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("convrot64 fused kernel only supports K <= INT_MAX");
     }
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        if (group_size == 64) {
+            constexpr int block_threads = 128;
+            constexpr int groups_in_flight = block_threads / (64 / 4);
+            const size_t smem_bytes =
+                (static_cast<size_t>(num_cols) + groups_in_flight * 2 * 64) * sizeof(float);
+            auto launch = [&](auto kernel) {
+                cudaError_t attr_err = cudaFuncSetAttribute(
+                    kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+                    static_cast<int>(smem_bytes));
+                if (attr_err != cudaSuccess) {
+                    throw std::runtime_error(
+                        std::string("group-64 convrot fused kernel shared memory request failed: ") +
+                        cudaGetErrorString(attr_err));
+                }
+                kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
+                    static_cast<const InputType*>(input),
+                    static_cast<int8_t*>(output),
+                    static_cast<float*>(scales),
+                    static_cast<int>(num_cols),
+                    seed);
+            };
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot_group64_kernel<InputType, block_threads, true>);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot_group64_kernel<InputType, block_threads, false>);
+            }
+            return;
+        }
+
         constexpr int block_threads_single = 512;
         constexpr int block_threads_multi = 1024;
         auto launch = [&](auto kernel, int block_threads) {

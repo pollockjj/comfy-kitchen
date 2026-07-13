@@ -39,6 +39,8 @@ __all__ = [
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
     "int8_linear",
+    "grouped_int8_convrot_linear",
+    "grouped_int8_convrot_linear_packed",
 ]
 
 import torch
@@ -66,6 +68,8 @@ from .quantization import (
     dequantize_mxfp8,
     dequantize_nvfp4,
     dequantize_per_tensor_fp8,
+    grouped_int8_convrot_linear,
+    grouped_int8_convrot_linear_packed,
     int8_linear,
     mxfp8_embedding,
     mxfp8_weighted_embedding,
@@ -480,6 +484,27 @@ def _build_constraints() -> dict:
             "bias": ParamConstraint(dtypes=standard_floats),
             "convrot": ParamConstraint(dtypes=frozenset({bool})),
             "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+        },
+        default_devices=all_devices,
+    )
+    out["grouped_int8_convrot_linear"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(3),)),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(3),)),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+            "out_dtype": ParamConstraint(dtypes=standard_floats),
+        },
+        default_devices=all_devices,
+    )
+    out["grouped_int8_convrot_linear_packed"] = FunctionConstraints(
+        params={
+            "x": ParamConstraint(dtypes=standard_floats, shape_rules=(ExactDims(2),)),
+            "expert_indptr": ParamConstraint(dtypes=frozenset({torch.int32}), shape_rules=(ExactDims(1),)),
+            "weight": ParamConstraint(dtypes=frozenset({torch.int8}), shape_rules=(ExactDims(3),)),
+            "weight_scale": ParamConstraint(dtypes=standard_floats),
+            "convrot_groupsize": ParamConstraint(dtypes=frozenset({int})),
+            "out_dtype": ParamConstraint(dtypes=standard_floats),
         },
         default_devices=all_devices,
     )
