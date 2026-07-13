@@ -1382,9 +1382,9 @@ def convrot_w4a4_linear(
         _cuda_device_supports_native_int4_mma(x2d) or _should_use_turing_int4(x2d)
     ):
         if (
-            convrot_groupsize == 256
-            and x2d.shape[-1] % 256 == 0
-            and 256 <= x2d.shape[-1] <= _CONVROT_FUSED_MAX_K
+            convrot_groupsize in (64, 256)
+            and x2d.shape[-1] % convrot_groupsize == 0
+            and x2d.shape[-1] <= _CONVROT_FUSED_MAX_K
             and _convrot_fused_shared_memory_fits(x2d, x2d.shape[-1], convrot_groupsize)
         ):
             qact_int8, x_scale = quantize_int8_rowwise_convrot64(x2d, convrot_groupsize)
@@ -1623,7 +1623,7 @@ def quantize_int8_convrot_weight(
     if (
         group_size in (64, 256)
         and k % group_size == 0
-        and 256 <= k <= _CONVROT_FUSED_MAX_K
+        and k <= _CONVROT_FUSED_MAX_K
         and _convrot_fused_shared_memory_fits(weight_2d, k, group_size)
     ):
         return quantize_int8_rowwise_convrot64(weight_2d, group_size, stochastic_rounding=stochastic_rounding)
