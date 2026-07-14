@@ -234,22 +234,42 @@ __global__ void activate_intermediate(
 }
 
 template <class T>
-__global__ void restore_route_order(
+__global__ void restore_weight_reduce_top8(
     const T* routed_output,
     const int32_t* route_dest,
+    const float* route_weights,
     T* output,
-    int routes,
     int hidden_size) {
-    const int64_t elements = static_cast<int64_t>(routes) * hidden_size;
-    for (int64_t linear = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         linear < elements;
-         linear += static_cast<int64_t>(blockDim.x) * gridDim.x) {
-        const int route = static_cast<int>(linear / hidden_size);
-        const int col = static_cast<int>(linear - static_cast<int64_t>(route) * hidden_size);
-        const int dest = route_dest[route];
-        output[linear] = dest < 0
-            ? float_to_lowp<T>(__int_as_float(0x7fc00000))
-            : routed_output[static_cast<size_t>(dest) * hidden_size + col];
+    const int token = blockIdx.x;
+    __shared__ int32_t destinations[kTopKMax];
+    __shared__ float weights[kTopKMax];
+    if (threadIdx.x < kTopKMax) {
+        const int route = token * kTopKMax + threadIdx.x;
+        destinations[threadIdx.x] = route_dest[route];
+        weights[threadIdx.x] = route_weights[route];
+    }
+    __syncthreads();
+
+    for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+        float products[kTopKMax];
+#pragma unroll
+        for (int position = 0; position < kTopKMax; ++position) {
+            const int destination = destinations[position];
+            products[position] = destination < 0
+                ? __int_as_float(0x7fc00000)
+                : __fmul_rn(
+                    lowp_to_float(
+                        routed_output[static_cast<size_t>(destination) * hidden_size + col]),
+                    weights[position]);
+        }
+        const float pair0 = __fadd_rn(products[0], products[4]);
+        const float pair1 = __fadd_rn(products[1], products[5]);
+        const float pair2 = __fadd_rn(products[2], products[6]);
+        const float pair3 = __fadd_rn(products[3], products[7]);
+        float sum = __fadd_rn(pair0, pair1);
+        sum = __fadd_rn(sum, pair2);
+        sum = __fadd_rn(sum, pair3);
+        output[static_cast<size_t>(token) * hidden_size + col] = float_to_lowp<T>(sum);
     }
 }
 
@@ -392,12 +412,9 @@ bool run_fused_moe_int8_convrot(
         return false;
     }
 
-    const int64_t output_elements = static_cast<int64_t>(routes) * h;
-    const int reduction_blocks = static_cast<int>(
-        (output_elements + kRouteThreads - 1) / kRouteThreads);
     last_error_stage = 8;
-    restore_route_order<OutputType><<<reduction_blocks, kRouteThreads, 0, stream>>>(
-        routed_down, route_dest, static_cast<OutputType*>(output), routes, h);
+    restore_weight_reduce_top8<OutputType><<<n, kRouteThreads, 0, stream>>>(
+        routed_down, route_dest, router_weights, static_cast<OutputType*>(output), h);
     if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
@@ -440,7 +457,7 @@ extern "C" bool launch_cutlass_fused_moe_int8_convrot(
         return false;
     }
     if (num_tokens <= 0 || hidden_size <= 0 || intermediate_size <= 0 ||
-        num_experts <= 0 || top_k <= 0 || top_k > kTopKMax ||
+        num_experts <= 0 || top_k != kTopKMax ||
         num_tokens > INT_MAX || hidden_size > INT_MAX || intermediate_size > INT_MAX ||
         num_experts > INT_MAX || num_tokens > INT_MAX / top_k ||
         (fc1_group_size != 64 && fc1_group_size != 256) ||

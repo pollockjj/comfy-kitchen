@@ -851,7 +851,7 @@ class TestTensorWisePublicAPI:
         if not hasattr(cuda._C, "cutlass_fused_moe_int8_convrot"):
             pytest.skip("CUDA extension was built without fused INT8 ConvRot MoE")
 
-        n, h, intermediate, experts, top_k = 8, 256, 64, 4, 2
+        n, h, intermediate, experts, top_k = 8, 256, 64, 4, 8
         x = torch.randn(n, h, device="cuda", dtype=torch.float16)
         expert_ids = torch.randint(experts, (n, top_k), device="cuda", dtype=torch.int32)
         route_weights = torch.softmax(
