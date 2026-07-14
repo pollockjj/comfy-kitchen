@@ -41,20 +41,15 @@ using FragmentA = wmma::fragment<
 using FragmentB = wmma::fragment<
     wmma::matrix_b, kWmma, kWmma, kWmma, __nv_bfloat16, wmma::row_major>;
 
-__device__ __forceinline__ void h4_transform(
-    float x0,
-    float x1,
-    float x2,
-    float x3,
-    float& y0,
-    float& y1,
-    float& y2,
-    float& y3)
+__device__ __forceinline__ float h4_row_dot(
+    int row, float x0, float x1, float x2, float x3)
 {
-    y0 = 0.5f * (x0 + x1 + x2 - x3);
-    y1 = 0.5f * (x0 + x1 - x2 + x3);
-    y2 = 0.5f * (x0 - x1 + x2 + x3);
-    y3 = 0.5f * (-x0 + x1 + x2 + x3);
+    switch (row) {
+        case 0: return x0 + x1 + x2 - x3;
+        case 1: return x0 + x1 - x2 + x3;
+        case 2: return x0 - x1 + x2 + x3;
+        default: return -x0 + x1 + x2 + x3;
+    }
 }
 
 __device__ __forceinline__ void load_convrot_row(
@@ -86,9 +81,10 @@ __device__ __forceinline__ void load_convrot_row(
         const float x1 = values[offset + 1];
         const float x2 = values[offset + 2];
         const float x3 = values[offset + 3];
-        h4_transform(
-            x0, x1, x2, x3,
-            next[offset], next[offset + 1], next[offset + 2], next[offset + 3]);
+        next[offset] = 0.5f * h4_row_dot(0, x0, x1, x2, x3);
+        next[offset + 1] = 0.5f * h4_row_dot(1, x0, x1, x2, x3);
+        next[offset + 2] = 0.5f * h4_row_dot(2, x0, x1, x2, x3);
+        next[offset + 3] = 0.5f * h4_row_dot(3, x0, x1, x2, x3);
     }
 
 #pragma unroll
@@ -101,13 +97,8 @@ __device__ __forceinline__ void load_convrot_row(
         const float x1 = half == 0 ? local1 : remote1;
         const float x2 = half == 0 ? remote0 : local0;
         const float x3 = half == 0 ? remote1 : local1;
-        float y0;
-        float y1;
-        float y2;
-        float y3;
-        h4_transform(x0, x1, x2, x3, y0, y1, y2, y3);
-        values[d0] = half == 0 ? y0 : y2;
-        values[4 + d0] = half == 0 ? y1 : y3;
+        values[d0] = 0.5f * h4_row_dot(half == 0 ? 0 : 2, x0, x1, x2, x3);
+        values[4 + d0] = 0.5f * h4_row_dot(half == 0 ? 1 : 3, x0, x1, x2, x3);
     }
 
 #pragma unroll
@@ -117,11 +108,7 @@ __device__ __forceinline__ void load_convrot_row(
         const float x1 = __shfl_sync(mask, values[value], lane_base + 1);
         const float x2 = __shfl_sync(mask, values[value], lane_base + 2);
         const float x3 = __shfl_sync(mask, values[value], lane_base + 3);
-        float transformed[4];
-        h4_transform(
-            x0, x1, x2, x3,
-            transformed[0], transformed[1], transformed[2], transformed[3]);
-        next[value] = transformed[d2];
+        next[value] = 0.5f * h4_row_dot(d2, x0, x1, x2, x3);
     }
 
 #pragma unroll
@@ -131,11 +118,7 @@ __device__ __forceinline__ void load_convrot_row(
         const float x1 = __shfl_sync(mask, next[value], lane_base + 4);
         const float x2 = __shfl_sync(mask, next[value], lane_base + 8);
         const float x3 = __shfl_sync(mask, next[value], lane_base + 12);
-        float transformed[4];
-        h4_transform(
-            x0, x1, x2, x3,
-            transformed[0], transformed[1], transformed[2], transformed[3]);
-        values[value] = transformed[d3];
+        values[value] = 0.5f * h4_row_dot(d3, x0, x1, x2, x3);
     }
 
 #pragma unroll
