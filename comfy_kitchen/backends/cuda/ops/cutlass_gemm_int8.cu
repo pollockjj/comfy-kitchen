@@ -586,6 +586,38 @@ __global__ void dequantize_packed_grouped_int8(
 }
 
 template <typename ElementOutput>
+__global__ void dequantize_packed_grouped_int8_vec4(
+    const int32_t* accumulator,
+    const float* activation_scales,
+    const float* weight_scales,
+    const int32_t* row_expert,
+    ElementOutput* output,
+    int64_t vectors,
+    int n,
+    int n4) {
+    const int64_t index4 = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (index4 >= vectors) {
+        return;
+    }
+    const int row = static_cast<int>(index4 / n4);
+    const int column4 = static_cast<int>(index4 - static_cast<int64_t>(row) * n4);
+    const int expert = row_expert[row];
+    const float activation_scale = activation_scales[row];
+    const int4 values = reinterpret_cast<const int4*>(accumulator)[index4];
+    const float4 scales = reinterpret_cast<const float4*>(
+        weight_scales + static_cast<size_t>(expert) * n)[column4];
+    const int64_t index = index4 * 4;
+    output[index] = static_cast<ElementOutput>(
+        static_cast<float>(values.x) * activation_scale * scales.x);
+    output[index + 1] = static_cast<ElementOutput>(
+        static_cast<float>(values.y) * activation_scale * scales.y);
+    output[index + 2] = static_cast<ElementOutput>(
+        static_cast<float>(values.z) * activation_scale * scales.z);
+    output[index + 3] = static_cast<ElementOutput>(
+        static_cast<float>(values.w) * activation_scale * scales.w);
+}
+
+template <typename ElementOutput>
 bool run_packed_grouped_int8(
     const void* activations_raw,
     const void* weights_raw,
@@ -673,15 +705,30 @@ bool run_packed_grouped_int8(
 
     constexpr int dequant_threads = 256;
     const int64_t elements = static_cast<int64_t>(rows) * n;
-    const int blocks = static_cast<int>((elements + dequant_threads - 1) / dequant_threads);
-    dequantize_packed_grouped_int8<<<blocks, dequant_threads, 0, stream>>>(
-        static_cast<const int32_t*>(accumulator_raw),
-        static_cast<const float*>(activation_scales_raw),
-        static_cast<const float*>(weight_scales_raw),
-        row_expert,
-        static_cast<ElementOutput*>(output_raw),
-        elements,
-        n);
+    if ((n & 3) == 0) {
+        const int n4 = n / 4;
+        const int64_t vectors = elements / 4;
+        const int blocks = static_cast<int>((vectors + dequant_threads - 1) / dequant_threads);
+        dequantize_packed_grouped_int8_vec4<<<blocks, dequant_threads, 0, stream>>>(
+            static_cast<const int32_t*>(accumulator_raw),
+            static_cast<const float*>(activation_scales_raw),
+            static_cast<const float*>(weight_scales_raw),
+            row_expert,
+            static_cast<ElementOutput*>(output_raw),
+            vectors,
+            n,
+            n4);
+    } else {
+        const int blocks = static_cast<int>((elements + dequant_threads - 1) / dequant_threads);
+        dequantize_packed_grouped_int8<<<blocks, dequant_threads, 0, stream>>>(
+            static_cast<const int32_t*>(accumulator_raw),
+            static_cast<const float*>(activation_scales_raw),
+            static_cast<const float*>(weight_scales_raw),
+            row_expert,
+            static_cast<ElementOutput*>(output_raw),
+            elements,
+            n);
+    }
     return cudaGetLastError() == cudaSuccess;
 }
 }  // namespace packed_int8
