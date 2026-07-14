@@ -7,6 +7,7 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
+#include <cmath>
 #include <cstdint>
 
 namespace comfy {
@@ -172,16 +173,16 @@ __global__ void self_conditioning_softmax_bf16_kernel(
         const BFloat16x8 input = reinterpret_cast<const BFloat16x8*>(row)[packet];
 #pragma unroll
         for (int i = 0; i < kSelfConditioningILP; ++i) {
-            exponential_sum += expf(__bfloat162float(input.values[i]) - maximum);
+            exponential_sum += std::exp(__bfloat162float(input.values[i]) - maximum);
         }
     }
     for (int64_t col = vectorized_size + threadIdx.x; col < vocab_size; col += blockDim.x) {
-        exponential_sum += expf(__bfloat162float(row[col]) - maximum);
+        exponential_sum += std::exp(__bfloat162float(row[col]) - maximum);
     }
     exponential_sum = self_conditioning_block_reduce_sum(exponential_sum, warp_values);
 
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float probability = expf(__bfloat162float(row[col]) - maximum) / exponential_sum;
+        const float probability = std::exp(__bfloat162float(row[col]) - maximum) / exponential_sum;
         row[col] = __float2bfloat16_rn(probability);
     }
 }
