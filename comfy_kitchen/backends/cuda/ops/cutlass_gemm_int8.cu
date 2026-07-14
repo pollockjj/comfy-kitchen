@@ -471,7 +471,7 @@ using PackedInt8KernelT = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
 using PackedInt8Kernel = PackedInt8KernelT<4>;
 using PackedInt8Gemm = cutlass::gemm::device::GemmGrouped<PackedInt8Kernel>;
-using PackedInt8GemmStage2 = cutlass::gemm::device::GemmGrouped<PackedInt8KernelT<2>>;
+using PackedInt8GemmStage3 = cutlass::gemm::device::GemmGrouped<PackedInt8KernelT<3>>;
 
 constexpr size_t kPackedWorkspaceAlignment = 16;
 
@@ -687,8 +687,8 @@ bool run_packed_grouped_int8(
     constexpr int threadblock_count = 256;
     const bool gate_up_shape = groups == 128 && n == 1408 && k == 2816;
     if (gate_up_shape) {
-        typename PackedInt8GemmStage2::EpilogueOutputOp::Params epilogue(1, 0);
-        typename PackedInt8GemmStage2::Arguments arguments(
+        typename PackedInt8GemmStage3::EpilogueOutputOp::Params epilogue(1, 0);
+        typename PackedInt8GemmStage3::Arguments arguments(
             problem_sizes,
             groups,
             threadblock_count,
@@ -702,7 +702,7 @@ bool run_packed_grouped_int8(
             ldc,
             ldd,
             nullptr);
-        PackedInt8GemmStage2 gemm;
+        PackedInt8GemmStage3 gemm;
         if (gemm.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess ||
             gemm.run(stream) != cutlass::Status::kSuccess) {
             return false;
