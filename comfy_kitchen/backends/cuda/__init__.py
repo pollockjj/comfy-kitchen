@@ -44,7 +44,6 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
-    "grouped_int8_convrot_linear_packed_prequantized",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -2663,68 +2662,6 @@ def grouped_int8_convrot_linear_packed(
         stream_ptr,
     ):
         raise RuntimeError("Native packed grouped INT8 ConvRot CUTLASS GEMM is unavailable")
-    return output
-
-
-def grouped_int8_convrot_linear_packed_prequantized(
-    qdata: torch.Tensor,
-    activation_scales: torch.Tensor,
-    expert_indptr: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Dispatch prequantized packed expert rows through the variable-M INT8 GEMM."""
-    if qdata.dim() != 2 or weight.dim() != 3:
-        raise ValueError("Prequantized packed INT8 expects qdata [R, K] and weight [E, N, K]")
-    experts, n, k = weight.shape
-    rows = qdata.shape[0]
-    if qdata.shape[1] != k:
-        raise ValueError(
-            f"Prequantized packed INT8 shape mismatch: qdata {tuple(qdata.shape)}, weight {tuple(weight.shape)}"
-        )
-    if expert_indptr.dim() != 1 or expert_indptr.numel() != experts + 1:
-        raise ValueError("Prequantized packed INT8 indptr must be [E + 1]")
-    if expert_indptr.dtype != torch.int32:
-        raise ValueError("Prequantized packed INT8 indptr must be int32")
-    if tuple(activation_scales.shape) not in ((rows,), (rows, 1)):
-        raise ValueError("Prequantized packed INT8 activation scales must be [R] or [R, 1]")
-    expected_scales = weight.shape[:2]
-    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
-        raise ValueError("Prequantized packed INT8 weight scales must be [E, N] or [E, N, 1]")
-    if qdata.dtype != torch.int8 or weight.dtype != torch.int8:
-        raise ValueError("Prequantized packed INT8 qdata and weights must be int8")
-    if activation_scales.dtype != torch.float32 or weight_scale.dtype != torch.float32:
-        raise ValueError("Prequantized packed INT8 scales must be float32")
-    if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise ValueError("Prequantized packed INT8 output must be float32, float16, or bfloat16")
-    tensors = (activation_scales, expert_indptr, weight, weight_scale)
-    if any(tensor.device != qdata.device for tensor in tensors):
-        raise ValueError("Prequantized packed INT8 tensors must share one CUDA device")
-
-    activations = qdata if qdata.is_contiguous() else qdata.contiguous()
-    scales = activation_scales.reshape(rows, 1).contiguous()
-    weights = weight if weight.is_contiguous() else weight.contiguous()
-    indptr = expert_indptr if expert_indptr.is_contiguous() else expert_indptr.contiguous()
-    weight_scales = weight_scale.reshape(experts, n).contiguous()
-    output = torch.empty((rows, n), dtype=out_dtype, device=qdata.device)
-    accumulator = torch.empty((rows, n), dtype=torch.int32, device=qdata.device)
-    workspace_bytes = _C.cutlass_grouped_int8_dequant_packed_workspace_bytes(experts, rows)
-    workspace = torch.empty(max(1, workspace_bytes), dtype=torch.uint8, device=qdata.device)
-    stream_ptr = torch.cuda.current_stream(qdata.device).cuda_stream
-    if not _C.cutlass_grouped_int8_dequant_packed(
-        _wrap_for_dlpack(activations),
-        _wrap_for_dlpack(weights),
-        _wrap_for_dlpack(scales),
-        _wrap_for_dlpack(weight_scales),
-        _wrap_for_dlpack(indptr),
-        _wrap_for_dlpack(accumulator),
-        _wrap_for_dlpack(output),
-        _wrap_for_dlpack(workspace),
-        DTYPE_TO_CODE[out_dtype],
-        stream_ptr,
-    ):
-        raise RuntimeError("Native prequantized packed INT8 CUTLASS GEMM is unavailable")
     return output
 
 

@@ -47,7 +47,6 @@ __all__ = [
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
-    "quantize_int8_rowwise_convrot64",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
     # Fused matmul
@@ -71,7 +70,6 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
-    "grouped_int8_convrot_linear_packed_prequantized",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -975,17 +973,6 @@ def quantize_int8_rowwise(
     return impl(**kwargs)
 
 
-def quantize_int8_rowwise_convrot64(
-    x: torch.Tensor,
-    group_size: int,
-    stochastic_rounding: int | None = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply fused ConvRot and row-wise INT8 quantization on CUDA."""
-    return _cuda_backend.quantize_int8_rowwise_convrot64(
-        x, group_size, stochastic_rounding=stochastic_rounding
-    )
-
-
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 tensor with scale."""
     return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale)
@@ -1069,26 +1056,6 @@ def grouped_int8_convrot_linear_packed(
         weight_scale,
         convrot_groupsize,
         DTYPE_TO_CODE[out_dtype],
-    )
-
-
-def grouped_int8_convrot_linear_packed_prequantized(
-    qdata: torch.Tensor,
-    activation_scales: torch.Tensor,
-    expert_indptr: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    *,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Packed grouped INT8 linear from ConvRot-quantized activation rows."""
-    return _cuda_backend.grouped_int8_convrot_linear_packed_prequantized(
-        qdata,
-        activation_scales,
-        expert_indptr,
-        weight,
-        weight_scale,
-        out_dtype=out_dtype,
     )
 
 
