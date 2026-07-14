@@ -20,6 +20,7 @@ namespace {
 
 namespace wmma = nvcuda::wmma;
 
+constexpr int kConvRotGroup = 256;
 constexpr int kReductionChunk = 65504;
 constexpr int kTileM = 128;
 constexpr int kTileN = 256;
