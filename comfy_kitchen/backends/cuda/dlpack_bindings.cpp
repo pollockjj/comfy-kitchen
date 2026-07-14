@@ -1202,7 +1202,7 @@ void cutlass_fused_moe_int8_convrot(
         fc2_scales.shape(0) != num_experts || fc2_scales.shape(1) != hidden_size) {
         throw std::runtime_error("fused INT8 ConvRot MoE down bank shape mismatch");
     }
-    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size ||
+    if (output.shape(0) != num_tokens * top_k || output.shape(1) != hidden_size ||
         map_dtype_to_code(output.dtype()) != input_dtype_code ||
         (input_dtype_code != 1 && input_dtype_code != 2)) {
         throw std::runtime_error("fused INT8 ConvRot MoE output dtype or shape mismatch");

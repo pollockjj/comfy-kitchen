@@ -2330,7 +2330,11 @@ def fused_moe_int8_convrot(
     route_weights = router_weights if router_weights.is_contiguous() else router_weights.contiguous()
     fc1_scales_2d = fc1_scales.reshape(experts, gate_up_size).contiguous()
     fc2_scales_2d = fc2_scales.reshape(experts, hidden_size).contiguous()
-    output = torch.empty_like(input_tensor)
+    output = torch.empty(
+        (input_tensor.shape[0] * expert_ids_i32.shape[1], input_tensor.shape[1]),
+        dtype=input_tensor.dtype,
+        device=input_tensor.device,
+    )
     stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
     workspace = _get_fused_moe_workspace(x, stream_ptr)
     _C.cutlass_fused_moe_int8_convrot(
@@ -2347,7 +2351,10 @@ def fused_moe_int8_convrot(
         fc2_group_size,
         stream_ptr,
     )
-    return output
+    routed_output = output.view(
+        input_tensor.shape[0], expert_ids_i32.shape[1], input_tensor.shape[1]
+    )
+    return (routed_output * route_weights.unsqueeze(-1)).sum(dim=1).to(input_tensor.dtype)
 
 
 def fused_moe_mxfp8_scaled(
