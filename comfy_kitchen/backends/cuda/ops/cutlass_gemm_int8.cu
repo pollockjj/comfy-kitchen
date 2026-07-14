@@ -760,6 +760,81 @@ bool run_packed_grouped_int8(
 }
 }  // namespace packed_int8
 
+namespace int8_routes {
+constexpr int kThreads = 256;
+
+__global__ void count_and_rank(
+    const int64_t* expert_ids,
+    int32_t* counts,
+    int32_t* route_rank,
+    int routes,
+    int num_experts) {
+    for (int route = blockIdx.x * blockDim.x + threadIdx.x;
+         route < routes;
+         route += blockDim.x * gridDim.x) {
+        const int64_t expert = expert_ids[route];
+        route_rank[route] = expert >= 0 && expert < num_experts
+            ? atomicAdd(counts + expert, 1)
+            : -1;
+    }
+}
+
+__global__ void prefix_and_place(
+    const int64_t* expert_ids,
+    const int32_t* counts,
+    const int32_t* route_rank,
+    int32_t* expert_indptr,
+    int64_t* route_order,
+    int64_t* route_dest,
+    int routes,
+    int num_experts) {
+    if (threadIdx.x == 0) {
+        int32_t running = 0;
+        for (int expert = 0; expert < num_experts; ++expert) {
+            expert_indptr[expert] = running;
+            running += counts[expert];
+        }
+        expert_indptr[num_experts] = running;
+    }
+    __syncthreads();
+
+    for (int route = threadIdx.x; route < routes; route += blockDim.x) {
+        const int64_t expert = expert_ids[route];
+        const int32_t rank = route_rank[route];
+        const int64_t destination = expert >= 0 && expert < num_experts && rank >= 0
+            ? static_cast<int64_t>(expert_indptr[expert]) + rank
+            : -1;
+        route_dest[route] = destination;
+        if (destination >= 0) {
+            route_order[destination] = route;
+        }
+    }
+}
+
+bool prepare(
+    const int64_t* expert_ids,
+    int32_t* counts,
+    int32_t* route_rank,
+    int32_t* expert_indptr,
+    int64_t* route_order,
+    int64_t* route_dest,
+    int routes,
+    int num_experts,
+    cudaStream_t stream) {
+    if (cudaMemsetAsync(counts, 0, static_cast<size_t>(num_experts) * sizeof(int32_t), stream) !=
+        cudaSuccess) {
+        return false;
+    }
+    const int blocks = (routes + kThreads - 1) / kThreads;
+    count_and_rank<<<blocks, kThreads, 0, stream>>>(
+        expert_ids, counts, route_rank, routes, num_experts);
+    prefix_and_place<<<1, kThreads, 0, stream>>>(
+        expert_ids, counts, route_rank, expert_indptr, route_order, route_dest,
+        routes, num_experts);
+    return cudaPeekAtLastError() == cudaSuccess;
+}
+}  // namespace int8_routes
+
 extern "C" {
 bool launch_cutlass_int8_dequant(
     const void* A, const void* B, const void* xs, const void* ws, const void* bias,
@@ -887,6 +962,24 @@ bool launch_cutlass_grouped_int8_dequant_packed(
             return false;
     }
 }
+
+bool launch_prepare_int8_moe_routes(
+    const int64_t* expert_ids,
+    int32_t* counts,
+    int32_t* route_rank,
+    int32_t* expert_indptr,
+    int64_t* route_order,
+    int64_t* route_dest,
+    int64_t routes,
+    int64_t num_experts,
+    cudaStream_t stream) {
+    if (routes <= 0 || num_experts <= 0 || routes > INT_MAX || num_experts > INT_MAX) {
+        return false;
+    }
+    return int8_routes::prepare(
+        expert_ids, counts, route_rank, expert_indptr, route_order, route_dest,
+        static_cast<int>(routes), static_cast<int>(num_experts), stream);
+}
 }  // extern "C"
 
 #else  // !COMFY_HAVE_CUTLASS -- stub; caller falls back to cuBLAS + separate dequant.
@@ -916,6 +1009,12 @@ extern "C" size_t cutlass_grouped_int8_dequant_packed_workspace_size(int64_t, in
 extern "C" bool launch_cutlass_grouped_int8_dequant_packed(
     const void*, const void*, const void*, const void*, const int32_t*, void*, void*,
     int64_t, int64_t, int64_t, int64_t, void*, size_t, int, cudaStream_t) {
+    return false;
+}
+
+extern "C" bool launch_prepare_int8_moe_routes(
+    const int64_t*, int32_t*, int32_t*, int32_t*, int64_t*, int64_t*,
+    int64_t, int64_t, cudaStream_t) {
     return false;
 }
 

@@ -70,6 +70,7 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
+    "prepare_int8_moe_routes",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -1057,6 +1058,14 @@ def grouped_int8_convrot_linear_packed(
         convrot_groupsize,
         DTYPE_TO_CODE[out_dtype],
     )
+
+
+def prepare_int8_moe_routes(
+    expert_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed route metadata with the native CUDA route constructor."""
+    return _cuda_backend.prepare_int8_moe_routes(expert_ids, num_experts)
 
 
 # =============================================================================

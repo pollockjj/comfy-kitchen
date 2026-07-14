@@ -44,6 +44,7 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
+    "prepare_int8_moe_routes",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -2663,6 +2664,38 @@ def grouped_int8_convrot_linear_packed(
     ):
         raise RuntimeError("Native packed grouped INT8 ConvRot CUTLASS GEMM is unavailable")
     return output
+
+
+def prepare_int8_moe_routes(
+    expert_ids: torch.Tensor,
+    num_experts: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Build packed route order, expert indptr, and inverse destinations on CUDA."""
+    if expert_ids.dim() != 2 or expert_ids.dtype != torch.int64 or not expert_ids.is_cuda:
+        raise ValueError("INT8 MoE expert IDs must be a CUDA int64 [tokens, top_k] tensor")
+    if num_experts <= 0:
+        raise ValueError("INT8 MoE num_experts must be positive")
+
+    ids = expert_ids if expert_ids.is_contiguous() else expert_ids.contiguous()
+    routes = ids.numel()
+    counts = torch.empty(num_experts, dtype=torch.int32, device=ids.device)
+    route_rank = torch.empty(routes, dtype=torch.int32, device=ids.device)
+    expert_indptr = torch.empty(num_experts + 1, dtype=torch.int32, device=ids.device)
+    route_order = torch.empty(routes, dtype=torch.int64, device=ids.device)
+    route_dest = torch.empty(routes, dtype=torch.int64, device=ids.device)
+    stream_ptr = torch.cuda.current_stream(ids.device).cuda_stream
+    if not _C.prepare_int8_moe_routes(
+        _wrap_for_dlpack(ids),
+        _wrap_for_dlpack(counts),
+        _wrap_for_dlpack(route_rank),
+        _wrap_for_dlpack(expert_indptr),
+        _wrap_for_dlpack(route_order),
+        _wrap_for_dlpack(route_dest),
+        num_experts,
+        stream_ptr,
+    ):
+        raise RuntimeError("Native INT8 MoE route construction is unavailable")
+    return route_order, expert_indptr, route_dest
 
 
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
