@@ -1,9 +1,8 @@
 import torch
 
-from comfy_kitchen.backends.cuda import bf16_tuned_gate_up_linear as _cuda_bf16_tuned_gate_up_linear
-
 
 def bf16_tuned_gate_up_linear(x: torch.Tensor, weight: torch.Tensor) -> torch.Tensor:
+    from comfy_kitchen.backends.cuda import bf16_tuned_gate_up_linear as _cuda_bf16_tuned_gate_up_linear
     return _cuda_bf16_tuned_gate_up_linear(x, weight)
 
 
