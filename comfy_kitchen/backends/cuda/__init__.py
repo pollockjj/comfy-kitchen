@@ -2711,9 +2711,10 @@ def grouped_int8_convrot_gelu_linear_packed(
     accumulator = torch.empty((rows, n), dtype=torch.int32, device=gate.device)
     workspace_bytes = _C.cutlass_grouped_int8_dequant_packed_workspace_bytes(experts, rows)
     workspace = torch.empty(max(1, workspace_bytes), dtype=torch.uint8, device=gate.device)
+    gelu = torch.nn.functional.gelu(gate, approximate="tanh")
     stream_ptr = torch.cuda.current_stream(gate.device).cuda_stream
-    _C.gelu_tanh_multiply_quantize_int8_rowwise_convrot64(
-        _wrap_for_dlpack(gate),
+    _C.multiply_quantize_int8_rowwise_convrot64(
+        _wrap_for_dlpack(gelu),
         _wrap_for_dlpack(up),
         _wrap_for_dlpack(qdata),
         _wrap_for_dlpack(activation_scales),
