@@ -739,6 +739,15 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    void launch_bf16_tuned_gate_up_linear(
+        const void* input,
+        const void* weight,
+        void* output,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        cudaStream_t stream);
+
     void launch_quantize_int8_rowwise_kernel(
         const void* input,
         void* output,
@@ -1019,6 +1028,27 @@ void cublas_gemm_int8(
         workspace.data(),
         workspace.size() > 0 ? (int64_t)workspace.size() : 0,
         stream);
+}
+
+void bf16_tuned_gate_up_linear(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    uintptr_t stream_ptr) {
+    if (map_dtype_to_code(input.dtype()) != 2 ||
+        map_dtype_to_code(weight.dtype()) != 2 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("tuned BF16 gate/up requires BF16 tensors");
+    }
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    if (weight.shape(1) != K || output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("tuned BF16 gate/up shape mismatch");
+    }
+    launch_bf16_tuned_gate_up_linear(
+        input.data(), weight.data(), output.data(), M, N, K,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 void quantize_int8_rowwise(
@@ -1953,6 +1983,13 @@ NB_MODULE(_C, m) {
           nb::arg("b"),
           nb::arg("c"),
           nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("bf16_tuned_gate_up_linear", &bf16_tuned_gate_up_linear,
+          "Exact tuned BF16 E4B M=3 gate/up linear",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("output"),
           nb::arg("stream_ptr"));
 
     m.def("quantize_int8_rowwise", &quantize_int8_rowwise,
