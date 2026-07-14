@@ -687,15 +687,11 @@ bool run_packed_grouped_int8(
     constexpr int threadblock_count = 256;
     const bool gate_up_shape = groups == 128 && n == 1408 && k == 2816;
     if (gate_up_shape) {
-        static const int gate_up_threadblock_count = PackedInt8GemmStage3::sufficient();
-        if (gate_up_threadblock_count <= 0) {
-            return false;
-        }
         typename PackedInt8GemmStage3::EpilogueOutputOp::Params epilogue(1, 0);
         typename PackedInt8GemmStage3::Arguments arguments(
             problem_sizes,
             groups,
-            gate_up_threadblock_count,
+            threadblock_count,
             epilogue,
             activation_ptrs,
             weight_ptrs,
