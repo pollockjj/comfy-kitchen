@@ -11,6 +11,10 @@ def _bf16_small_m_linear_kernel(
     x,
     weight,
     out,
+    stride_xm: tl.constexpr,
+    stride_xk: tl.constexpr,
+    stride_wn: tl.constexpr,
+    stride_wk: tl.constexpr,
     m: tl.constexpr,
     n: tl.constexpr,
     k: tl.constexpr,
@@ -24,12 +28,12 @@ def _bf16_small_m_linear_kernel(
     acc = tl.zeros((16, block_n), tl.float32)
     for k_base in range(0, k, block_k):
         x_tile = tl.load(
-            x + rows[:, None] * k + k_base + inner[None, :],
+            x + rows[:, None] * stride_xm + (k_base + inner[None, :]) * stride_xk,
             mask=rows[:, None] < m,
             other=0.0,
         )
         weight_tile = tl.load(
-            weight + cols[None, :] * k + k_base + inner[:, None],
+            weight + cols[None, :] * stride_wn + (k_base + inner[:, None]) * stride_wk,
             mask=cols[None, :] < n,
             other=0.0,
         )
@@ -72,6 +76,10 @@ def bf16_small_m_linear(
         x_2d,
         weight,
         out,
+        stride_xm=x_2d.stride(0),
+        stride_xk=x_2d.stride(1),
+        stride_wn=weight.stride(0),
+        stride_wk=weight.stride(1),
         m=x_2d.shape[0],
         n=weight.shape[0],
         k=weight.shape[1],
