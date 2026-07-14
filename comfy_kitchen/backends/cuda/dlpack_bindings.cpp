@@ -43,7 +43,8 @@ class CudaGraphExec {
 public:
     CudaGraphExec(cudaGraph_t graph, nb::object retained_objects)
         : graph_(graph), retained_objects_(std::move(retained_objects)) {
-        check_cuda(cudaGraphInstantiate(&graph_exec_, graph_, nullptr, nullptr, 0),
+        check_cuda(cudaGraphInstantiate(
+                       &graph_exec_, graph_, cudaGraphInstantiateFlagAutoFreeOnLaunch),
                    "cudaGraphInstantiate");
     }
 
@@ -102,7 +103,9 @@ public:
             check_cuda(cudaGraphExecDestroy(graph_exec_), "cudaGraphExecDestroy");
             graph_exec_ = nullptr;
             try {
-                check_cuda(cudaGraphInstantiate(&graph_exec_, next_graph, nullptr, nullptr, 0),
+                check_cuda(cudaGraphInstantiate(
+                               &graph_exec_, next_graph,
+                               cudaGraphInstantiateFlagAutoFreeOnLaunch),
                            "cudaGraphInstantiate");
             } catch (...) {
                 cudaGraphDestroy(next_graph);
