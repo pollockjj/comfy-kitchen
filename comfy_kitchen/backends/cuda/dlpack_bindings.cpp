@@ -2157,17 +2157,6 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
-    bool launch_prepare_int8_moe_routes(
-        const int64_t* expert_ids,
-        int32_t* counts,
-        int32_t* route_rank,
-        int32_t* expert_indptr,
-        int64_t* route_order,
-        int64_t* route_dest,
-        int64_t routes,
-        int64_t num_experts,
-        cudaStream_t stream);
-
     bool launch_cutlass_int4_dequant(
         const void* A,
         const void* B,
@@ -2828,27 +2817,6 @@ size_t cutlass_grouped_int8_dequant_packed_workspace_bytes(int64_t groups, int64
         throw std::runtime_error("packed grouped INT8 workspace dimensions must be non-negative");
     }
     return cutlass_grouped_int8_dequant_packed_workspace_size(groups, rows);
-}
-
-bool prepare_int8_moe_routes(
-    nb::ndarray<int64_t, nb::ndim<2>, nb::device::cuda> expert_ids,
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> counts,
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> route_rank,
-    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> expert_indptr,
-    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> route_order,
-    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> route_dest,
-    int64_t num_experts,
-    uintptr_t stream_ptr) {
-    const int64_t routes = static_cast<int64_t>(expert_ids.size());
-    if (num_experts <= 0 || counts.shape(0) != num_experts ||
-        route_rank.shape(0) != routes || expert_indptr.shape(0) != num_experts + 1 ||
-        route_order.shape(0) != routes || route_dest.shape(0) != routes) {
-        throw std::runtime_error("INT8 MoE route workspace shape mismatch");
-    }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    return launch_prepare_int8_moe_routes(
-        expert_ids.data(), counts.data(), route_rank.data(), expert_indptr.data(),
-        route_order.data(), route_dest.data(), routes, num_experts, stream);
 }
 
 bool cutlass_grouped_int8_dequant_packed(
@@ -3708,17 +3676,6 @@ NB_MODULE(_C, m) {
           "Workspace bytes for packed variable-M expert INT8 GEMM",
           nb::arg("groups"),
           nb::arg("rows"));
-
-    m.def("prepare_int8_moe_routes", &prepare_int8_moe_routes,
-          "Build packed INT8 MoE route order, indptr, and inverse destinations",
-          nb::arg("expert_ids"),
-          nb::arg("counts"),
-          nb::arg("route_rank"),
-          nb::arg("expert_indptr"),
-          nb::arg("route_order"),
-          nb::arg("route_dest"),
-          nb::arg("num_experts"),
-          nb::arg("stream_ptr"));
 
     m.def("cutlass_grouped_int8_dequant_packed", &cutlass_grouped_int8_dequant_packed,
           "Packed variable-M expert INT8 GEMM followed by output dequantization",
