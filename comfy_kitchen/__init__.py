@@ -26,8 +26,11 @@ from .tensor.convrot_w4a4 import (
 __version__ = "0.1.0"
 
 __all__ = [
+    "CudaGraph",
+    "abort_cuda_graph_capture",
     # Normalization
     "adaln",
+    "begin_cuda_graph_capture",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -40,6 +43,7 @@ __all__ = [
     "quantize_int8_rowwise",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
+    "end_cuda_graph_capture",
     # Fused matmul
     "scaled_mm_nvfp4",
     "scaled_mm_mxfp8",
@@ -79,6 +83,11 @@ __all__ = [
 # =============================================================================
 # Public API Functions
 # =============================================================================
+
+CudaGraph = _cuda_backend.CudaGraph
+begin_cuda_graph_capture = _cuda_backend.begin_cuda_graph_capture
+end_cuda_graph_capture = _cuda_backend.end_cuda_graph_capture
+abort_cuda_graph_capture = _cuda_backend.abort_cuda_graph_capture
 
 
 def adaln(

@@ -21,6 +21,8 @@ import sys
 import torch
 
 __all__ = [
+    "CudaGraph",
+    "abort_cuda_graph_capture",
     "adaln",
     "apply_rope",
     "apply_rope1",
@@ -58,6 +60,8 @@ __all__ = [
     "scaled_mm_nvfp4",
     "scaled_mm_svdquant_w4a4",
     "stochastic_rounding_fp8",
+    "begin_cuda_graph_capture",
+    "end_cuda_graph_capture",
 ]
 
 
@@ -159,6 +163,65 @@ from comfy_kitchen.tensor.int8_utils import (  # noqa: E402
 )
 
 _CUBLASLT_AVAILABLE = _EXT_AVAILABLE and getattr(_C, "HAS_CUBLASLT", False)
+
+
+def _cuda_stream_ptr(stream: torch.cuda.Stream) -> int:
+    if not isinstance(stream, torch.cuda.Stream):
+        raise TypeError("stream must be a torch.cuda.Stream")
+    return int(stream.cuda_stream)
+
+
+class CudaGraph:
+    """CUDA Runtime graph with explicit update, replay, and destruction."""
+
+    __slots__ = ("_graph_exec",)
+
+    def __init__(self, graph_exec: object):
+        self._graph_exec = graph_exec
+
+    @property
+    def valid(self) -> bool:
+        return bool(self._graph_exec.valid)
+
+    def replay(self, stream: torch.cuda.Stream) -> None:
+        self._graph_exec.replay(_cuda_stream_ptr(stream))
+
+    def update_from_capture(
+        self, stream: torch.cuda.Stream, *captured_objects: object
+    ) -> bool:
+        """End active capture and update the executable; return whether it was reinstantiated."""
+        return bool(
+            self._graph_exec.update_from_capture(
+                _cuda_stream_ptr(stream), captured_objects
+            )
+        )
+
+    def reset(self) -> None:
+        self._graph_exec.reset()
+
+
+def _require_cuda_graph_extension() -> None:
+    if not _EXT_AVAILABLE:
+        raise RuntimeError(f"Comfy Kitchen CUDA extension is unavailable: {_EXT_ERROR}")
+
+
+def begin_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    _require_cuda_graph_extension()
+    _C.begin_cuda_graph_capture(_cuda_stream_ptr(stream))
+
+
+def end_cuda_graph_capture(
+    stream: torch.cuda.Stream, *captured_objects: object
+) -> CudaGraph:
+    _require_cuda_graph_extension()
+    return CudaGraph(
+        _C.end_cuda_graph_capture(_cuda_stream_ptr(stream), captured_objects)
+    )
+
+
+def abort_cuda_graph_capture(stream: torch.cuda.Stream) -> None:
+    _require_cuda_graph_extension()
+    _C.abort_cuda_graph_capture(_cuda_stream_ptr(stream))
 _cublas_workspaces: dict[int, torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
