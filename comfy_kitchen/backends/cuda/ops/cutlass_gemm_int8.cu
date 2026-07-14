@@ -920,3 +920,74 @@ extern "C" bool launch_cutlass_grouped_int8_dequant_packed(
 }
 
 #endif
+
+namespace int8_route_weight {
+constexpr int kThreads = 256;
+
+template <class T>
+__device__ __forceinline__ float to_float(T value);
+
+template <>
+__device__ __forceinline__ float to_float(__half value) {
+    return __half2float(value);
+}
+
+template <>
+__device__ __forceinline__ float to_float(__nv_bfloat16 value) {
+    return __bfloat162float(value);
+}
+
+template <class T>
+__global__ void restore_and_weight(
+    const T* routed_output,
+    const int64_t* route_dest,
+    const float* route_weights,
+    float* output,
+    int routes,
+    int hidden_size) {
+    const int route = blockIdx.x;
+    if (route >= routes) {
+        return;
+    }
+    const int64_t destination = route_dest[route];
+    const float weight = route_weights[route];
+    for (int col = threadIdx.x; col < hidden_size; col += blockDim.x) {
+        output[static_cast<size_t>(route) * hidden_size + col] = destination < 0
+            ? __int_as_float(0x7fc00000)
+            : __fmul_rn(
+                to_float(routed_output[static_cast<size_t>(destination) * hidden_size + col]),
+                weight);
+    }
+}
+}  // namespace int8_route_weight
+
+extern "C" bool launch_restore_weighted_int8_moe_routes(
+    const void* routed_output,
+    const int64_t* route_dest,
+    const float* route_weights,
+    float* output,
+    int64_t routes,
+    int64_t hidden_size,
+    int input_dtype_code,
+    cudaStream_t stream) {
+    if (routes <= 0 || hidden_size <= 0 || routes > INT_MAX || hidden_size > INT_MAX) {
+        return false;
+    }
+    const int route_count = static_cast<int>(routes);
+    const int width = static_cast<int>(hidden_size);
+    switch (input_dtype_code) {
+        case 1:
+            int8_route_weight::restore_and_weight<<<route_count, int8_route_weight::kThreads, 0, stream>>>(
+                static_cast<const __half*>(routed_output), route_dest, route_weights,
+                output, route_count, width);
+            break;
+        case 2:
+            int8_route_weight::restore_and_weight<<<route_count, int8_route_weight::kThreads, 0, stream>>>(
+                static_cast<const __nv_bfloat16*>(routed_output), route_dest, route_weights,
+                output, route_count, width);
+            break;
+        default:
+            return false;
+    }
+    return cudaPeekAtLastError() == cudaSuccess;
+}
