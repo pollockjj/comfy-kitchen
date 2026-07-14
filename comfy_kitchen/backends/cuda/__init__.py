@@ -1983,13 +1983,12 @@ def _rms_rope_cuda(
     if k_scale is None:
         k_scale = q_scale
 
-    bnhd = _native_rms_rope_layout(q, freqs_cis, extension_op="rms_rope")
-    k_bnhd = _native_rms_rope_layout(k, freqs_cis, extension_op="rms_rope1")
-    head_axis = 2 if bnhd else 1
+    bnhd = _native_rms_rope_layout(
+        q, freqs_cis, extension_op="rms_rope"
+    )
     native_fast_path = (
         bnhd is not None
-        and k_bnhd == bnhd
-        and all(k.shape[axis] == q.shape[axis] for axis in range(4) if axis != head_axis)
+        and k.shape == q.shape
         and k.dtype == q.dtype
         and k_scale.ndim == 1
         and k_scale.numel() == q.shape[-1]
@@ -2005,12 +2004,6 @@ def _rms_rope_cuda(
 
         impl = eager_rms_rope_split_half if split_half else eager_rms_rope
         return impl(q, k, freqs_cis, q_scale, k_scale, epsilon)
-
-    if k.shape != q.shape:
-        return (
-            _rms_rope1_cuda(q, freqs_cis, q_scale, epsilon, split_half=split_half),
-            _rms_rope1_cuda(k, freqs_cis, k_scale, epsilon, split_half=split_half),
-        )
 
     if not _has_vectorizable_rms_rope_rows(q):
         q = q.contiguous()
