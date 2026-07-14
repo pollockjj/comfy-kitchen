@@ -44,8 +44,15 @@ template<> __device__ __forceinline__ half from_float<half>(float val) { return 
 template<> __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float val) { return __float2bfloat16_rn(val); }
 
 template<typename T>
-__device__ __forceinline__ T multiply_rounded(T x, T y) {
-    return from_float<T>(to_float(x) * to_float(y));
+__device__ __forceinline__ T gelu_tanh_multiply(T gate, T up) {
+    const float x = to_float(gate);
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    constexpr float kCubicCoefficient = 0.044715f;
+    const float x_cube = x * x * x;
+    const float gelu =
+        0.5f * x * (1.0f + tanhf(kSqrtTwoOverPi * (x + kCubicCoefficient * x_cube)));
+    const T rounded_gelu = from_float<T>(gelu);
+    return from_float<T>(to_float(rounded_gelu) * to_float(up));
 }
 
 template<typename T>
@@ -1077,10 +1084,10 @@ __global__ void quantize_int8_rowwise_convrot_group64_kernel(
 }
 
 template<typename InputType, int BLOCK_THREADS>
-__global__ void multiply_quantize_int8_rowwise_convrot_group64_kernel(
-    const InputType* __restrict__ gelu,
+__global__ void gelu_tanh_multiply_quantize_int8_rowwise_convrot_group64_kernel(
+    const InputType* __restrict__ gate,
     const InputType* __restrict__ up,
-    int64_t gelu_row_stride,
+    int64_t gate_row_stride,
     int64_t up_row_stride,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
@@ -1103,7 +1110,7 @@ __global__ void multiply_quantize_int8_rowwise_convrot_group64_kernel(
     const int sub = tid / kGroupThreads;
     const int lane = tid % kGroupThreads;
     const int64_t output_row_offset = static_cast<int64_t>(row) * K;
-    const int64_t gelu_row_offset = static_cast<int64_t>(row) * gelu_row_stride;
+    const int64_t gate_row_offset = static_cast<int64_t>(row) * gate_row_stride;
     const int64_t up_row_offset = static_cast<int64_t>(row) * up_row_stride;
     const int n_groups = K / kGroupSize;
     const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
@@ -1117,13 +1124,13 @@ __global__ void multiply_quantize_int8_rowwise_convrot_group64_kernel(
         const bool active = group < n_groups;
         const int base = lane * 4;
         const int group_col = group * kGroupSize;
-        const int64_t gelu_offset = gelu_row_offset + group_col + base;
+        const int64_t gate_offset = gate_row_offset + group_col + base;
         const int64_t up_offset = up_row_offset + group_col + base;
 
-        const float x0 = active ? to_float(multiply_rounded(gelu[gelu_offset], up[up_offset])) : 0.0f;
-        const float x1 = active ? to_float(multiply_rounded(gelu[gelu_offset + 1], up[up_offset + 1])) : 0.0f;
-        const float x2 = active ? to_float(multiply_rounded(gelu[gelu_offset + 2], up[up_offset + 2])) : 0.0f;
-        const float x3 = active ? to_float(multiply_rounded(gelu[gelu_offset + 3], up[up_offset + 3])) : 0.0f;
+        const float x0 = active ? to_float(gelu_tanh_multiply(gate[gate_offset], up[up_offset])) : 0.0f;
+        const float x1 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 1], up[up_offset + 1])) : 0.0f;
+        const float x2 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 2], up[up_offset + 2])) : 0.0f;
+        const float x3 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 3], up[up_offset + 3])) : 0.0f;
         buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
         buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
         buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
@@ -1548,10 +1555,10 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
-void launch_multiply_quantize_int8_rowwise_convrot64_kernel(
-    const void* gelu,
+void launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
+    const void* gate,
     const void* up,
-    int64_t gelu_row_stride,
+    int64_t gate_row_stride,
     int64_t up_row_stride,
     void* output,
     void* scales,
@@ -1566,8 +1573,8 @@ void launch_multiply_quantize_int8_rowwise_convrot64_kernel(
     if (num_cols % 64 != 0) {
         throw std::runtime_error("fused GEGLU ConvRot quantization requires K divisible by 64");
     }
-    if (gelu_row_stride < num_cols || up_row_stride < num_cols) {
-        throw std::runtime_error("fused multiply ConvRot quantization requires valid row strides");
+    if (gate_row_stride < num_cols || up_row_stride < num_cols) {
+        throw std::runtime_error("fused GEGLU ConvRot quantization requires valid row strides");
     }
     if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
         throw std::runtime_error("fused GEGLU ConvRot quantization only supports K <= INT_MAX");
@@ -1578,7 +1585,7 @@ void launch_multiply_quantize_int8_rowwise_convrot64_kernel(
         constexpr int groups_in_flight = block_threads / (64 / 4);
         const size_t smem_bytes =
             (static_cast<size_t>(num_cols) + groups_in_flight * 2 * 64) * sizeof(float);
-        auto kernel = comfy::multiply_quantize_int8_rowwise_convrot_group64_kernel<
+        auto kernel = comfy::gelu_tanh_multiply_quantize_int8_rowwise_convrot_group64_kernel<
             InputType, block_threads>;
         cudaError_t attr_err = cudaFuncSetAttribute(
             kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
@@ -1588,9 +1595,9 @@ void launch_multiply_quantize_int8_rowwise_convrot64_kernel(
                 cudaGetErrorString(attr_err));
         }
         kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
-            static_cast<const InputType*>(gelu),
+            static_cast<const InputType*>(gate),
             static_cast<const InputType*>(up),
-            gelu_row_stride,
+            gate_row_stride,
             up_row_stride,
             static_cast<int8_t*>(output),
             static_cast<float*>(scales),

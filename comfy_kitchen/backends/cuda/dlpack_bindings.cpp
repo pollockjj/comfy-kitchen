@@ -2232,10 +2232,10 @@ extern "C" {
         uint64_t seed,
         cudaStream_t stream);
 
-    void launch_multiply_quantize_int8_rowwise_convrot64_kernel(
-        const void* gelu,
+    void launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
+        const void* gate,
         const void* up,
-        int64_t gelu_row_stride,
+        int64_t gate_row_stride,
         int64_t up_row_stride,
         void* output,
         void* scales,
@@ -3089,20 +3089,20 @@ void quantize_int8_rowwise_convrot64(
         stream);
 }
 
-void multiply_quantize_int8_rowwise_convrot64(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> gelu,
+void gelu_tanh_multiply_quantize_int8_rowwise_convrot64(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> gate,
     nb::ndarray<nb::ndim<2>, nb::device::cuda> up,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
     uintptr_t stream_ptr) {
 
-    const int64_t M = gelu.shape(0);
-    const int64_t K = gelu.shape(1);
+    const int64_t M = gate.shape(0);
+    const int64_t K = gate.shape(1);
     if (up.shape(0) != M || up.shape(1) != K) {
         throw std::runtime_error("fused GEGLU ConvRot gate/up shape mismatch");
     }
-    if (gelu.stride(1) != 1 || up.stride(1) != 1) {
-        throw std::runtime_error("fused multiply ConvRot inputs must be contiguous in the last dimension");
+    if (gate.stride(1) != 1 || up.stride(1) != 1) {
+        throw std::runtime_error("fused GEGLU ConvRot gate/up last dimension must be contiguous");
     }
     if (output.shape(0) != M || output.shape(1) != K) {
         throw std::runtime_error("fused GEGLU ConvRot output shape mismatch");
@@ -3110,16 +3110,16 @@ void multiply_quantize_int8_rowwise_convrot64(
     if (scales.shape(0) != M || scales.shape(1) != 1) {
         throw std::runtime_error("fused GEGLU ConvRot scale shape mismatch");
     }
-    const int input_dtype_code = map_dtype_to_code(gelu.dtype());
+    const int input_dtype_code = map_dtype_to_code(gate.dtype());
     if (input_dtype_code < 0 || input_dtype_code > 2 || map_dtype_to_code(up.dtype()) != input_dtype_code) {
         throw std::runtime_error("fused GEGLU ConvRot requires matching floating gate/up dtypes");
     }
 
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_multiply_quantize_int8_rowwise_convrot64_kernel(
-        gelu.data(),
+    launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
+        gate.data(),
         up.data(),
-        gelu.stride(0),
+        gate.stride(0),
         up.stride(0),
         output.data(),
         scales.data(),
@@ -3803,10 +3803,10 @@ NB_MODULE(_C, m) {
           nb::arg("seed"),
           nb::arg("stream_ptr"));
 
-    m.def("multiply_quantize_int8_rowwise_convrot64",
-          &multiply_quantize_int8_rowwise_convrot64,
-          "Fused multiply and group-64 ConvRot INT8 quantization",
-          nb::arg("gelu"),
+    m.def("gelu_tanh_multiply_quantize_int8_rowwise_convrot64",
+          &gelu_tanh_multiply_quantize_int8_rowwise_convrot64,
+          "Fused tanh GELU, multiply, and group-64 ConvRot INT8 quantization",
+          nb::arg("gate"),
           nb::arg("up"),
           nb::arg("output"),
           nb::arg("scales"),
