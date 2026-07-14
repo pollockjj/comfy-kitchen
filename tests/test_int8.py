@@ -84,8 +84,8 @@ def test_cuda_int8_linear_does_not_retain_scratch_tensors():
 
 
 def test_cuda_int8_convrot_weighted_embedding_is_bit_exact():
-    if not torch.cuda.is_available():
-        pytest.skip("CUDA required")
+    if not torch.cuda.is_available() or not cuda.status().get("available", False):
+        pytest.skip("CUDA backend required")
 
     torch.manual_seed(51)
     qweight = torch.randint(-127, 128, (128, 256), device="cuda", dtype=torch.int8)
