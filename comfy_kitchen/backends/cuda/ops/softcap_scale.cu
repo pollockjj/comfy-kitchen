@@ -130,6 +130,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     __shared__ float inverse_exponential_sum;
 
     MaxPair local_max{-FLT_MAX, INT64_MAX};
+    #pragma unroll 4
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         const float raw = __bfloat162float(row_raw[col]);
         const float processed = tanhf(raw * (1.0f / cap)) * cap * inverse_temperature;
@@ -141,6 +142,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     const MaxPair maximum = block_reduce_max_pair(local_max, warp_values, warp_indices);
 
     float exponential_sum = 0.0f;
+    #pragma unroll 4
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         exponential_sum += __expf(row_processed[col] - maximum.value);
     }
@@ -155,6 +157,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
 
     float entropy_sum = 0.0f;
     MaxPair local_sample{-FLT_MAX, INT64_MAX};
+    #pragma unroll 4
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         const float normalized = row_processed[col] - log_normalizer;
         const float probability = __expf(normalized - normalized_max) * inverse_exponential_sum;
