@@ -69,6 +69,12 @@ public:
         uint64_t,
         int64_t
     );
+    using cublasLtMatrixLayoutSetAttribute_t = cublasStatus_t (*)(
+        cublasLtMatrixLayout_t,
+        cublasLtMatrixLayoutAttribute_t,
+        const void*,
+        size_t
+    );
     using cublasLtMatrixLayoutDestroy_t = cublasStatus_t (*)(cublasLtMatrixLayout_t);
     using cublasLtMatmulPreferenceCreate_t = cublasStatus_t (*)(cublasLtMatmulPreference_t*);
     using cublasLtMatmulPreferenceDestroy_t = cublasStatus_t (*)(cublasLtMatmulPreference_t);
@@ -114,6 +120,7 @@ public:
     cublasLtMatmulDescDestroy_t cublasLtMatmulDescDestroy = nullptr;
     cublasLtMatmulDescSetAttribute_t cublasLtMatmulDescSetAttribute = nullptr;
     cublasLtMatrixLayoutCreate_t cublasLtMatrixLayoutCreate = nullptr;
+    cublasLtMatrixLayoutSetAttribute_t cublasLtMatrixLayoutSetAttribute = nullptr;
     cublasLtMatrixLayoutDestroy_t cublasLtMatrixLayoutDestroy = nullptr;
     cublasLtMatmulPreferenceCreate_t cublasLtMatmulPreferenceCreate = nullptr;
     cublasLtMatmulPreferenceDestroy_t cublasLtMatmulPreferenceDestroy = nullptr;
@@ -208,6 +215,7 @@ private:
         LOAD_SYMBOL(cublasLtMatmulDescDestroy);
         LOAD_SYMBOL(cublasLtMatmulDescSetAttribute);
         LOAD_SYMBOL(cublasLtMatrixLayoutCreate);
+        LOAD_SYMBOL(cublasLtMatrixLayoutSetAttribute);
         LOAD_SYMBOL(cublasLtMatrixLayoutDestroy);
         LOAD_SYMBOL(cublasLtMatmulPreferenceCreate);
         LOAD_SYMBOL(cublasLtMatmulPreferenceDestroy);
@@ -238,6 +246,7 @@ private:
         cublasLtMatmulDescDestroy = nullptr;
         cublasLtMatmulDescSetAttribute = nullptr;
         cublasLtMatrixLayoutCreate = nullptr;
+        cublasLtMatrixLayoutSetAttribute = nullptr;
         cublasLtMatrixLayoutDestroy = nullptr;
         cublasLtMatmulPreferenceCreate = nullptr;
         cublasLtMatmulPreferenceDestroy = nullptr;

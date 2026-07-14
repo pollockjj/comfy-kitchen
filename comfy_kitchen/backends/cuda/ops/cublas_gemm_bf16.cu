@@ -22,8 +22,8 @@ thread_local cublasLtHandle_t bf16_handle = nullptr;
 
 struct Bf16Plan {
   cublasLtMatmulDesc_t operation = nullptr;
-  cublasLtMatrixLayout_t weight = nullptr;
   cublasLtMatrixLayout_t input = nullptr;
+  cublasLtMatrixLayout_t weight = nullptr;
   cublasLtMatrixLayout_t output = nullptr;
   cublasLtMatmulAlgo_t algo = {};
   bool initialized = false;
@@ -55,16 +55,23 @@ Bf16Plan& get_gate_up_plan() {
   auto& plan = gate_up_plan;
 
   CUBLAS_CHECK(runtime.cublasLtMatmulDescCreate(&plan.operation, CUBLAS_COMPUTE_32F, CUDA_R_32F));
-  const cublasOperation_t trans_weight = CUBLAS_OP_T;
   const cublasOperation_t trans_input = CUBLAS_OP_N;
+  const cublasOperation_t trans_weight = CUBLAS_OP_T;
   CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
-      plan.operation, CUBLASLT_MATMUL_DESC_TRANSA, &trans_weight, sizeof(trans_weight)));
+      plan.operation, CUBLASLT_MATMUL_DESC_TRANSA, &trans_input, sizeof(trans_input)));
   CUBLAS_CHECK(runtime.cublasLtMatmulDescSetAttribute(
-      plan.operation, CUBLASLT_MATMUL_DESC_TRANSB, &trans_input, sizeof(trans_input)));
+      plan.operation, CUBLASLT_MATMUL_DESC_TRANSB, &trans_weight, sizeof(trans_weight)));
 
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.weight, CUDA_R_16BF, K, N, K));
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.input, CUDA_R_16BF, K, M, K));
-  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.output, CUDA_R_16BF, N, M, N));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.input, CUDA_R_16BF, M, K, K));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.weight, CUDA_R_16BF, N, K, K));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutCreate(&plan.output, CUDA_R_16BF, M, N, N));
+  const cublasLtOrder_t row_major = CUBLASLT_ORDER_ROW;
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutSetAttribute(
+      plan.input, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major, sizeof(row_major)));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutSetAttribute(
+      plan.weight, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major, sizeof(row_major)));
+  CUBLAS_CHECK(runtime.cublasLtMatrixLayoutSetAttribute(
+      plan.output, CUBLASLT_MATRIX_LAYOUT_ORDER, &row_major, sizeof(row_major)));
 
   cublasLtMatmulPreference_t preference = nullptr;
   CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceCreate(&preference));
@@ -73,11 +80,11 @@ Bf16Plan& get_gate_up_plan() {
       preference, CUBLASLT_MATMUL_PREF_MAX_WORKSPACE_BYTES,
       &workspace_bytes, sizeof(workspace_bytes)));
 
-  cublasLtMatmulHeuristicResult_t results[16] = {};
+  cublasLtMatmulHeuristicResult_t results[200] = {};
   int returned = 0;
   CUBLAS_CHECK(runtime.cublasLtMatmulAlgoGetHeuristic(
-      handle, plan.operation, plan.weight, plan.input, plan.output, plan.output,
-      preference, 16, results, &returned));
+      handle, plan.operation, plan.input, plan.weight, plan.output, plan.output,
+      preference, 200, results, &returned));
   CUBLAS_CHECK(runtime.cublasLtMatmulPreferenceDestroy(preference));
 
   bool found = false;
@@ -121,8 +128,8 @@ void tuned_gate_up(
   const float beta = 0.0f;
   CUBLAS_CHECK(runtime.cublasLtMatmul(
       get_handle(), plan.operation, &alpha,
-      weight, plan.weight,
       input, plan.input,
+      weight, plan.weight,
       &beta,
       output, plan.output,
       output, plan.output,
