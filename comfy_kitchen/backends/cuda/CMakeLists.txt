@@ -106,6 +106,7 @@ set(CUDA_SOURCES
     ops/quantize_mxfp8.cu
     ops/cublas_gemm_nvfp4.cu
     ops/cublas_gemm_int8.cu
+    ops/cublas_gemm_bf16.cu
     ops/cutlass_gemm_int8.cu
     ops/turing_int8.cu
     ops/int8_linear.cu
