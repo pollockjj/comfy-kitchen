@@ -127,6 +127,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     __shared__ int64_t warp_indices[kWarps];
     __shared__ float log_normalizer;
     __shared__ float normalized_max;
+    __shared__ float inverse_exponential_sum;
 
     MaxPair local_max{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
@@ -147,6 +148,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     if (threadIdx.x == 0) {
         log_normalizer = __logf(exponential_sum) + maximum.value;
         normalized_max = maximum.value - log_normalizer;
+        inverse_exponential_sum = __fdividef(1.0f, exponential_sum);
         argmax[row] = maximum.index;
     }
     __syncthreads();
@@ -155,7 +157,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
     MaxPair local_sample{-FLT_MAX, INT64_MAX};
     for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
         const float normalized = row_processed[col] - log_normalizer;
-        const float probability = __fdividef(__expf(normalized - normalized_max), exponential_sum);
+        const float probability = __expf(normalized - normalized_max) * inverse_exponential_sum;
         const float noise = row_noise[col];
         if (!isfinite(noise) || noise <= 0.0f) {
             atomicExch(invalid, 1);
