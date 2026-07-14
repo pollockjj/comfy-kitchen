@@ -465,7 +465,7 @@ using PackedInt8Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     cutlass::gemm::GemmShape<16, 8, 32>,
     PackedInt8Epilogue,
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-    3,
+    4,
     cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly,
     cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
 using PackedInt8Gemm = cutlass::gemm::device::GemmGrouped<PackedInt8Kernel>;
