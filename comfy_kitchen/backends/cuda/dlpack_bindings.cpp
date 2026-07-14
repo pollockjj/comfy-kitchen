@@ -80,8 +80,13 @@ public:
         if (graph_exec_ == nullptr) {
             throw std::runtime_error("CUDA graph executable has been reset");
         }
-        synchronize_replays();
         cudaGraph_t next_graph = end_capture(stream_ptr);
+        try {
+            synchronize_replays();
+        } catch (...) {
+            cudaGraphDestroy(next_graph);
+            throw;
+        }
         bool reinstantiated = false;
 #if CUDART_VERSION >= 12000
         cudaGraphExecUpdateResultInfo result_info{};
