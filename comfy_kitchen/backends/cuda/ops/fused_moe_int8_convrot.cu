@@ -23,17 +23,6 @@ extern "C" void launch_quantize_int8_rowwise_convrot64_kernel(
     uint64_t seed,
     cudaStream_t stream);
 
-extern "C" void launch_quantize_int8_rowwise_convrot256_routed_kernel(
-    const void* input,
-    const int32_t* route_dest,
-    void* output,
-    void* scales,
-    int64_t num_rows,
-    int64_t num_cols,
-    int top_k,
-    int input_dtype_code,
-    cudaStream_t stream);
-
 extern "C" size_t cutlass_grouped_int8_dequant_packed_workspace_size(
     int64_t groups,
     int64_t rows);
@@ -302,7 +291,6 @@ bool run_fused_moe_int8_convrot(
     int fc1_group_size,
     int fc2_group_size,
     int dtype_code,
-    bool fuse_input_route,
     void* workspace_ptr,
     size_t workspace_size,
     cudaStream_t stream) {
@@ -337,10 +325,8 @@ bool run_fused_moe_int8_convrot(
 
     last_error_stage = 4;
     WorkspaceArena stage1(scratch, scratch_size);
-    int8_t* token_qdata = fuse_input_route
-        ? nullptr
-        : stage1.allocate<int8_t>(static_cast<size_t>(n) * h);
-    float* token_scales = fuse_input_route ? nullptr : stage1.allocate<float>(n);
+    int8_t* token_qdata = stage1.allocate<int8_t>(static_cast<size_t>(n) * h);
+    float* token_scales = stage1.allocate<float>(n);
     int8_t* routed_qdata = stage1.allocate<int8_t>(static_cast<size_t>(routes) * h);
     float* routed_scales = stage1.allocate<float>(routes);
     int32_t* fc1_accumulator =
@@ -351,32 +337,21 @@ bool run_fused_moe_int8_convrot(
     const size_t fc1_workspace_size = stage1.remaining();
     const size_t packed_workspace_size =
         cutlass_grouped_int8_dequant_packed_workspace_size(e, routes);
-    if ((!fuse_input_route && (token_qdata == nullptr || token_scales == nullptr)) ||
-        routed_qdata == nullptr ||
+    if (token_qdata == nullptr || token_scales == nullptr || routed_qdata == nullptr ||
         routed_scales == nullptr || fc1_accumulator == nullptr || gate_up == nullptr ||
         fc1_workspace == nullptr || fc1_workspace_size < packed_workspace_size) {
         return false;
     }
 
     try {
-        if (fuse_input_route) {
-            if (fc1_group_size != 256) {
-                return false;
-            }
-            launch_quantize_int8_rowwise_convrot256_routed_kernel(
-                input, route_dest, routed_qdata, routed_scales, n, h, top_k,
-                dtype_code, stream);
-        } else {
-            launch_quantize_int8_rowwise_convrot64_kernel(
-                input, token_qdata, token_scales, n, h, fc1_group_size, dtype_code,
-                false, 0, stream);
-            replicate_quantized_routes<<<n, kRouteThreads, 0, stream>>>(
-                token_qdata, token_scales, route_dest, routed_qdata, routed_scales,
-                n, h, top_k);
-        }
+        launch_quantize_int8_rowwise_convrot64_kernel(
+            input, token_qdata, token_scales, n, h, fc1_group_size, dtype_code,
+            false, 0, stream);
     } catch (...) {
         return false;
     }
+    replicate_quantized_routes<<<n, kRouteThreads, 0, stream>>>(
+        token_qdata, token_scales, route_dest, routed_qdata, routed_scales, n, h, top_k);
     if (cudaPeekAtLastError() != cudaSuccess) {
         return false;
     }
@@ -471,7 +446,6 @@ extern "C" bool launch_cutlass_fused_moe_int8_convrot(
     int fc1_group_size,
     int fc2_group_size,
     int dtype_code,
-    bool fuse_input_route,
     void* workspace_ptr,
     int64_t workspace_size,
     cudaStream_t stream) {
@@ -508,7 +482,7 @@ extern "C" bool launch_cutlass_fused_moe_int8_convrot(
             static_cast<int>(num_tokens), static_cast<int>(hidden_size),
             static_cast<int>(intermediate_size), static_cast<int>(num_experts),
             static_cast<int>(top_k), fc1_group_size, fc2_group_size, dtype_code,
-            fuse_input_route, workspace_ptr, static_cast<size_t>(workspace_size), stream);
+            workspace_ptr, static_cast<size_t>(workspace_size), stream);
     }
     return run_fused_moe_int8_convrot<__nv_bfloat16>(
         input, expert_ids, router_weights, static_cast<const int8_t*>(fc1_qdata),
@@ -516,7 +490,7 @@ extern "C" bool launch_cutlass_fused_moe_int8_convrot(
         static_cast<int>(num_tokens), static_cast<int>(hidden_size),
         static_cast<int>(intermediate_size), static_cast<int>(num_experts),
         static_cast<int>(top_k), fc1_group_size, fc2_group_size, dtype_code,
-        fuse_input_route, workspace_ptr, static_cast<size_t>(workspace_size), stream);
+        workspace_ptr, static_cast<size_t>(workspace_size), stream);
 }
 
 extern "C" int cutlass_fused_moe_int8_convrot_last_error_stage() {
