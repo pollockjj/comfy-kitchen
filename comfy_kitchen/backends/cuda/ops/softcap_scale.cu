@@ -164,7 +164,7 @@ __global__ void softcap_categorical_stats_sample_bf16_kernel(
         } else {
             local_sample = better_pair(local_sample, MaxPair{__fdiv_rn(probability, noise), col});
         }
-        entropy_sum += fmaxf(normalized, -FLT_MAX) * probability;
+        entropy_sum += normalized * probability;
     }
     entropy_sum = block_reduce_sum(entropy_sum, warp_values);
     const MaxPair sampled = block_reduce_max_pair(local_sample, warp_values, warp_indices);
