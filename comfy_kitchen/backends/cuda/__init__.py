@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "bf16_cublaslt_linear",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -339,6 +340,35 @@ def get_cublas_workspace() -> torch.Tensor:
         )
         _cublas_workspaces[device_index] = workspace
     return workspace
+
+
+def bf16_cublaslt_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    out: torch.Tensor,
+    algorithm_index: int,
+) -> torch.Tensor:
+    """Run one indexed cuBLASLt BF16 linear heuristic into caller-owned storage."""
+    if x.ndim < 2 or weight.ndim != 2:
+        raise ValueError("BF16 cuBLASLt linear requires rank-2 weight and rank-2+ input")
+
+    k = x.shape[-1]
+    n = weight.shape[0]
+    x_2d = x.reshape(-1, k)
+    out_2d = out.reshape(-1, n)
+    if x_2d.shape[0] != out_2d.shape[0]:
+        raise ValueError("BF16 cuBLASLt linear output shape does not match input")
+
+    workspace = get_cublas_workspace()
+    _C.bf16_cublaslt_linear(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(out_2d),
+        _wrap_for_dlpack(workspace),
+        algorithm_index,
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    return out_2d.reshape(*x.shape[:-1], n)
 
 
 def _empty_cuda_tensor(device: torch.device, dtype: torch.dtype) -> torch.Tensor:
