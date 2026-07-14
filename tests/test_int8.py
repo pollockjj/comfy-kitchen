@@ -83,6 +83,22 @@ def test_cuda_int8_linear_does_not_retain_scratch_tensors():
     assert not hasattr(cuda, "_int8_gemm_int32_scratch_tensor")
 
 
+def test_cuda_int8_convrot_weighted_embedding_is_bit_exact():
+    if not torch.cuda.is_available() or not cuda.status().get("available", False):
+        pytest.skip("CUDA backend required")
+
+    torch.manual_seed(51)
+    qweight = torch.randint(-127, 128, (128, 256), device="cuda", dtype=torch.int8)
+    scales = torch.rand((128, 1), device="cuda", dtype=torch.float32) * 0.02
+    weights = torch.randn((128, 128), device="cuda", dtype=torch.bfloat16)
+    reference_weight = cuda.dequantize_int8_convrot_weight_dtype(qweight, scales, 256, 2)
+    reference = torch.mm(weights, reference_weight, out_dtype=torch.float32)
+    with ck.registry.use_backend("cuda"):
+        actual = ck.int8_convrot_weighted_embedding(qweight, scales, weights, 256)
+
+    assert torch.equal(actual.view(torch.int32), reference.view(torch.int32))
+
+
 def test_turing_fused_int8_shape_selection():
     assert cuda._prefer_turing_fused_int8(128, 4096, 4096)
     assert cuda._prefer_turing_fused_int8(512, 2048, 1024)

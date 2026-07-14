@@ -70,6 +70,7 @@ from .quantization import (
     dequantize_per_tensor_fp8,
     grouped_int8_convrot_linear,
     grouped_int8_convrot_linear_packed,
+    int8_convrot_weighted_embedding,
     int8_linear,
     mxfp8_embedding,
     mxfp8_weighted_embedding,
@@ -564,6 +565,23 @@ def _build_constraints() -> dict:
                         dtypes=frozenset({torch.bfloat16}),
                         shape_rules=(ExactDims(2),),
                     ),
+                },
+                default_devices=all_devices)
+
+        out["int8_convrot_weighted_embedding"] = FunctionConstraints(
+                params={
+                    "qweight": ParamConstraint(
+                        dtypes=frozenset({torch.int8}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "scales": ParamConstraint(
+                        dtypes=frozenset({torch.float32}),
+                    ),
+                    "weights": ParamConstraint(
+                        dtypes=frozenset({torch.bfloat16}),
+                        shape_rules=(ExactDims(2),),
+                    ),
+                    "group_size": ParamConstraint(dtypes=frozenset({int})),
                 },
                 default_devices=all_devices)
 

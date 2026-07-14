@@ -522,6 +522,18 @@ extern "C" {
         int split_k,
         cudaStream_t stream);
 
+    void launch_int8_convrot_weighted_embedding_kernel(
+        const void* qweight,
+        const void* scales,
+        const void* weights,
+        float* partials,
+        float* output,
+        int64_t m,
+        int64_t k,
+        int64_t n,
+        int partitions,
+        cudaStream_t stream);
+
     // SVDQuant W4A4 — see ops/quantize_svdquant_w4a4.cu
     void launch_svdquant_quantize_w4a4_kernel(
         const void* x,
@@ -1554,6 +1566,49 @@ void mxfp8_weighted_embedding(
         qweight.data(), block_scales.data(), weights.data(),
         static_cast<float*>(partials.data()), static_cast<float*>(output.data()),
         m, k, n, split_k, reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void int8_convrot_weighted_embedding(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> qweight,
+    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weights,
+    nb::ndarray<float, nb::device::cuda> partials,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> output,
+    int group_size,
+    int partitions,
+    uintptr_t stream_ptr)
+{
+    const int64_t k = static_cast<int64_t>(qweight.shape(0));
+    const int64_t n = static_cast<int64_t>(qweight.shape(1));
+    const int64_t m = static_cast<int64_t>(weights.shape(0));
+    if (m <= 0 || k <= 0 || n <= 0 || weights.shape(1) != k) {
+        throw std::runtime_error("int8_convrot_weighted_embedding shape mismatch");
+    }
+    if (m % 128 || k % 32 || n % 256 || group_size != 256) {
+        throw std::runtime_error(
+            "int8_convrot_weighted_embedding requires M%128 == 0, K%32 == 0, "
+            "N%256 == 0, and group_size == 256");
+    }
+    if (scales.size() != static_cast<size_t>(k)
+        || map_dtype_to_code(weights.dtype()) != 2) {
+        throw std::runtime_error("int8_convrot_weighted_embedding dtype or scale mismatch");
+    }
+    if (partitions <= 0
+        || static_cast<int64_t>(partials.size()) != static_cast<int64_t>(partitions) * m * n
+        || static_cast<int64_t>(output.size()) != m * n) {
+        throw std::runtime_error("int8_convrot_weighted_embedding workspace shape mismatch");
+    }
+    const int device = qweight.device_id();
+    if (scales.device_id() != device
+        || weights.device_id() != device
+        || partials.device_id() != device
+        || output.device_id() != device) {
+        throw std::runtime_error(
+            "int8_convrot_weighted_embedding tensors must share one CUDA device");
+    }
+    launch_int8_convrot_weighted_embedding_kernel(
+        qweight.data(), scales.data(), weights.data(), partials.data(), output.data(),
+        m, k, n, partitions, reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Nanobind wrapper for apply_rope (handles both single tensor and q/k pair)
@@ -3882,6 +3937,17 @@ NB_MODULE(_C, m) {
           nb::arg("partials"),
           nb::arg("output"),
           nb::arg("split_k"),
+          nb::arg("stream_ptr"));
+
+    m.def("int8_convrot_weighted_embedding", &int8_convrot_weighted_embedding,
+          "Multiply BF16 probabilities by a ConvRot INT8 embedding into FP32",
+          nb::arg("qweight"),
+          nb::arg("scales"),
+          nb::arg("weights"),
+          nb::arg("partials"),
+          nb::arg("output"),
+          nb::arg("group_size"),
+          nb::arg("partitions"),
           nb::arg("stream_ptr"));
 
     m.def("svdquant_quantize_w4a4", &svdquant_quantize_w4a4,
