@@ -28,6 +28,7 @@ __version__ = "0.1.0"
 __all__ = [
     # Normalization
     "adaln",
+    "bf16_small_batch_linear",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -99,6 +100,14 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def bf16_small_batch_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Multiply up to three BF16 rows by a row-major BF16 linear weight."""
+    return torch.ops.comfy_kitchen.bf16_small_batch_linear(x, weight)
 
 
 def quantize_per_tensor_fp8(

@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "bf16_small_batch_linear",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -45,6 +46,7 @@ from comfy_kitchen.constraints import (
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln
+from .linear import bf16_small_batch_linear
 from .awq import gemv_awq_w4a16
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -91,6 +93,15 @@ def _build_constraints() -> dict:
     scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "bf16_small_batch_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=standard_floats),
+                "weight": ParamConstraint(
+                    dtypes=standard_floats, shape_rules=(ExactDims(2),)
+                ),
+            },
+            default_devices=all_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),

@@ -117,7 +117,7 @@ class CMakeBuildExt(build_ext):
 
         build_args = ["--config", config]
 
-        max_jobs = os.cpu_count() or 1
+        max_jobs = int(os.environ.get("MAX_JOBS", os.cpu_count() or 1))
         # Use appropriate parallel build syntax for the platform
         if os.name == "nt":
             # Windows MSBuild uses /m:N for parallel builds

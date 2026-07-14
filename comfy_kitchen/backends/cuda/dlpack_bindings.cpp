@@ -239,6 +239,15 @@ extern "C" {
         float       eps,
         int         dtype_code,
         cudaStream_t stream);
+
+    void launch_bf16_small_batch_linear_kernel(
+        const void* x,
+        const void* weight,
+        void* out,
+        int m,
+        int n,
+        int k,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -911,6 +920,30 @@ void adaln(
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
         N, D, scale_group, shift_group, eps, dtype_code, stream);
+}
+
+void bf16_small_batch_linear(
+    nb::ndarray<nb::device::cuda> x,
+    nb::ndarray<nb::device::cuda> weight,
+    nb::ndarray<nb::device::cuda> out,
+    uintptr_t stream_ptr) {
+    if (map_dtype_to_code(x.dtype()) != 2 || map_dtype_to_code(weight.dtype()) != 2
+            || map_dtype_to_code(out.dtype()) != 2) {
+        throw std::runtime_error("bf16_small_batch_linear requires BF16 tensors");
+    }
+    if (x.ndim() != 2 || weight.ndim() != 2 || out.ndim() != 2) {
+        throw std::runtime_error("bf16_small_batch_linear requires 2D tensor views");
+    }
+    const int m = static_cast<int>(x.shape(0));
+    const int k = static_cast<int>(x.shape(1));
+    const int n = static_cast<int>(weight.shape(0));
+    if (m < 1 || m > 3 || k != weight.shape(1) || k % 64 != 0
+            || out.shape(0) != m || out.shape(1) != n) {
+        throw std::runtime_error("bf16_small_batch_linear requires M in [1,3], matching K divisible by 64, and output [M,N]");
+    }
+    launch_bf16_small_batch_linear_kernel(
+        x.data(), weight.data(), out.data(), m, n, k,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Python module definition
@@ -2549,6 +2582,13 @@ NB_MODULE(_C, m) {
           nb::arg("shift_group"),
           nb::arg("eps"),
           nb::arg("dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("bf16_small_batch_linear", &bf16_small_batch_linear,
+          "BF16 small-batch linear for M=1..3 with FP32 tensor-core accumulation",
+          nb::arg("x"),
+          nb::arg("weight"),
+          nb::arg("out"),
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

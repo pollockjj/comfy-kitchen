@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "bf16_small_batch_linear",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -203,6 +204,35 @@ def _cuda_device_supports_native_int4_mma(tensor: torch.Tensor) -> bool:
     # sm80+ integer MMA shape. Hopper is routed through the INT8 fallback for
     # better behavior with this implementation.
     return major == 8
+
+
+def bf16_small_batch_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    if (
+        x.dtype != torch.bfloat16
+        or weight.dtype != torch.bfloat16
+        or x.ndim < 2
+        or weight.ndim != 2
+        or x.shape[-1] != weight.shape[1]
+        or x.shape[-1] % 64 != 0
+        or x.numel() // x.shape[-1] not in (1, 2, 3)
+    ):
+        return torch.nn.functional.linear(x, weight)
+    x_2d = x.contiguous().view(-1, x.shape[-1])
+    weight_2d = weight.contiguous()
+    out_2d = torch.empty(
+        (x_2d.shape[0], weight_2d.shape[0]), dtype=x.dtype, device=x.device
+    )
+    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
+    _C.bf16_small_batch_linear(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(weight_2d),
+        _wrap_for_dlpack(out_2d),
+        stream_ptr,
+    )
+    return out_2d.view(*x.shape[:-1], weight_2d.shape[0])
 
 
 def _should_use_turing_int4(tensor: torch.Tensor) -> bool:
@@ -2440,6 +2470,19 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "bf16_small_batch_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}), shape_rules=(MinDims(2),)
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2), DivisibleBy(dim=1, factor=64)),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(
