@@ -1428,6 +1428,15 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
                 launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_256, false>,
                        block_threads_256);
             }
+        } else if (num_cols == 2816) {
+            constexpr int block_threads_2816 = 704;
+            if (stochastic) {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2816, true>,
+                       block_threads_2816);
+            } else {
+                launch(comfy::quantize_int8_rowwise_convrot64_kernel<InputType, block_threads_2816, false>,
+                       block_threads_2816);
+            }
         } else if (num_cols == 2560) {
             constexpr int block_threads_2560 = 640;
             if (stochastic) {
