@@ -225,8 +225,9 @@ def softcap_categorical_stats_sample(
     exponential_noise: torch.Tensor,
     cap: float,
     inverse_temperature: float,
+    precompute_probabilities: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Return DG processed/self-conditioning logits, entropy, argmax, and sample."""
+    """Return DG processed/self-conditioning values, entropy, argmax, and sample."""
     if raw_logits.dtype != torch.bfloat16 or exponential_noise.dtype != torch.float32:
         raise ValueError("softcap_categorical_stats_sample requires BF16 logits and FP32 noise")
     if raw_logits.shape != exponential_noise.shape:
@@ -249,7 +250,7 @@ def softcap_categorical_stats_sample(
     noise_2d = exponential_noise.reshape(raw_logits_2d.shape)
     processed, self_conditioning, entropy, argmax, sample, invalid = (
         torch.ops.comfy_kitchen.softcap_categorical_stats_sample(
-            raw_logits_2d, noise_2d, cap, inverse_temperature
+            raw_logits_2d, noise_2d, cap, inverse_temperature, precompute_probabilities
         )
     )
     if invalid.device.type in {"cpu", "cuda", "meta"}:

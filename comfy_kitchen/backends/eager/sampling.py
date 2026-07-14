@@ -44,15 +44,19 @@ def softcap_categorical_stats_sample(
     exponential_noise: torch.Tensor,
     cap: float,
     inverse_temperature: float,
+    precompute_probabilities: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse DG softcapping, BF16 self-conditioning, statistics, and sampling."""
     processed_logits = softcap_scale(raw_logits, cap, inverse_temperature)
     entropy, argmax, sample, invalid = categorical_stats_sample(
         processed_logits, exponential_noise
     )
+    self_conditioning = processed_logits.to(torch.bfloat16)
+    if precompute_probabilities:
+        self_conditioning = self_conditioning.softmax(dim=-1, dtype=torch.float32).to(torch.bfloat16)
     return (
         processed_logits,
-        processed_logits.to(torch.bfloat16),
+        self_conditioning,
         entropy,
         argmax,
         sample,
@@ -126,19 +130,23 @@ def _op_softcap_categorical_stats_sample(
     exponential_noise: torch.Tensor,
     cap: float,
     inverse_temperature: float,
+    precompute_probabilities: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     kwargs = {
         "raw_logits": raw_logits,
         "exponential_noise": exponential_noise,
         "cap": cap,
         "inverse_temperature": inverse_temperature,
+        "precompute_probabilities": precompute_probabilities,
     }
     impl = registry.get_implementation("softcap_categorical_stats_sample", kwargs=kwargs)
     return impl(**kwargs)
 
 
 @_op_softcap_categorical_stats_sample.register_fake
-def _op_softcap_categorical_stats_sample_fake(raw_logits, exponential_noise, cap, inverse_temperature):
+def _op_softcap_categorical_stats_sample_fake(
+    raw_logits, exponential_noise, cap, inverse_temperature, precompute_probabilities
+):
     rows = raw_logits.shape[0]
     return (
         torch.empty_like(raw_logits, dtype=torch.float32),

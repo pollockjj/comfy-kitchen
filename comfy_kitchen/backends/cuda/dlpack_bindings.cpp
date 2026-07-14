@@ -249,6 +249,7 @@ extern "C" {
         int64_t vocab_size,
         float cap,
         float inverse_temperature,
+        bool precompute_probabilities,
         cudaStream_t stream);
 
     void launch_stochastic_round_fp8_kernel(void* rng_and_output,
@@ -803,6 +804,7 @@ void softcap_categorical_stats_sample(
     nb::ndarray<int32_t, nb::device::cuda> invalid,
     float cap,
     float inverse_temperature,
+    bool precompute_probabilities,
     int64_t vocab_size,
     uintptr_t stream_ptr)
 {
@@ -862,6 +864,7 @@ void softcap_categorical_stats_sample(
         vocab_size,
         cap,
         inverse_temperature,
+        precompute_probabilities,
         stream);
 }
 
@@ -3442,6 +3445,7 @@ NB_MODULE(_C, m) {
           nb::arg("invalid"),
           nb::arg("cap"),
           nb::arg("inverse_temperature"),
+          nb::arg("precompute_probabilities"),
           nb::arg("vocab_size"),
           nb::arg("stream_ptr"));
     
