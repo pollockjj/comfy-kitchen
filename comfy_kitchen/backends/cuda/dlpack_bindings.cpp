@@ -2232,18 +2232,6 @@ extern "C" {
         uint64_t seed,
         cudaStream_t stream);
 
-    void launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
-        const void* gate,
-        const void* up,
-        int64_t gate_row_stride,
-        int64_t up_row_stride,
-        void* output,
-        void* scales,
-        int64_t num_rows,
-        int64_t num_cols,
-        int input_dtype_code,
-        cudaStream_t stream);
-
     void launch_dequantize_int8_linear_kernel(
         const void* input,
         const void* x_scales,
@@ -3089,46 +3077,6 @@ void quantize_int8_rowwise_convrot64(
         stream);
 }
 
-void gelu_tanh_multiply_quantize_int8_rowwise_convrot64(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> gate,
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> up,
-    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> output,
-    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> scales,
-    uintptr_t stream_ptr) {
-
-    const int64_t M = gate.shape(0);
-    const int64_t K = gate.shape(1);
-    if (up.shape(0) != M || up.shape(1) != K) {
-        throw std::runtime_error("fused GEGLU ConvRot gate/up shape mismatch");
-    }
-    if (gate.stride(1) != 1 || up.stride(1) != 1) {
-        throw std::runtime_error("fused GEGLU ConvRot gate/up last dimension must be contiguous");
-    }
-    if (output.shape(0) != M || output.shape(1) != K) {
-        throw std::runtime_error("fused GEGLU ConvRot output shape mismatch");
-    }
-    if (scales.shape(0) != M || scales.shape(1) != 1) {
-        throw std::runtime_error("fused GEGLU ConvRot scale shape mismatch");
-    }
-    const int input_dtype_code = map_dtype_to_code(gate.dtype());
-    if (input_dtype_code < 0 || input_dtype_code > 2 || map_dtype_to_code(up.dtype()) != input_dtype_code) {
-        throw std::runtime_error("fused GEGLU ConvRot requires matching floating gate/up dtypes");
-    }
-
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
-        gate.data(),
-        up.data(),
-        gate.stride(0),
-        up.stride(0),
-        output.data(),
-        scales.data(),
-        M,
-        K,
-        input_dtype_code,
-        stream);
-}
-
 void dequantize_int8_linear(
     nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
@@ -3801,15 +3749,6 @@ NB_MODULE(_C, m) {
           nb::arg("group_size"),
           nb::arg("stochastic"),
           nb::arg("seed"),
-          nb::arg("stream_ptr"));
-
-    m.def("gelu_tanh_multiply_quantize_int8_rowwise_convrot64",
-          &gelu_tanh_multiply_quantize_int8_rowwise_convrot64,
-          "Fused tanh GELU, multiply, and group-64 ConvRot INT8 quantization",
-          nb::arg("gate"),
-          nb::arg("up"),
-          nb::arg("output"),
-          nb::arg("scales"),
           nb::arg("stream_ptr"));
 
     m.def("dequantize_int8_linear", &dequantize_int8_linear,

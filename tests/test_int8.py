@@ -845,31 +845,6 @@ class TestTensorWisePublicAPI:
 
         assert torch.equal(actual, expected)
 
-    def test_cuda_fused_geglu_packed_int8_convrot_is_exact(self, seed):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        from comfy_kitchen.backends.eager.quantization import quantize_int8_convrot_weight
-
-        rows, features = 6, 704
-        gate_up = torch.randn(rows, 2 * features, device="cuda", dtype=torch.bfloat16)
-        gate, up = gate_up.chunk(2, dim=-1)
-        indptr = torch.tensor([0, 2, 3, 5, 6], device="cuda", dtype=torch.int32)
-        weights = torch.randn(4, 128, features, device="cuda", dtype=torch.bfloat16)
-        quantized = [quantize_int8_convrot_weight(weight, 64) for weight in weights]
-        qweight = torch.stack([item[0] for item in quantized])
-        scales = torch.stack([item[1] for item in quantized])
-
-        with ck.registry.use_backend("cuda"):
-            expected = ck.grouped_int8_convrot_linear_packed(
-                torch.nn.functional.gelu(gate, approximate="tanh") * up,
-                indptr, qweight, scales, 64,
-            )
-            actual = ck.grouped_int8_convrot_gelu_linear_packed(
-                gate, up, indptr, qweight, scales, 64,
-            )
-
-        assert torch.equal(actual, expected)
-
     def test_eager_int8_linear_single_row(self, seed, device):
         """Eager int8_linear supports single-row batches."""
         import torch

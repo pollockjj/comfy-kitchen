@@ -44,7 +44,6 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
-    "grouped_int8_convrot_gelu_linear_packed",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -2663,75 +2662,6 @@ def grouped_int8_convrot_linear_packed(
         stream_ptr,
     ):
         raise RuntimeError("Native packed grouped INT8 ConvRot CUTLASS GEMM is unavailable")
-    return output
-
-
-def grouped_int8_convrot_gelu_linear_packed(
-    gate: torch.Tensor,
-    up: torch.Tensor,
-    expert_indptr: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    convrot_groupsize: int,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Fuse GEGLU and group-64 ConvRot quantization before packed expert GEMM."""
-    if gate.dim() != 2 or up.dim() != 2 or weight.dim() != 3:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot expects gate/up [R, K] and weight [E, N, K]")
-    if gate.shape != up.shape or gate.dtype != up.dtype or gate.device != up.device:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot gate/up must share shape, dtype, and device")
-    experts, n, k = weight.shape
-    if gate.shape[1] != k:
-        raise ValueError(f"Fused GEGLU packed INT8 ConvRot shape mismatch: gate {tuple(gate.shape)}, weight {tuple(weight.shape)}")
-    if gate.stride(-1) != 1 or up.stride(-1) != 1:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot gate/up last dimension must be contiguous")
-    if expert_indptr.dim() != 1 or expert_indptr.numel() != experts + 1 or expert_indptr.dtype != torch.int32:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot indptr must be int32 [E + 1]")
-    expected_scales = weight.shape[:2]
-    if tuple(weight_scale.shape) not in (expected_scales, (*expected_scales, 1)):
-        raise ValueError(f"Fused GEGLU packed INT8 ConvRot scale must be [E, N] or [E, N, 1], got {tuple(weight_scale.shape)}")
-    if convrot_groupsize != 64 or k % 64 != 0:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot requires group size 64 dividing K")
-    if gate.dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise ValueError("Fused GEGLU packed INT8 ConvRot input must be float32, float16, or bfloat16")
-    if weight.dtype != torch.int8 or weight_scale.dtype != torch.float32:
-        raise ValueError("Fused GEGLU packed INT8 ConvRot requires int8 weights and float32 scales")
-    if out_dtype not in (torch.float32, torch.float16, torch.bfloat16):
-        raise ValueError("Fused GEGLU packed INT8 ConvRot output must be float32, float16, or bfloat16")
-    if any(tensor.device != gate.device for tensor in (expert_indptr, weight, weight_scale)):
-        raise ValueError("Fused GEGLU packed INT8 ConvRot tensors must share one CUDA device")
-
-    weights = weight if weight.is_contiguous() else weight.contiguous()
-    indptr = expert_indptr if expert_indptr.is_contiguous() else expert_indptr.contiguous()
-    weight_scales = weight_scale.reshape(experts, n).contiguous()
-    rows = gate.shape[0]
-    qdata = torch.empty(gate.shape, dtype=torch.int8, device=gate.device)
-    activation_scales = torch.empty((rows, 1), dtype=torch.float32, device=gate.device)
-    output = torch.empty((rows, n), dtype=out_dtype, device=gate.device)
-    accumulator = torch.empty((rows, n), dtype=torch.int32, device=gate.device)
-    workspace_bytes = _C.cutlass_grouped_int8_dequant_packed_workspace_bytes(experts, rows)
-    workspace = torch.empty(max(1, workspace_bytes), dtype=torch.uint8, device=gate.device)
-    stream_ptr = torch.cuda.current_stream(gate.device).cuda_stream
-    _C.gelu_tanh_multiply_quantize_int8_rowwise_convrot64(
-        _wrap_for_dlpack(gate),
-        _wrap_for_dlpack(up),
-        _wrap_for_dlpack(qdata),
-        _wrap_for_dlpack(activation_scales),
-        stream_ptr,
-    )
-    if not _C.cutlass_grouped_int8_dequant_packed(
-        _wrap_for_dlpack(qdata),
-        _wrap_for_dlpack(weights),
-        _wrap_for_dlpack(activation_scales),
-        _wrap_for_dlpack(weight_scales),
-        _wrap_for_dlpack(indptr),
-        _wrap_for_dlpack(accumulator),
-        _wrap_for_dlpack(output),
-        _wrap_for_dlpack(workspace),
-        DTYPE_TO_CODE[out_dtype],
-        stream_ptr,
-    ):
-        raise RuntimeError("Native fused GEGLU packed INT8 ConvRot CUTLASS GEMM is unavailable")
     return output
 
 
