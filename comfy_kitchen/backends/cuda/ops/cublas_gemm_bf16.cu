@@ -103,10 +103,18 @@ Bf16Plan& get_gate_up_plan() {
         &algo, CUBLASLT_ALGO_CONFIG_SPLITK_NUM, &split_k, sizeof(split_k), &written));
     CUBLAS_CHECK(runtime.cublasLtMatmulAlgoConfigGetAttribute(
         &algo, CUBLASLT_ALGO_CONFIG_STAGES_ID, &stages, sizeof(stages), &written));
-    if (algo_id == 21 && tile_id == 5 && split_k == 1 && stages == 19 &&
+    if (algo_id == 21 && tile_id == 5 && split_k == 1 && stages == 20 &&
         results[i].workspaceSize == 0 && results[i].state == CUBLAS_STATUS_SUCCESS) {
       plan.algo = algo;
-      found = true;
+      constexpr int tuned_stages = 19;
+      CUBLAS_CHECK(runtime.cublasLtMatmulAlgoConfigSetAttribute(
+          &plan.algo, CUBLASLT_ALGO_CONFIG_STAGES_ID,
+          &tuned_stages, sizeof(tuned_stages)));
+      cublasLtMatmulHeuristicResult_t checked = {};
+      CUBLAS_CHECK(runtime.cublasLtMatmulAlgoCheck(
+          handle, plan.operation, plan.input, plan.weight, plan.output, plan.output,
+          &plan.algo, &checked));
+      found = checked.state == CUBLAS_STATUS_SUCCESS && checked.workspaceSize == 0;
       break;
     }
   }

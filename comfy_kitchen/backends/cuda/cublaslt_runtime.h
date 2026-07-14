@@ -103,6 +103,22 @@ public:
         size_t,
         size_t*
     );
+    using cublasLtMatmulAlgoConfigSetAttribute_t = cublasStatus_t (*)(
+        cublasLtMatmulAlgo_t*,
+        cublasLtMatmulAlgoConfigAttributes_t,
+        const void*,
+        size_t
+    );
+    using cublasLtMatmulAlgoCheck_t = cublasStatus_t (*)(
+        cublasLtHandle_t,
+        cublasLtMatmulDesc_t,
+        cublasLtMatrixLayout_t,
+        cublasLtMatrixLayout_t,
+        cublasLtMatrixLayout_t,
+        cublasLtMatrixLayout_t,
+        const cublasLtMatmulAlgo_t*,
+        cublasLtMatmulHeuristicResult_t*
+    );
 
     static CublasLtRuntime& instance() {
         static CublasLtRuntime runtime;
@@ -127,6 +143,8 @@ public:
     cublasLtMatmulPreferenceSetAttribute_t cublasLtMatmulPreferenceSetAttribute = nullptr;
     cublasLtMatmulAlgoGetHeuristic_t cublasLtMatmulAlgoGetHeuristic = nullptr;
     cublasLtMatmulAlgoConfigGetAttribute_t cublasLtMatmulAlgoConfigGetAttribute = nullptr;
+    cublasLtMatmulAlgoConfigSetAttribute_t cublasLtMatmulAlgoConfigSetAttribute = nullptr;
+    cublasLtMatmulAlgoCheck_t cublasLtMatmulAlgoCheck = nullptr;
 
 private:
     CublasLtRuntime() {
@@ -222,6 +240,8 @@ private:
         LOAD_SYMBOL(cublasLtMatmulPreferenceSetAttribute);
         LOAD_SYMBOL(cublasLtMatmulAlgoGetHeuristic);
         LOAD_SYMBOL(cublasLtMatmulAlgoConfigGetAttribute);
+        LOAD_SYMBOL(cublasLtMatmulAlgoConfigSetAttribute);
+        LOAD_SYMBOL(cublasLtMatmulAlgoCheck);
 
 #undef LOAD_SYMBOL
         return true;
@@ -253,6 +273,8 @@ private:
         cublasLtMatmulPreferenceSetAttribute = nullptr;
         cublasLtMatmulAlgoGetHeuristic = nullptr;
         cublasLtMatmulAlgoConfigGetAttribute = nullptr;
+        cublasLtMatmulAlgoConfigSetAttribute = nullptr;
+        cublasLtMatmulAlgoCheck = nullptr;
     }
 
     void* handle_ = nullptr;
