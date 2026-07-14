@@ -730,7 +730,7 @@ bool run_packed_grouped_int8(
         }
     }
 
-    const int dequant_threads = gate_up_shape ? 128 : 256;
+    constexpr int dequant_threads = 256;
     const int64_t elements = static_cast<int64_t>(rows) * n;
     if ((n & 3) == 0) {
         const int n4 = n / 4;
