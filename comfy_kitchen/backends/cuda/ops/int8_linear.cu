@@ -1360,7 +1360,7 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
 
     DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
         if (group_size == 64) {
-            constexpr int block_threads = 128;
+            constexpr int block_threads = 256;
             constexpr int groups_in_flight = block_threads / (64 / 4);
             const size_t smem_bytes =
                 (static_cast<size_t>(num_cols) + groups_in_flight * 2 * 64) * sizeof(float);
