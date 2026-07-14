@@ -46,6 +46,7 @@ from comfy_kitchen.registry import registry
 
 from .adaln import adaln
 from .awq import gemv_awq_w4a16
+from .linear import bf16_tuned_gate_up_linear
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
     dequantize_convrot_w4a4_weight,
@@ -91,6 +92,13 @@ def _build_constraints() -> dict:
     scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "bf16_tuned_gate_up_linear": FunctionConstraints(
+            params={
+                "x": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+                "weight": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+            },
+            default_devices=all_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),

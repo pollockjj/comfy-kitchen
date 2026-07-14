@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "bf16_tuned_gate_up_linear",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -1809,6 +1810,26 @@ def int8_linear(
     return out if is_2d_output else out.reshape(*orig_shape[:-1], n)
 
 
+def bf16_tuned_gate_up_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    orig_shape = x.shape
+    x_2d = x.reshape(-1, x.shape[-1])
+    if not x_2d.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("tuned BF16 gate/up requires contiguous tensors")
+    if x_2d.shape != (3, 2560) or weight.shape != (20480, 2560):
+        raise ValueError("tuned BF16 gate/up requires M=3, N=20480, K=2560")
+    out = torch.empty((3, 20480), dtype=torch.bfloat16, device=x.device)
+    _C.bf16_tuned_gate_up_linear(
+        _wrap_for_dlpack(x_2d),
+        _wrap_for_dlpack(weight),
+        _wrap_for_dlpack(out),
+        torch.cuda.current_stream(x.device).cuda_stream,
+    )
+    return out.reshape(*orig_shape[:-1], 20480)
+
+
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     orig_shape = x.shape
     d = x.shape[-1]
@@ -2888,6 +2909,20 @@ def _build_constraints() -> dict:
     }
 
     if _CUBLASLT_AVAILABLE:
+        constraints["bf16_tuned_gate_up_linear"] = FunctionConstraints(
+            params={
+                "x": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(MinDims(2),),
+                ),
+                "weight": ParamConstraint(
+                    dtypes=frozenset({torch.bfloat16}),
+                    shape_rules=(ExactDims(2),),
+                ),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(12, 0),
+        )
         constraints["int8_linear"] = FunctionConstraints(
             params={
                 "x": ParamConstraint(

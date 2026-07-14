@@ -90,6 +90,13 @@ public:
         cublasLtMatmulHeuristicResult_t*,
         int*
     );
+    using cublasLtMatmulAlgoConfigGetAttribute_t = cublasStatus_t (*)(
+        const cublasLtMatmulAlgo_t*,
+        cublasLtMatmulAlgoConfigAttributes_t,
+        void*,
+        size_t,
+        size_t*
+    );
 
     static CublasLtRuntime& instance() {
         static CublasLtRuntime runtime;
@@ -112,6 +119,7 @@ public:
     cublasLtMatmulPreferenceDestroy_t cublasLtMatmulPreferenceDestroy = nullptr;
     cublasLtMatmulPreferenceSetAttribute_t cublasLtMatmulPreferenceSetAttribute = nullptr;
     cublasLtMatmulAlgoGetHeuristic_t cublasLtMatmulAlgoGetHeuristic = nullptr;
+    cublasLtMatmulAlgoConfigGetAttribute_t cublasLtMatmulAlgoConfigGetAttribute = nullptr;
 
 private:
     CublasLtRuntime() {
@@ -205,6 +213,7 @@ private:
         LOAD_SYMBOL(cublasLtMatmulPreferenceDestroy);
         LOAD_SYMBOL(cublasLtMatmulPreferenceSetAttribute);
         LOAD_SYMBOL(cublasLtMatmulAlgoGetHeuristic);
+        LOAD_SYMBOL(cublasLtMatmulAlgoConfigGetAttribute);
 
 #undef LOAD_SYMBOL
         return true;
@@ -234,6 +243,7 @@ private:
         cublasLtMatmulPreferenceDestroy = nullptr;
         cublasLtMatmulPreferenceSetAttribute = nullptr;
         cublasLtMatmulAlgoGetHeuristic = nullptr;
+        cublasLtMatmulAlgoConfigGetAttribute = nullptr;
     }
 
     void* handle_ = nullptr;
@@ -245,4 +255,3 @@ private:
 
 
 } // namespace comfy
-

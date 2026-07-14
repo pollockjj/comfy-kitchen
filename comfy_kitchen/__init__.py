@@ -28,6 +28,7 @@ __version__ = "0.1.0"
 __all__ = [
     # Normalization
     "adaln",
+    "bf16_tuned_gate_up_linear",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -99,6 +100,14 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def bf16_tuned_gate_up_linear(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+) -> torch.Tensor:
+    """Exact tuned BF16 E4B M=3 fused gate/up projection."""
+    return torch.ops.comfy_kitchen.bf16_tuned_gate_up_linear(x, weight)
 
 
 def quantize_per_tensor_fp8(
