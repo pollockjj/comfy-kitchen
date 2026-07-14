@@ -11,7 +11,7 @@
 #include <cstddef>
 #include <cstdint>
 
-void launch_quantize_int8_rowwise_convrot64_kernel(
+extern "C" void launch_quantize_int8_rowwise_convrot64_kernel(
     const void* input,
     void* output,
     void* scales,
