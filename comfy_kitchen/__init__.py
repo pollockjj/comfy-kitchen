@@ -47,7 +47,6 @@ __all__ = [
     "quantize_svdquant_w4a4",
     "quantize_convrot_w4a4_weight",
     "quantize_int8_rowwise",
-    "quantize_int8_rowwise_convrot64",
     "quantize_int8_tensorwise",
     "dequantize_int8_simple",
     # Fused matmul
@@ -69,7 +68,6 @@ __all__ = [
     "dequantize_convrot_w4a4_weight",
     "gemv_awq_w4a16",
     "int8_linear",
-    "int8_linear_prequantized",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
     # Positional encoding
@@ -975,17 +973,6 @@ def quantize_int8_rowwise(
     return impl(**kwargs)
 
 
-def quantize_int8_rowwise_convrot64(
-    x: torch.Tensor,
-    group_size: int,
-    stochastic_rounding: int | None = 0,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    """Apply the CUDA ConvRot64 transform and quantize each row to INT8."""
-    return _cuda_backend.quantize_int8_rowwise_convrot64(
-        x, group_size, stochastic_rounding=stochastic_rounding
-    )
-
-
 def dequantize_int8_simple(q: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """Dequantize INT8 tensor with scale."""
     return torch.ops.comfy_kitchen.dequantize_int8_simple(q, scale)
@@ -1032,20 +1019,6 @@ def int8_linear(
     }
     impl = registry.get_implementation("int8_linear", kwargs=kwargs)
     return impl(**kwargs)
-
-
-def int8_linear_prequantized(
-    x_qdata: torch.Tensor,
-    x_scale: torch.Tensor,
-    weight: torch.Tensor,
-    weight_scale: torch.Tensor,
-    bias: torch.Tensor | None = None,
-    out_dtype: torch.dtype = torch.bfloat16,
-) -> torch.Tensor:
-    """Run the CUDA INT8 linear dispatch from row-wise quantized activations."""
-    return _cuda_backend.int8_linear_prequantized(
-        x_qdata, x_scale, weight, weight_scale, bias, out_dtype
-    )
 
 
 def grouped_int8_convrot_linear(
