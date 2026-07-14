@@ -70,7 +70,6 @@ __all__ = [
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
-    "fused_moe_int8_convrot",
     "CudaGraph",
     "begin_cuda_graph_capture",
     "end_cuda_graph_capture",
@@ -2273,85 +2272,6 @@ def fused_moe_mxfp8(
     return output
 
 
-def fused_moe_int8_convrot(
-    x: torch.Tensor,
-    expert_ids: torch.Tensor,
-    router_weights: torch.Tensor,
-    fc1_qdata: torch.Tensor,
-    fc1_scales: torch.Tensor,
-    fc2_qdata: torch.Tensor,
-    fc2_scales: torch.Tensor,
-    fc1_group_size: int = 256,
-    fc2_group_size: int = 64,
-) -> torch.Tensor:
-    """Run routed INT8 ConvRot expert banks through one native MoE pipeline."""
-    if x.dim() != 2 or expert_ids.dim() != 2 or router_weights.dim() != 2:
-        raise ValueError("fused INT8 ConvRot MoE expects rank-2 input and route tensors")
-    if x.dtype not in (torch.float16, torch.bfloat16):
-        raise ValueError("fused INT8 ConvRot MoE input must be float16 or bfloat16")
-    if expert_ids.dtype not in (torch.int32, torch.int64):
-        raise ValueError("fused INT8 ConvRot MoE expert IDs must be int32 or int64")
-    if router_weights.dtype != torch.float32:
-        raise ValueError("fused INT8 ConvRot MoE route weights must be float32")
-    if fc1_qdata.dtype != torch.int8 or fc2_qdata.dtype != torch.int8:
-        raise ValueError("fused INT8 ConvRot MoE weights must be int8")
-    if fc1_scales.dtype != torch.float32 or fc2_scales.dtype != torch.float32:
-        raise ValueError("fused INT8 ConvRot MoE weight scales must be float32")
-    if not fc1_qdata.is_contiguous() or not fc2_qdata.is_contiguous():
-        raise ValueError("fused INT8 ConvRot MoE weight banks must be contiguous")
-    if expert_ids.shape != router_weights.shape or expert_ids.shape[0] != x.shape[0]:
-        raise ValueError("fused INT8 ConvRot MoE route shape mismatch")
-    if fc1_qdata.dim() != 3 or fc2_qdata.dim() != 3:
-        raise ValueError("fused INT8 ConvRot MoE weight banks must be rank 3")
-    experts, gate_up_size, hidden_size = fc1_qdata.shape
-    if gate_up_size % 2 != 0:
-        raise ValueError("fused INT8 ConvRot MoE gate/up width must be even")
-    intermediate_size = gate_up_size // 2
-    if x.shape[1] != hidden_size or fc2_qdata.shape != (
-        experts,
-        hidden_size,
-        intermediate_size,
-    ):
-        raise ValueError("fused INT8 ConvRot MoE expert bank shape mismatch")
-    if fc1_group_size not in (64, 256) or hidden_size % fc1_group_size != 0:
-        raise ValueError("fused INT8 ConvRot MoE gate/up group size must divide hidden size")
-    if fc2_group_size not in (64, 256) or intermediate_size % fc2_group_size != 0:
-        raise ValueError("fused INT8 ConvRot MoE down group size must divide intermediate size")
-    tensors = (expert_ids, router_weights, fc1_qdata, fc1_scales, fc2_qdata, fc2_scales)
-    if any(tensor.device != x.device for tensor in tensors):
-        raise ValueError("fused INT8 ConvRot MoE tensors must share one CUDA device")
-
-    input_tensor = x if x.is_contiguous() else x.contiguous()
-    expert_ids_i32 = (
-        expert_ids
-        if expert_ids.dtype == torch.int32 and expert_ids.is_contiguous()
-        else expert_ids.to(dtype=torch.int32).contiguous()
-    )
-    route_weights = router_weights if router_weights.is_contiguous() else router_weights.contiguous()
-    fc1_scales_2d = fc1_scales.reshape(experts, gate_up_size).contiguous()
-    fc2_scales_2d = fc2_scales.reshape(experts, hidden_size).contiguous()
-    if expert_ids_i32.shape[1] != 8:
-        raise ValueError("fused INT8 ConvRot MoE requires top_k=8")
-    output = torch.empty_like(input_tensor)
-    stream_ptr = torch.cuda.current_stream(x.device).cuda_stream
-    workspace = _get_fused_moe_workspace(x, stream_ptr)
-    _C.cutlass_fused_moe_int8_convrot(
-        _wrap_for_dlpack(input_tensor),
-        _wrap_for_dlpack(expert_ids_i32),
-        _wrap_for_dlpack(route_weights),
-        _wrap_for_dlpack(fc1_qdata),
-        _wrap_for_dlpack(fc1_scales_2d),
-        _wrap_for_dlpack(fc2_qdata),
-        _wrap_for_dlpack(fc2_scales_2d),
-        _wrap_for_dlpack(output),
-        _wrap_for_dlpack(workspace),
-        fc1_group_size,
-        fc2_group_size,
-        stream_ptr,
-    )
-    return output
-
-
 def fused_moe_mxfp8_scaled(
     x: torch.Tensor,
     expert_ids: torch.Tensor,
@@ -4001,40 +3921,6 @@ def _build_constraints() -> dict:
         )
 
     if _CUTLASS_AVAILABLE:
-        constraints["fused_moe_int8_convrot"] = FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.float16, torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "expert_ids": ParamConstraint(
-                    dtypes=frozenset({torch.int32, torch.int64}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "router_weights": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "fc1_qdata": ParamConstraint(
-                    dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(3),),
-                ),
-                "fc1_scales": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
-                ),
-                "fc2_qdata": ParamConstraint(
-                    dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(3),),
-                ),
-                "fc2_scales": ParamConstraint(
-                    dtypes=frozenset({torch.float32}),
-                ),
-                "fc1_group_size": ParamConstraint(dtypes=frozenset({int})),
-                "fc2_group_size": ParamConstraint(dtypes=frozenset({int})),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(8, 0),
-        )
         constraints["grouped_scaled_mm_nvfp4"] = FunctionConstraints(
             params={
                 "a": ParamConstraint(

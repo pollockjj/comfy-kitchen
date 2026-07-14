@@ -845,54 +845,6 @@ class TestTensorWisePublicAPI:
 
         assert torch.equal(actual, expected)
 
-    def test_cuda_fused_moe_int8_convrot_matches_grouped_pipeline(self, seed):
-        if not torch.cuda.is_available():
-            pytest.skip("CUDA required")
-        if not hasattr(cuda._C, "cutlass_fused_moe_int8_convrot"):
-            pytest.skip("CUDA extension was built without fused INT8 ConvRot MoE")
-
-        n, h, intermediate, experts, top_k = 8, 256, 64, 4, 8
-        x = torch.randn(n, h, device="cuda", dtype=torch.float16)
-        expert_ids = torch.randint(experts, (n, top_k), device="cuda", dtype=torch.int32)
-        route_weights = torch.softmax(
-            torch.randn(n, top_k, device="cuda", dtype=torch.float32), dim=-1
-        )
-        fc1_qdata = torch.randint(
-            -127, 128, (experts, 2 * intermediate, h), device="cuda", dtype=torch.int8
-        )
-        fc1_scales = torch.rand(experts, 2 * intermediate, device="cuda") * 0.01
-        fc2_qdata = torch.randint(
-            -127, 128, (experts, h, intermediate), device="cuda", dtype=torch.int8
-        )
-        fc2_scales = torch.rand(experts, h, device="cuda") * 0.01
-
-        flat_experts = expert_ids.reshape(-1)
-        order = torch.argsort(flat_experts)
-        counts = torch.bincount(flat_experts, minlength=experts).to(torch.int32)
-        indptr = torch.zeros(experts + 1, device="cuda", dtype=torch.int32)
-        torch.cumsum(counts, dim=0, out=indptr[1:])
-        routed_x = x[order // top_k]
-        gate_up = ck.grouped_int8_convrot_linear_packed(
-            routed_x, indptr, fc1_qdata, fc1_scales, 256, out_dtype=x.dtype
-        )
-        gate, up = gate_up.chunk(2, dim=-1)
-        intermediate_x = torch.nn.functional.gelu(gate, approximate="tanh") * up
-        routed_y = ck.grouped_int8_convrot_linear_packed(
-            intermediate_x, indptr, fc2_qdata, fc2_scales, 64, out_dtype=x.dtype
-        )
-        pair_order = torch.empty(n * top_k, device="cuda", dtype=torch.long)
-        pair_order[order] = torch.arange(n * top_k, device="cuda")
-        expected = (
-            routed_y[pair_order].float()
-            * route_weights.reshape(-1, 1)
-        ).view(n, top_k, h).sum(dim=1).to(x.dtype)
-        actual = ck.fused_moe_int8_convrot(
-            x, expert_ids, route_weights, fc1_qdata, fc1_scales,
-            fc2_qdata, fc2_scales, 256, 64
-        )
-
-        assert torch.equal(actual, expected)
-
     def test_eager_int8_linear_single_row(self, seed, device):
         """Eager int8_linear supports single-row batches."""
         import torch
