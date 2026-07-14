@@ -44,6 +44,17 @@ template<> __device__ __forceinline__ half from_float<half>(float val) { return 
 template<> __device__ __forceinline__ nv_bfloat16 from_float<nv_bfloat16>(float val) { return __float2bfloat16_rn(val); }
 
 template<typename T>
+__device__ __forceinline__ T gelu_tanh_multiply(T gate, T up) {
+    const float x = to_float(gate);
+    constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
+    constexpr float kCubicCoefficient = 0.044715f;
+    const float gelu =
+        0.5f * x * (1.0f + tanhf(kSqrtTwoOverPi * (x + kCubicCoefficient * x * x * x)));
+    const T rounded_gelu = from_float<T>(gelu);
+    return from_float<T>(to_float(rounded_gelu) * to_float(up));
+}
+
+template<typename T>
 __device__ __forceinline__ float quant_div_to_float(T val, float scale) {
     const float scale_t = to_float(from_float<T>(scale));
     return to_float(from_float<T>(to_float(val) / scale_t));
@@ -1071,6 +1082,86 @@ __global__ void quantize_int8_rowwise_convrot_group64_kernel(
     }
 }
 
+template<typename InputType, int BLOCK_THREADS>
+__global__ void gelu_tanh_multiply_quantize_int8_rowwise_convrot_group64_kernel(
+    const InputType* __restrict__ gate,
+    const InputType* __restrict__ up,
+    int64_t gate_row_stride,
+    int64_t up_row_stride,
+    int8_t* __restrict__ q,
+    float* __restrict__ scales,
+    int K)
+{
+    constexpr int kGroupSize = 64;
+    constexpr int kGroupThreads = kGroupSize / 4;
+    constexpr int kGroupsInFlight = BLOCK_THREADS / kGroupThreads;
+    constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
+
+    extern __shared__ float smem[];
+    float* row_buf = smem;
+    float* tmp = smem + K;
+
+    __shared__ float warp_smem[kWarps];
+    __shared__ float block_smem;
+
+    const int row = static_cast<int>(blockIdx.x);
+    const int tid = threadIdx.x;
+    const int sub = tid / kGroupThreads;
+    const int lane = tid % kGroupThreads;
+    const int64_t output_row_offset = static_cast<int64_t>(row) * K;
+    const int64_t gate_row_offset = static_cast<int64_t>(row) * gate_row_stride;
+    const int64_t up_row_offset = static_cast<int64_t>(row) * up_row_stride;
+    const int n_groups = K / kGroupSize;
+    const int iters = (n_groups + kGroupsInFlight - 1) / kGroupsInFlight;
+
+    float* buf0 = tmp + sub * (2 * kGroupSize);
+    float* buf1 = buf0 + kGroupSize;
+    float abs_max = 0.0f;
+
+    for (int it = 0; it < iters; ++it) {
+        const int group = it * kGroupsInFlight + sub;
+        const bool active = group < n_groups;
+        const int base = lane * 4;
+        const int group_col = group * kGroupSize;
+        const int64_t gate_offset = gate_row_offset + group_col + base;
+        const int64_t up_offset = up_row_offset + group_col + base;
+
+        const float x0 = active ? to_float(gelu_tanh_multiply(gate[gate_offset], up[up_offset])) : 0.0f;
+        const float x1 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 1], up[up_offset + 1])) : 0.0f;
+        const float x2 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 2], up[up_offset + 2])) : 0.0f;
+        const float x3 = active ? to_float(gelu_tanh_multiply(gate[gate_offset + 3], up[up_offset + 3])) : 0.0f;
+        buf1[base] = 0.5f * (x0 + x1 + x2 - x3);
+        buf1[base + 1] = 0.5f * (x0 + x1 - x2 + x3);
+        buf1[base + 2] = 0.5f * (x0 - x1 + x2 + x3);
+        buf1[base + 3] = 0.5f * (-x0 + x1 + x2 + x3);
+        __syncthreads();
+
+        convrot_fht_stage64<4>(buf1, buf0, lane);
+        __syncthreads();
+        if (active) {
+            abs_max = fmaxf(
+                abs_max,
+                convrot_fht_stage64_store_absmax<16, float>(buf0, row_buf + group_col, lane));
+        }
+        __syncthreads();
+    }
+
+    abs_max = block_reduce_max_t<kWarps>(abs_max, warp_smem, &block_smem);
+    const float scale = fmaxf(
+        finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
+        1.0e-30f);
+    if (tid == 0) {
+        scales[row] = scale;
+    }
+
+    for (int col = tid; col < K; col += BLOCK_THREADS) {
+        const int64_t idx = output_row_offset + col;
+        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
+        const float quantized = fminf(127.0f, fmaxf(-128.0f, nearbyintf(scaled)));
+        q[idx] = static_cast<int8_t>(quantized);
+    }
+}
+
 } // namespace
 
 } // namespace comfy
@@ -1460,6 +1551,62 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA INT8 rowwise convrot64 quantization failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_gelu_tanh_multiply_quantize_int8_rowwise_convrot64_kernel(
+    const void* gate,
+    const void* up,
+    int64_t gate_row_stride,
+    int64_t up_row_stride,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int input_dtype_code,
+    cudaStream_t stream)
+{
+    if (num_rows == 0 || num_cols == 0) {
+        return;
+    }
+    if (num_cols % 64 != 0) {
+        throw std::runtime_error("fused GEGLU ConvRot quantization requires K divisible by 64");
+    }
+    if (gate_row_stride < num_cols || up_row_stride < num_cols) {
+        throw std::runtime_error("fused GEGLU ConvRot quantization requires valid row strides");
+    }
+    if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("fused GEGLU ConvRot quantization only supports K <= INT_MAX");
+    }
+
+    DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        constexpr int block_threads = 128;
+        constexpr int groups_in_flight = block_threads / (64 / 4);
+        const size_t smem_bytes =
+            (static_cast<size_t>(num_cols) + groups_in_flight * 2 * 64) * sizeof(float);
+        auto kernel = comfy::gelu_tanh_multiply_quantize_int8_rowwise_convrot_group64_kernel<
+            InputType, block_threads>;
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, static_cast<int>(smem_bytes));
+        if (attr_err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("fused GEGLU ConvRot shared memory request failed: ") +
+                cudaGetErrorString(attr_err));
+        }
+        kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
+            static_cast<const InputType*>(gate),
+            static_cast<const InputType*>(up),
+            gate_row_stride,
+            up_row_stride,
+            static_cast<int8_t*>(output),
+            static_cast<float*>(scales),
+            static_cast<int>(num_cols));
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("CUDA fused GEGLU ConvRot quantization failed: ") + cudaGetErrorString(err));
     }
 }
 
