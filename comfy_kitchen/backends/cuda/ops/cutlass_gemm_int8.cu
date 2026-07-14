@@ -460,7 +460,7 @@ using PackedInt8Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     int32_t,
     cutlass::arch::OpClassTensorOp,
     cutlass::arch::Sm80,
-    cutlass::gemm::GemmShape<64, 128, 64>,
+    cutlass::gemm::GemmShape<64, 64, 64>,
     cutlass::gemm::GemmShape<32, 64, 64>,
     cutlass::gemm::GemmShape<16, 8, 32>,
     PackedInt8Epilogue,
