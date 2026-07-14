@@ -173,6 +173,7 @@ endif()
 # Note: cuBLASLt is loaded dynamically at runtime via dlopen/LoadLibrary
 target_link_libraries(_C PRIVATE
     CUDA::cudart_static
+    CUDA::cublas
 )
 
 # On Windows, static cudart requires additional system libraries

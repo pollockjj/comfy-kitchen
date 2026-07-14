@@ -94,6 +94,16 @@ extern "C" {
         int64_t workspace_size,
         cudaStream_t stream);
 
+    void launch_bf16_cublas_gemm_ex(
+        const void* input,
+        const void* weight,
+        void* output,
+        int64_t M,
+        int64_t N,
+        int64_t K,
+        int algorithm,
+        cudaStream_t stream);
+
     void launch_apply_rope_kernel(
         const void* xq,
         const void* xk,
@@ -969,6 +979,32 @@ void bf16_cublaslt_linear(
     launch_bf16_cublaslt_linear(
         input.data(), weight.data(), output.data(), M, N, K, algorithm_index,
         workspace.data(), static_cast<int64_t>(workspace.size()),
+        reinterpret_cast<cudaStream_t>(stream_ptr));
+}
+
+void bf16_cublas_gemm_ex(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> weight,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int algorithm,
+    uintptr_t stream_ptr)
+{
+    const int64_t M = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t N = weight.shape(0);
+    if (weight.shape(1) != K || output.shape(0) != M || output.shape(1) != N) {
+        throw std::runtime_error("BF16 cuBLAS GemmEx shape mismatch");
+    }
+    if (map_dtype_to_code(input.dtype()) != 2 ||
+        map_dtype_to_code(weight.dtype()) != 2 ||
+        map_dtype_to_code(output.dtype()) != 2) {
+        throw std::runtime_error("BF16 cuBLAS GemmEx requires BF16 input, weight, and output");
+    }
+    if (input.stride(1) != 1 || weight.stride(1) != 1 || output.stride(1) != 1) {
+        throw std::runtime_error("BF16 cuBLAS GemmEx requires contiguous row-major tensors");
+    }
+    launch_bf16_cublas_gemm_ex(
+        input.data(), weight.data(), output.data(), M, N, K, algorithm,
         reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
@@ -2618,6 +2654,11 @@ NB_MODULE(_C, m) {
           "Run an indexed cuBLASLt heuristic for BF16 linear",
           nb::arg("input"), nb::arg("weight"), nb::arg("output"),
           nb::arg("workspace"), nb::arg("algorithm_index"), nb::arg("stream_ptr"));
+
+    m.def("bf16_cublas_gemm_ex", &bf16_cublas_gemm_ex,
+          "Run an indexed cuBLAS GemmEx algorithm for BF16 linear",
+          nb::arg("input"), nb::arg("weight"), nb::arg("output"),
+          nb::arg("algorithm"), nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)
     m.attr("HAS_CUBLASLT") = comfy::CublasLtRuntime::instance().is_available();

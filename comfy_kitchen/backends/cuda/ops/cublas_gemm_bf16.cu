@@ -2,6 +2,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <cublasLt.h>
+#include <cublas_v2.h>
 #include <cuda_runtime.h>
 
 #include <cstdint>
@@ -23,6 +24,7 @@
 namespace {
 
 thread_local cublasLtHandle_t bf16_handle = nullptr;
+thread_local cublasHandle_t bf16_gemm_ex_handle = nullptr;
 
 cublasLtHandle_t get_handle() {
   auto& runtime = comfy::CublasLtRuntime::instance();
@@ -33,6 +35,13 @@ cublasLtHandle_t get_handle() {
     CUBLAS_CHECK(runtime.cublasLtCreate(&bf16_handle));
   }
   return bf16_handle;
+}
+
+cublasHandle_t get_gemm_ex_handle() {
+  if (bf16_gemm_ex_handle == nullptr) {
+    CUBLAS_CHECK(cublasCreate(&bf16_gemm_ex_handle));
+  }
+  return bf16_gemm_ex_handle;
 }
 
 struct Bf16Plan {
@@ -133,4 +142,26 @@ extern "C" void launch_bf16_cublaslt_linear(
       &beta, output, plan.output, output, plan.output,
       &plan.algorithms[algorithm_index].algo, workspace,
       static_cast<size_t>(workspace_size), stream));
+}
+
+extern "C" void launch_bf16_cublas_gemm_ex(
+    const void* input,
+    const void* weight,
+    void* output,
+    int64_t M,
+    int64_t N,
+    int64_t K,
+    int algorithm,
+    cudaStream_t stream) {
+  cublasHandle_t handle = get_gemm_ex_handle();
+  CUBLAS_CHECK(cublasSetStream(handle, stream));
+  const float alpha = 1.0f;
+  const float beta = 0.0f;
+  CUBLAS_CHECK(cublasGemmEx(
+      handle, CUBLAS_OP_T, CUBLAS_OP_N,
+      static_cast<int>(N), static_cast<int>(M), static_cast<int>(K),
+      &alpha, weight, CUDA_R_16BF, static_cast<int>(K),
+      input, CUDA_R_16BF, static_cast<int>(K),
+      &beta, output, CUDA_R_16BF, static_cast<int>(N),
+      CUBLAS_COMPUTE_32F, static_cast<cublasGemmAlgo_t>(algorithm)));
 }
