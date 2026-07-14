@@ -56,6 +56,7 @@ __all__ = [
     "fused_moe_nvfp4",
     "fused_moe_mxfp8",
     "fused_moe_mxfp8_scaled",
+    "fused_moe_int8_convrot",
     "CudaGraph",
     "begin_cuda_graph_capture",
     "end_cuda_graph_capture",
@@ -505,6 +506,33 @@ def fused_moe_mxfp8(
         "fc2_block_scales": fc2_block_scales,
     }
     impl = registry.get_implementation("fused_moe_mxfp8", kwargs=kwargs)
+    return impl(**kwargs)
+
+
+def fused_moe_int8_convrot(
+    x: torch.Tensor,
+    expert_ids: torch.Tensor,
+    router_weights: torch.Tensor,
+    fc1_qdata: torch.Tensor,
+    fc1_scales: torch.Tensor,
+    fc2_qdata: torch.Tensor,
+    fc2_scales: torch.Tensor,
+    fc1_group_size: int = 256,
+    fc2_group_size: int = 64,
+) -> torch.Tensor:
+    """Run a routed INT8 ConvRot MoE layer in one native backend call."""
+    kwargs = {
+        "x": x,
+        "expert_ids": expert_ids,
+        "router_weights": router_weights,
+        "fc1_qdata": fc1_qdata,
+        "fc1_scales": fc1_scales,
+        "fc2_qdata": fc2_qdata,
+        "fc2_scales": fc2_scales,
+        "fc1_group_size": fc1_group_size,
+        "fc2_group_size": fc2_group_size,
+    }
+    impl = registry.get_implementation("fused_moe_int8_convrot", kwargs=kwargs)
     return impl(**kwargs)
 
 
