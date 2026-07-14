@@ -2283,7 +2283,6 @@ def fused_moe_int8_convrot(
     fc2_scales: torch.Tensor,
     fc1_group_size: int = 256,
     fc2_group_size: int = 64,
-    fuse_intermediate_quant: bool = True,
 ) -> torch.Tensor:
     """Run routed INT8 ConvRot expert banks through one native MoE pipeline."""
     if x.dim() != 2 or expert_ids.dim() != 2 or router_weights.dim() != 2:
@@ -2348,7 +2347,6 @@ def fused_moe_int8_convrot(
         _wrap_for_dlpack(workspace),
         fc1_group_size,
         fc2_group_size,
-        fuse_intermediate_quant,
         stream_ptr,
     )
     return output
