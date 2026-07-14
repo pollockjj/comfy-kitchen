@@ -42,6 +42,7 @@ __all__ = [
     "dequantize_int8_convrot_weight_dtype",
     "dequantize_convrot_w4a4_weight",
     "int8_linear",
+    "int8_linear_prequantized",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
     "int4_linear",
@@ -1116,6 +1117,20 @@ def _int4_linear_via_int8_values(
         stream_ptr,
     )
     return output
+
+
+def int8_linear_prequantized(
+    x_qdata: torch.Tensor,
+    x_scale: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    bias: torch.Tensor | None = None,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Run the native INT8 GEMM path when activation quantization is already complete."""
+    return _int4_linear_via_int8_values(
+        x_qdata, weight, x_scale, weight_scale, bias, out_dtype
+    )
 
 
 def _int8_linear_turing_quantized(
