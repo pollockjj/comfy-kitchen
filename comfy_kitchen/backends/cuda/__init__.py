@@ -184,6 +184,7 @@ _cublas_workspaces: dict[int, torch.Tensor] = {}
 _fused_moe_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
+_sm86_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
@@ -197,6 +198,15 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
     _turing_device_cache[device_index] = is_turing
     return is_turing
+
+
+def _cuda_device_is_sm86(device_index: int) -> bool:
+    cached = _sm86_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    is_sm86 = torch.cuda.get_device_capability(device_index) == (8, 6)
+    _sm86_device_cache[device_index] = is_sm86
+    return is_sm86
 
 
 def _prefer_turing_fused_int8(m: int, n: int, k: int) -> bool:
@@ -480,6 +490,17 @@ def _prefer_cublas_int8_fallback(m: int, n: int, k: int) -> bool:
         (n <= k and not cutlass_n_le_k_exception)
         or (m <= 512 and k >= 4096 and n > k and n <= 3 * k)
     )
+
+
+_SM86_DG_CUTLASS_INT8_SHAPES = frozenset({
+    (256, 2112, 2816),
+    (256, 2816, 4096),
+    (256, 2816, 8192),
+})
+
+
+def _prefer_sm86_dg_cutlass(tensor: torch.Tensor, m: int, n: int, k: int) -> bool:
+    return (m, n, k) in _SM86_DG_CUTLASS_INT8_SHAPES and _cuda_device_is_sm86(tensor.get_device())
 
 
 def _wrap_for_dlpack(tensor: torch.Tensor):
@@ -2479,7 +2500,10 @@ def int8_linear(
             return turing_out if is_2d_output else turing_out.reshape(*orig_shape[:-1], n)
 
     used_cutlass = False
-    prefer_cublas_fallback = _prefer_cublas_int8_fallback(m, n, k)
+    prefer_cublas_fallback = (
+        _prefer_cublas_int8_fallback(m, n, k)
+        and not _prefer_sm86_dg_cutlass(x_qdata, m, n, k)
+    )
     if (
         not prefer_cublas_fallback
         and not _DISABLE_CUTLASS_INT8
