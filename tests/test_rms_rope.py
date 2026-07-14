@@ -244,8 +244,9 @@ class TestRMSRopeSplitHalf:
         if "eager" not in backends:
             pytest.skip("cross-backend test requires eager as the reference backend")
 
-        batch, seq_len, heads, head_dim = 2, 256, 16, 128
-        x_shape = (batch, seq_len, heads, head_dim)
+        batch, seq_len, q_heads, kv_heads, head_dim = 2, 256, 32, 8, 128
+        x_shape = (batch, seq_len, q_heads, head_dim)
+        k_shape = (batch, seq_len, kv_heads, head_dim)
         freqs_shape = (1, seq_len, 1, head_dim // 2, 2, 2)
         freqs_cis = torch.randn(freqs_shape, dtype=freqs_dtype, device=device)
         q_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
@@ -253,7 +254,7 @@ class TestRMSRopeSplitHalf:
         results = {}
         if op_name == "rms_rope_split_half":
             q = torch.randn(x_shape, dtype=dtype, device=device)
-            k = torch.randn(x_shape, dtype=dtype, device=device)
+            k = torch.randn(k_shape, dtype=dtype, device=device)
             k_scale = torch.randn(head_dim, dtype=torch.float32, device=device)
             for backend in backends:
                 results[backend] = _run_backend(
