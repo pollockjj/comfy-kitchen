@@ -519,6 +519,7 @@ def fused_moe_int8_convrot(
     fc2_scales: torch.Tensor,
     fc1_group_size: int = 256,
     fc2_group_size: int = 64,
+    fuse_input_route: bool = True,
 ) -> torch.Tensor:
     """Run a routed INT8 ConvRot MoE layer in one native backend call."""
     kwargs = {
@@ -531,6 +532,7 @@ def fused_moe_int8_convrot(
         "fc2_scales": fc2_scales,
         "fc1_group_size": fc1_group_size,
         "fc2_group_size": fc2_group_size,
+        "fuse_input_route": fuse_input_route,
     }
     impl = registry.get_implementation("fused_moe_int8_convrot", kwargs=kwargs)
     return impl(**kwargs)

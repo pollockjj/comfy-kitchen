@@ -252,13 +252,15 @@ __device__ __forceinline__ float block_reduce_max_t(float v, float* warp_smem, f
     return *block_smem;
 }
 
-template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
+template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC, bool ROUTED = false>
 __global__ void quantize_int8_rowwise_convrot_kernel(
     const InputType* __restrict__ x,
     int8_t* __restrict__ q,
     float* __restrict__ scales,
     int K,
-    uint64_t seed)
+    uint64_t seed,
+    const int32_t* __restrict__ route_dest,
+    int top_k)
 {
     constexpr int kGroupsInFlight = BLOCK_THREADS / kConvRotGroup;
     constexpr int kWarps = BLOCK_THREADS / kThreadsPerWarp;
@@ -321,7 +323,16 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
         finite_absmax_for_int8_scale<InputType>(abs_max) * (1.0f / 127.0f),
         1.0e-30f);
     if (tid == 0) {
-        scales[row] = scale;
+        if constexpr (ROUTED) {
+            for (int position = 0; position < top_k; ++position) {
+                const int destination = route_dest[row * top_k + position];
+                if (destination >= 0) {
+                    scales[destination] = scale;
+                }
+            }
+        } else {
+            scales[row] = scale;
+        }
     }
 
     for (int col = tid; col < K; col += BLOCK_THREADS) {
@@ -335,7 +346,17 @@ __global__ void quantize_int8_rowwise_convrot_kernel(
             quantized = nearbyintf(scaled);
         }
         quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[idx] = static_cast<int8_t>(quantized);
+        const int8_t value = static_cast<int8_t>(quantized);
+        if constexpr (ROUTED) {
+            for (int position = 0; position < top_k; ++position) {
+                const int destination = route_dest[row * top_k + position];
+                if (destination >= 0) {
+                    q[static_cast<int64_t>(destination) * K + col] = value;
+                }
+            }
+        } else {
+            q[idx] = value;
+        }
     }
 }
 
@@ -1178,7 +1199,9 @@ void launch_quantize_int8_rowwise_convrot_kernel(
                 static_cast<int8_t*>(output),
                 static_cast<float*>(scales),
                 static_cast<int>(num_cols),
-                seed);
+                seed,
+                nullptr,
+                0);
         };
         if (wide) {
             if (stochastic) {
@@ -1460,6 +1483,61 @@ void launch_quantize_int8_rowwise_convrot64_kernel(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA INT8 rowwise convrot64 quantization failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_quantize_int8_rowwise_convrot256_routed_kernel(
+    const void* input,
+    const int32_t* route_dest,
+    void* output,
+    void* scales,
+    int64_t num_rows,
+    int64_t num_cols,
+    int top_k,
+    int input_dtype_code,
+    cudaStream_t stream)
+{
+    if (num_rows == 0 || num_cols == 0) {
+        return;
+    }
+    if (num_cols % comfy::kConvRotGroup != 0 || top_k <= 0) {
+        throw std::runtime_error("routed ConvRot quantization requires group-256 rows and top_k");
+    }
+    if (num_cols > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("routed ConvRot quantization only supports K <= INT_MAX");
+    }
+
+    DISPATCH_FP_DTYPE(input_dtype_code, InputType, [&] {
+        constexpr int block_threads = 1024;
+        constexpr int groups_in_flight = block_threads / 64;
+        const size_t smem_bytes =
+            (static_cast<size_t>(num_cols) +
+             groups_in_flight * 2 * comfy::kConvRotGroup) * sizeof(float);
+        auto kernel = comfy::quantize_int8_rowwise_convrot_kernel<
+            InputType, block_threads, false, true>;
+        cudaError_t attr_err = cudaFuncSetAttribute(
+            kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+            static_cast<int>(smem_bytes));
+        if (attr_err != cudaSuccess) {
+            throw std::runtime_error(
+                std::string("routed ConvRot shared memory request failed: ") +
+                cudaGetErrorString(attr_err));
+        }
+        kernel<<<static_cast<unsigned int>(num_rows), block_threads, smem_bytes, stream>>>(
+            static_cast<const InputType*>(input),
+            static_cast<int8_t*>(output),
+            static_cast<float*>(scales),
+            static_cast<int>(num_cols),
+            0,
+            route_dest,
+            top_k);
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("CUDA routed ConvRot quantization failed: ") +
+            cudaGetErrorString(err));
     }
 }
 

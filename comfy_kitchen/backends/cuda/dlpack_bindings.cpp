@@ -381,6 +381,7 @@ extern "C" {
         int fc1_group_size,
         int fc2_group_size,
         int dtype_code,
+        bool fuse_input_route,
         void* workspace_ptr,
         int64_t workspace_size,
         cudaStream_t stream);
@@ -1181,6 +1182,7 @@ void cutlass_fused_moe_int8_convrot(
     nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
     int fc1_group_size,
     int fc2_group_size,
+    bool fuse_input_route,
     uintptr_t stream_ptr) {
     const int64_t num_tokens = input.shape(0);
     const int64_t hidden_size = input.shape(1);
@@ -1213,7 +1215,8 @@ void cutlass_fused_moe_int8_convrot(
             input.data(), expert_ids.data(), router_weights.data(), fc1_qdata.data(),
             fc1_scales.data(), fc2_qdata.data(), fc2_scales.data(), output.data(),
             num_tokens, hidden_size, intermediate_size, num_experts, top_k,
-            fc1_group_size, fc2_group_size, input_dtype_code, workspace.data(),
+            fc1_group_size, fc2_group_size, input_dtype_code, fuse_input_route,
+            workspace.data(),
             static_cast<int64_t>(workspace.size()), stream)) {
         throw std::runtime_error(
             "native CUTLASS fused INT8 ConvRot MoE failed at stage " +
@@ -3598,6 +3601,7 @@ NB_MODULE(_C, m) {
           nb::arg("workspace"),
           nb::arg("fc1_group_size"),
           nb::arg("fc2_group_size"),
+          nb::arg("fuse_input_route"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_fused_moe_mxfp8_scaled", &cutlass_fused_moe_mxfp8_scaled,
