@@ -48,8 +48,9 @@ __device__ __forceinline__ T gelu_tanh_multiply(T gate, T up) {
     const float x = to_float(gate);
     constexpr float kSqrtTwoOverPi = 0.7978845608028654f;
     constexpr float kCubicCoefficient = 0.044715f;
+    const float x_cube = x * x * x;
     const float gelu =
-        0.5f * x * (1.0f + tanhf(kSqrtTwoOverPi * (x + kCubicCoefficient * x * x * x)));
+        0.5f * x * (1.0f + tanhf(kSqrtTwoOverPi * (x + kCubicCoefficient * x_cube)));
     const T rounded_gelu = from_float<T>(gelu);
     return from_float<T>(to_float(rounded_gelu) * to_float(up));
 }
