@@ -1797,6 +1797,8 @@ void launch_dequantize_int8_convrot_kernel(
 
         if (num_cols < 1024) {
             launch_groups(std::integral_constant<int, 1>{});
+        } else if (num_cols == 2816) {
+            launch_groups(std::integral_constant<int, 4>{});
         } else if (num_cols < 4096) {
             launch_groups(std::integral_constant<int, 2>{});
         } else {
