@@ -12,7 +12,7 @@
 namespace comfy {
 namespace {
 
-constexpr int kThreads = 512;
+constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
 constexpr int64_t kMaxBlocks = 65535;
