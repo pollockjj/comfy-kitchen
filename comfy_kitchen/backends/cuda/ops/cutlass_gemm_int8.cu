@@ -660,7 +660,7 @@ bool run_packed_grouped_int8(
         return false;
     }
 
-    constexpr int prepare_threads = 32;
+    constexpr int prepare_threads = 128;
     prepare_packed_grouped_int8_args<<<groups, prepare_threads, 0, stream>>>(
         const_cast<int8_t*>(static_cast<const int8_t*>(activations_raw)),
         const_cast<int8_t*>(static_cast<const int8_t*>(weights_raw)),
