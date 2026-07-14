@@ -364,6 +364,29 @@ extern "C" {
 
     int cutlass_fused_moe_mxfp8_last_error_stage();
 
+    bool launch_cutlass_fused_moe_int8_convrot(
+        const void* input,
+        const int32_t* expert_ids,
+        const float* router_weights,
+        const void* fc1_qdata,
+        const float* fc1_scales,
+        const void* fc2_qdata,
+        const float* fc2_scales,
+        void* output,
+        int64_t num_tokens,
+        int64_t hidden_size,
+        int64_t intermediate_size,
+        int64_t num_experts,
+        int64_t top_k,
+        int fc1_group_size,
+        int fc2_group_size,
+        int dtype_code,
+        void* workspace_ptr,
+        int64_t workspace_size,
+        cudaStream_t stream);
+
+    int cutlass_fused_moe_int8_convrot_last_error_stage();
+
     bool launch_cutlass_fused_moe_nvfp4(
         const void* input_bf16,
         const int32_t* expert_ids,
@@ -1143,6 +1166,58 @@ void cutlass_fused_moe_mxfp8(
         throw std::runtime_error(
             "native CUTLASS fused MXFP8 MoE failed at stage " +
             std::to_string(cutlass_fused_moe_mxfp8_last_error_stage()));
+    }
+}
+
+void cutlass_fused_moe_int8_convrot(
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> expert_ids,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> router_weights,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> fc1_qdata,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> fc1_scales,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> fc2_qdata,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> fc2_scales,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int fc1_group_size,
+    int fc2_group_size,
+    uintptr_t stream_ptr) {
+    const int64_t num_tokens = input.shape(0);
+    const int64_t hidden_size = input.shape(1);
+    const int64_t top_k = expert_ids.shape(1);
+    const int64_t num_experts = fc1_qdata.shape(0);
+    const int64_t intermediate_size = fc1_qdata.shape(1) / 2;
+    const int input_dtype_code = map_dtype_to_code(input.dtype());
+    if (expert_ids.shape(0) != num_tokens || router_weights.shape(0) != num_tokens ||
+        router_weights.shape(1) != top_k) {
+        throw std::runtime_error("fused INT8 ConvRot MoE route shape mismatch");
+    }
+    if (fc1_qdata.shape(1) != 2 * intermediate_size ||
+        fc1_qdata.shape(2) != hidden_size || fc1_scales.shape(0) != num_experts ||
+        fc1_scales.shape(1) != 2 * intermediate_size) {
+        throw std::runtime_error("fused INT8 ConvRot MoE gate/up bank shape mismatch");
+    }
+    if (fc2_qdata.shape(0) != num_experts || fc2_qdata.shape(1) != hidden_size ||
+        fc2_qdata.shape(2) != intermediate_size ||
+        fc2_scales.shape(0) != num_experts || fc2_scales.shape(1) != hidden_size) {
+        throw std::runtime_error("fused INT8 ConvRot MoE down bank shape mismatch");
+    }
+    if (output.shape(0) != num_tokens || output.shape(1) != hidden_size ||
+        map_dtype_to_code(output.dtype()) != input_dtype_code ||
+        (input_dtype_code != 1 && input_dtype_code != 2)) {
+        throw std::runtime_error("fused INT8 ConvRot MoE output dtype or shape mismatch");
+    }
+
+    const cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    if (!launch_cutlass_fused_moe_int8_convrot(
+            input.data(), expert_ids.data(), router_weights.data(), fc1_qdata.data(),
+            fc1_scales.data(), fc2_qdata.data(), fc2_scales.data(), output.data(),
+            num_tokens, hidden_size, intermediate_size, num_experts, top_k,
+            fc1_group_size, fc2_group_size, input_dtype_code, workspace.data(),
+            static_cast<int64_t>(workspace.size()), stream)) {
+        throw std::runtime_error(
+            "native CUTLASS fused INT8 ConvRot MoE failed at stage " +
+            std::to_string(cutlass_fused_moe_int8_convrot_last_error_stage()));
     }
 }
 
@@ -3508,6 +3583,21 @@ NB_MODULE(_C, m) {
           nb::arg("fc2_block_scales"),
           nb::arg("output"),
           nb::arg("workspace"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_fused_moe_int8_convrot", &cutlass_fused_moe_int8_convrot,
+          "Native routed INT8 ConvRot MoE with GEGLU and weighted reduction",
+          nb::arg("input"),
+          nb::arg("expert_ids"),
+          nb::arg("router_weights"),
+          nb::arg("fc1_qdata"),
+          nb::arg("fc1_scales"),
+          nb::arg("fc2_qdata"),
+          nb::arg("fc2_scales"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("fc1_group_size"),
+          nb::arg("fc2_group_size"),
           nb::arg("stream_ptr"));
 
     m.def("cutlass_fused_moe_mxfp8_scaled", &cutlass_fused_moe_mxfp8_scaled,
