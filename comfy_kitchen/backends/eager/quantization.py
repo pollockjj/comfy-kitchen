@@ -414,18 +414,6 @@ def mxfp8_weighted_embedding(
     return torch.mm(weights, dequantized, out_dtype=torch.float32)
 
 
-def int8_convrot_weighted_embedding(
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    weights: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    """Reference ConvRot INT8 dequantize-then-matmul embedding path."""
-    dequantized = dequantize_int8_convrot_weight_dtype(
-        qweight, scales.reshape(-1, 1), group_size, DTYPE_TO_CODE[torch.bfloat16])
-    return torch.mm(weights, dequantized, out_dtype=torch.float32)
-
-
 def scaled_mm_mxfp8(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -816,32 +804,6 @@ def _op_mxfp8_weighted_embedding(
 
 @_op_mxfp8_weighted_embedding.register_fake
 def _op_mxfp8_weighted_embedding_fake(qweight, block_scales, weights):
-    return torch.empty(
-        (weights.shape[0], qweight.shape[1]),
-        dtype=torch.float32,
-        device=weights.device,
-    )
-
-
-@torch.library.custom_op("comfy_kitchen::int8_convrot_weighted_embedding", mutates_args=())
-def _op_int8_convrot_weighted_embedding(
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    weights: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    kwargs = {
-        "qweight": qweight,
-        "scales": scales,
-        "weights": weights,
-        "group_size": group_size,
-    }
-    impl = registry.get_implementation("int8_convrot_weighted_embedding", kwargs=kwargs)
-    return impl(**kwargs)
-
-
-@_op_int8_convrot_weighted_embedding.register_fake
-def _op_int8_convrot_weighted_embedding_fake(qweight, scales, weights, group_size):
     return torch.empty(
         (weights.shape[0], qweight.shape[1]),
         dtype=torch.float32,

@@ -44,7 +44,6 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
-    "int8_convrot_weighted_embedding",
     "int4_linear",
     "convrot_w4a4_linear",
     "prepare_int4_weight_for_int8_linear",
@@ -1886,59 +1885,6 @@ def mxfp8_weighted_embedding(
     return output
 
 
-def int8_convrot_weighted_embedding(
-    qweight: torch.Tensor,
-    scales: torch.Tensor,
-    weights: torch.Tensor,
-    group_size: int,
-) -> torch.Tensor:
-    """Direct BF16-by-ConvRot-INT8 matrix product with FP32 accumulation."""
-    if (
-        qweight.dtype != torch.int8
-        or scales.dtype != torch.float32
-        or weights.dtype != torch.bfloat16
-        or qweight.ndim != 2
-        or weights.ndim != 2
-        or not qweight.is_contiguous()
-        or not weights.is_contiguous()
-    ):
-        raise ValueError(
-            "int8_convrot_weighted_embedding requires contiguous 2D INT8 weights, "
-            "FP32 scales, and contiguous 2D BF16 probabilities"
-        )
-    scale_arg = scales.reshape(-1).contiguous()
-    if qweight.device != scale_arg.device or qweight.device != weights.device:
-        raise ValueError("int8_convrot_weighted_embedding tensors must share one CUDA device")
-    k, n = qweight.shape
-    m = weights.shape[0]
-    if weights.shape[1] != k or scale_arg.numel() != k:
-        raise ValueError("int8_convrot_weighted_embedding reduction or scale dimensions mismatch")
-    if m == 0 or k == 0 or n == 0:
-        raise ValueError("int8_convrot_weighted_embedding requires non-empty tensors")
-    if m % 128 != 0 or k % 32 != 0 or n % 256 != 0 or group_size != 256:
-        raise ValueError(
-            "native int8_convrot_weighted_embedding requires M%128 == 0, K%32 == 0, "
-            "N%256 == 0, and group_size == 256"
-        )
-
-    output = torch.empty((m, n), dtype=torch.float32, device=weights.device)
-    partitions = (k + 65503) // 65504
-    partials = output.unsqueeze(0) if partitions == 1 else torch.empty(
-        (partitions, m, n), dtype=torch.float32, device=weights.device)
-    stream_ptr = torch.cuda.current_stream(weights.device).cuda_stream
-    _C.int8_convrot_weighted_embedding(
-        _wrap_for_dlpack(qweight),
-        _wrap_for_dlpack(scale_arg),
-        _wrap_for_dlpack(weights),
-        _wrap_for_dlpack(partials),
-        _wrap_for_dlpack(output),
-        group_size,
-        partitions,
-        stream_ptr,
-    )
-    return output
-
-
 def scaled_mm_nvfp4(
     a: torch.Tensor,
     b: torch.Tensor,
@@ -3500,22 +3446,6 @@ def _build_constraints() -> dict:
                     dtypes=frozenset({torch.bfloat16}),
                     shape_rules=(ExactDims(2),),
                 ),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(8, 0),
-        ),
-        "int8_convrot_weighted_embedding": FunctionConstraints(
-            params={
-                "qweight": ParamConstraint(
-                    dtypes=frozenset({torch.int8}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "scales": ParamConstraint(dtypes=frozenset({torch.float32})),
-                "weights": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-                "group_size": ParamConstraint(dtypes=frozenset({int})),
             },
             default_devices=cuda_devices,
             min_compute_capability=(8, 0),
