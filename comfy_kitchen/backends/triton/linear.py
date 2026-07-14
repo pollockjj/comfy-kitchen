@@ -62,6 +62,8 @@ def bf16_small_m_linear(
     weight: torch.Tensor,
 ) -> torch.Tensor:
     x_2d = x.view(-1, x.shape[-1])
+    if not x_2d.is_contiguous() or not weight.is_contiguous():
+        raise ValueError("bf16_small_m_linear requires contiguous inputs")
     out = torch.empty(
         (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
     )
