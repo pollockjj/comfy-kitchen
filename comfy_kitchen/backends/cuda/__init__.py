@@ -596,7 +596,6 @@ def softcap_categorical_stats_sample(
     exponential_noise: torch.Tensor,
     cap: float,
     inverse_temperature: float,
-    precompute_probabilities: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse strict BF16 softcapping, self-conditioning, stats, and sampling."""
     if (
@@ -634,7 +633,6 @@ def softcap_categorical_stats_sample(
         _wrap_for_dlpack(invalid),
         cap,
         inverse_temperature,
-        precompute_probabilities,
         vocab_size,
         stream_ptr,
     )

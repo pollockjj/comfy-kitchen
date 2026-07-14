@@ -7,7 +7,6 @@
 #include <cuda_runtime.h>
 
 #include <cfloat>
-#include <cmath>
 #include <cstdint>
 
 namespace comfy {
@@ -16,14 +15,7 @@ namespace {
 constexpr int kThreads = 256;
 constexpr int kWarpSize = 32;
 constexpr int kWarps = kThreads / kWarpSize;
-constexpr int kSelfConditioningThreads = 1024;
-constexpr int kSelfConditioningWarps = kSelfConditioningThreads / kWarpSize;
-constexpr int kSelfConditioningILP = 8;
 constexpr int64_t kMaxBlocks = 65535;
-
-struct alignas(16) BFloat16x8 {
-    __nv_bfloat16 values[kSelfConditioningILP];
-};
 
 struct MaxPair {
     float value;
@@ -94,97 +86,6 @@ __device__ __forceinline__ float block_reduce_sum(float value, float* warp_value
     }
     __syncthreads();
     return warp_values[0];
-}
-
-__device__ __forceinline__ float warp_reduce_max(float value) {
-    for (int offset = kWarpSize / 2; offset > 0; offset >>= 1) {
-        const float other = __shfl_down_sync(0xffffffffu, value, offset);
-        value = value < other ? other : value;
-    }
-    return value;
-}
-
-__device__ __forceinline__ float self_conditioning_block_reduce_max(
-    float value,
-    float* warp_values)
-{
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int warp = threadIdx.x / kWarpSize;
-    value = warp_reduce_max(value);
-    __syncthreads();
-    if (lane == 0) warp_values[warp] = value;
-    __syncthreads();
-
-    value = threadIdx.x < kSelfConditioningWarps ? warp_values[lane] : -FLT_MAX;
-    if (warp == 0) value = warp_reduce_max(value);
-    if (threadIdx.x == 0) warp_values[0] = value;
-    __syncthreads();
-    return warp_values[0];
-}
-
-__device__ __forceinline__ float self_conditioning_block_reduce_sum(
-    float value,
-    float* warp_values)
-{
-    const int lane = threadIdx.x & (kWarpSize - 1);
-    const int warp = threadIdx.x / kWarpSize;
-    value = warp_reduce_sum(value);
-    __syncthreads();
-    if (lane == 0) warp_values[warp] = value;
-    __syncthreads();
-
-    value = threadIdx.x < kSelfConditioningWarps ? warp_values[lane] : 0.0f;
-    if (warp == 0) value = warp_reduce_sum(value);
-    if (threadIdx.x == 0) warp_values[0] = value;
-    __syncthreads();
-    return warp_values[0];
-}
-
-__global__ void self_conditioning_softmax_bf16_kernel(
-    __nv_bfloat16* self_conditioning,
-    int64_t vocab_size)
-{
-    __nv_bfloat16* row = self_conditioning + static_cast<int64_t>(blockIdx.x) * vocab_size;
-    __shared__ float warp_values[kSelfConditioningWarps];
-    const int64_t vectorized_size = vocab_size
-        - vocab_size % (kSelfConditioningILP * kSelfConditioningThreads);
-
-    float local_max = -FLT_MAX;
-    for (int64_t packet = threadIdx.x;
-         packet * kSelfConditioningILP < vectorized_size;
-         packet += blockDim.x) {
-        const BFloat16x8 input = reinterpret_cast<const BFloat16x8*>(row)[packet];
-#pragma unroll
-        for (int i = 0; i < kSelfConditioningILP; ++i) {
-            const float value = __bfloat162float(input.values[i]);
-            local_max = local_max < value ? value : local_max;
-        }
-    }
-    for (int64_t col = vectorized_size + threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float value = __bfloat162float(row[col]);
-        local_max = local_max < value ? value : local_max;
-    }
-    const float maximum = self_conditioning_block_reduce_max(local_max, warp_values);
-
-    float exponential_sum = 0.0f;
-    for (int64_t packet = threadIdx.x;
-         packet * kSelfConditioningILP < vectorized_size;
-         packet += blockDim.x) {
-        const BFloat16x8 input = reinterpret_cast<const BFloat16x8*>(row)[packet];
-#pragma unroll
-        for (int i = 0; i < kSelfConditioningILP; ++i) {
-            exponential_sum += std::exp(__bfloat162float(input.values[i]) - maximum);
-        }
-    }
-    for (int64_t col = vectorized_size + threadIdx.x; col < vocab_size; col += blockDim.x) {
-        exponential_sum += std::exp(__bfloat162float(row[col]) - maximum);
-    }
-    exponential_sum = self_conditioning_block_reduce_sum(exponential_sum, warp_values);
-
-    for (int64_t col = threadIdx.x; col < vocab_size; col += blockDim.x) {
-        const float probability = std::exp(__bfloat162float(row[col]) - maximum) / exponential_sum;
-        row[col] = __float2bfloat16_rn(probability);
-    }
 }
 
 __global__ void softcap_scale_bf16_kernel(
@@ -308,7 +209,6 @@ extern "C" void launch_softcap_categorical_stats_sample_kernel(
     int64_t vocab_size,
     float cap,
     float inverse_temperature,
-    bool precompute_probabilities,
     cudaStream_t stream)
 {
     comfy::softcap_categorical_stats_sample_bf16_kernel<<<
@@ -324,9 +224,4 @@ extern "C" void launch_softcap_categorical_stats_sample_kernel(
         vocab_size,
         cap,
         inverse_temperature);
-    if (precompute_probabilities) {
-        comfy::self_conditioning_softmax_bf16_kernel<<<
-            static_cast<unsigned>(rows), comfy::kSelfConditioningThreads, 0, stream>>>(
-            static_cast<__nv_bfloat16*>(self_conditioning_logits), vocab_size);
-    }
 }
