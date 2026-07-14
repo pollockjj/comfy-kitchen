@@ -446,6 +446,7 @@ namespace packed_int8 {
 
 using PackedInt8Epilogue = cutlass::epilogue::thread::LinearCombination<
     int32_t, 4, int32_t, int32_t>;
+template <int Stages>
 using PackedInt8Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     int8_t,
     cutlass::layout::RowMajor,
@@ -465,10 +466,45 @@ using PackedInt8Kernel = typename cutlass::gemm::kernel::DefaultGemmGrouped<
     cutlass::gemm::GemmShape<16, 8, 32>,
     PackedInt8Epilogue,
     cutlass::gemm::threadblock::GemmBatchedIdentityThreadblockSwizzle,
-    4,
+    Stages,
     cutlass::gemm::kernel::GroupScheduleMode::kDeviceOnly,
     cutlass::arch::OpMultiplyAddSaturate>::GemmKernel;
-using PackedInt8Gemm = cutlass::gemm::device::GemmGrouped<PackedInt8Kernel>;
+template <int Stages>
+using PackedInt8Gemm = cutlass::gemm::device::GemmGrouped<PackedInt8Kernel<Stages>>;
+
+template <typename Gemm>
+bool launch_packed_grouped_int8_gemm(
+    cutlass::gemm::GemmCoord* problem_sizes,
+    int groups,
+    int8_t** activation_ptrs,
+    int8_t** weight_ptrs,
+    int32_t** accumulator_c_ptrs,
+    int32_t** accumulator_d_ptrs,
+    int64_t* lda,
+    int64_t* ldb,
+    int64_t* ldc,
+    int64_t* ldd,
+    cudaStream_t stream) {
+    constexpr int threadblock_count = 256;
+    typename Gemm::EpilogueOutputOp::Params epilogue(1, 0);
+    typename Gemm::Arguments arguments(
+        problem_sizes,
+        groups,
+        threadblock_count,
+        epilogue,
+        activation_ptrs,
+        weight_ptrs,
+        accumulator_c_ptrs,
+        accumulator_d_ptrs,
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        nullptr);
+    Gemm gemm;
+    return gemm.initialize(arguments, nullptr, stream) == cutlass::Status::kSuccess &&
+        gemm.run(stream) == cutlass::Status::kSuccess;
+}
 
 constexpr size_t kPackedWorkspaceAlignment = 16;
 
@@ -681,25 +717,15 @@ bool run_packed_grouped_int8(
         return false;
     }
 
-    constexpr int threadblock_count = 256;
-    typename PackedInt8Gemm::EpilogueOutputOp::Params epilogue(1, 0);
-    typename PackedInt8Gemm::Arguments arguments(
-        problem_sizes,
-        groups,
-        threadblock_count,
-        epilogue,
-        activation_ptrs,
-        weight_ptrs,
-        accumulator_c_ptrs,
-        accumulator_d_ptrs,
-        lda,
-        ldb,
-        ldc,
-        ldd,
-        nullptr);
-    PackedInt8Gemm gemm;
-    if (gemm.initialize(arguments, nullptr, stream) != cutlass::Status::kSuccess ||
-        gemm.run(stream) != cutlass::Status::kSuccess) {
+    const bool gate_up_shape = groups == 128 && n == 1408 && k == 2816;
+    const bool gemm_ok = gate_up_shape
+        ? launch_packed_grouped_int8_gemm<PackedInt8Gemm<3>>(
+            problem_sizes, groups, activation_ptrs, weight_ptrs,
+            accumulator_c_ptrs, accumulator_d_ptrs, lda, ldb, ldc, ldd, stream)
+        : launch_packed_grouped_int8_gemm<PackedInt8Gemm<4>>(
+            problem_sizes, groups, activation_ptrs, weight_ptrs,
+            accumulator_c_ptrs, accumulator_d_ptrs, lda, ldb, ldc, ldd, stream);
+    if (!gemm_ok) {
         return false;
     }
 
