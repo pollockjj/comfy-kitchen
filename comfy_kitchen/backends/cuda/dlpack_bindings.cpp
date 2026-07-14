@@ -2157,17 +2157,6 @@ extern "C" {
         int out_dtype_code,
         cudaStream_t stream);
 
-    bool launch_restore_weighted_reduce_int8_moe_routes(
-        const void* routed_output,
-        const int64_t* route_dest,
-        const float* route_weights,
-        void* output,
-        int64_t routes,
-        int64_t hidden_size,
-        int top_k,
-        int dtype_code,
-        cudaStream_t stream);
-
     bool launch_cutlass_int4_dequant(
         const void* A,
         const void* B,
@@ -2828,28 +2817,6 @@ size_t cutlass_grouped_int8_dequant_packed_workspace_bytes(int64_t groups, int64
         throw std::runtime_error("packed grouped INT8 workspace dimensions must be non-negative");
     }
     return cutlass_grouped_int8_dequant_packed_workspace_size(groups, rows);
-}
-
-bool restore_weighted_reduce_int8_moe_routes(
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> routed_output,
-    nb::ndarray<int64_t, nb::ndim<1>, nb::device::cuda> route_dest,
-    nb::ndarray<float, nb::ndim<1>, nb::device::cuda> route_weights,
-    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
-    int top_k,
-    uintptr_t stream_ptr) {
-    const int dtype_code = map_dtype_to_code(routed_output.dtype());
-    const int64_t routes = routed_output.shape(0);
-    const int64_t hidden_size = routed_output.shape(1);
-    if ((dtype_code != 1 && dtype_code != 2) || top_k != 8 || routes <= 0 ||
-        routes % top_k != 0 || route_dest.shape(0) != routes ||
-        route_weights.shape(0) != routes || output.shape(0) != routes / top_k ||
-        output.shape(1) != hidden_size || map_dtype_to_code(output.dtype()) != dtype_code) {
-        throw std::runtime_error("weighted INT8 MoE route reduction shape or dtype mismatch");
-    }
-    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    return launch_restore_weighted_reduce_int8_moe_routes(
-        routed_output.data(), route_dest.data(), route_weights.data(), output.data(),
-        routes, hidden_size, top_k, dtype_code, stream);
 }
 
 bool cutlass_grouped_int8_dequant_packed(
@@ -3709,16 +3676,6 @@ NB_MODULE(_C, m) {
           "Workspace bytes for packed variable-M expert INT8 GEMM",
           nb::arg("groups"),
           nb::arg("rows"));
-
-    m.def("restore_weighted_reduce_int8_moe_routes",
-          &restore_weighted_reduce_int8_moe_routes,
-          "Restore, weight, and exactly reduce INT8 MoE routes",
-          nb::arg("routed_output"),
-          nb::arg("route_dest"),
-          nb::arg("route_weights"),
-          nb::arg("output"),
-          nb::arg("top_k"),
-          nb::arg("stream_ptr"));
 
     m.def("cutlass_grouped_int8_dequant_packed", &cutlass_grouped_int8_dequant_packed,
           "Packed variable-M expert INT8 GEMM followed by output dequantization",

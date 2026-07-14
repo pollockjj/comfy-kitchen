@@ -2665,53 +2665,6 @@ def grouped_int8_convrot_linear_packed(
     return output
 
 
-def restore_weighted_reduce_int8_moe_routes(
-    routed_output: torch.Tensor,
-    route_dest: torch.Tensor,
-    route_weights: torch.Tensor,
-    top_k: int,
-) -> torch.Tensor:
-    """Restore expert-sorted rows and perform the exact top-8 weighted reduction."""
-    if (
-        routed_output.dim() != 2
-        or routed_output.dtype not in (torch.float16, torch.bfloat16)
-        or not routed_output.is_cuda
-        or not routed_output.is_contiguous()
-    ):
-        raise ValueError("routed INT8 MoE output must be a contiguous CUDA FP16/BF16 matrix")
-    top_k = int(top_k)
-    if top_k != 8:
-        raise ValueError("native INT8 MoE route reduction requires top_k=8")
-    routes, hidden_size = routed_output.shape
-    if routes == 0 or hidden_size == 0 or routes % top_k:
-        raise ValueError("routed INT8 MoE output shape is incompatible with top_k")
-    destinations = route_dest.reshape(-1)
-    weights = route_weights.reshape(-1)
-    if destinations.dtype != torch.int64 or destinations.numel() != routes:
-        raise ValueError("INT8 MoE route destinations must be one INT64 value per route")
-    if weights.dtype != torch.float32 or weights.numel() != routes:
-        raise ValueError("INT8 MoE route weights must be one FP32 value per route")
-    if destinations.device != routed_output.device or weights.device != routed_output.device:
-        raise ValueError("INT8 MoE route tensors must share one CUDA device")
-    destinations = destinations if destinations.is_contiguous() else destinations.contiguous()
-    weights = weights if weights.is_contiguous() else weights.contiguous()
-    output = torch.empty(
-        (routes // top_k, hidden_size),
-        dtype=routed_output.dtype,
-        device=routed_output.device,
-    )
-    if not _C.restore_weighted_reduce_int8_moe_routes(
-        _wrap_for_dlpack(routed_output),
-        _wrap_for_dlpack(destinations),
-        _wrap_for_dlpack(weights),
-        _wrap_for_dlpack(output),
-        top_k,
-        torch.cuda.current_stream(routed_output.device).cuda_stream,
-    ):
-        raise RuntimeError("Native weighted INT8 MoE route reduction is unavailable")
-    return output
-
-
 def adaln(x: torch.Tensor, scale: torch.Tensor, shift: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     orig_shape = x.shape
     d = x.shape[-1]
