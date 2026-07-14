@@ -989,6 +989,25 @@ __global__ void quantize_int8_rowwise_convrot64_kernel(
     }
 }
 
+template<typename InputType, bool STOCHASTIC>
+__device__ __forceinline__ int8_t quantize_convrot_float(
+    float value,
+    float scale,
+    int64_t idx,
+    uint64_t seed)
+{
+    const float scaled = quant_div_float_to_float<InputType>(value, scale);
+    float quantized;
+    if constexpr (STOCHASTIC) {
+        const InputType noise = stochastic_rng_value<InputType>(idx, seed);
+        quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
+    } else {
+        quantized = nearbyintf(scaled);
+    }
+    quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
+    return static_cast<int8_t>(quantized);
+}
+
 template<typename InputType, int BLOCK_THREADS, bool STOCHASTIC>
 __global__ void quantize_int8_rowwise_convrot_group64_kernel(
     const InputType* __restrict__ x,
@@ -1056,18 +1075,17 @@ __global__ void quantize_int8_rowwise_convrot_group64_kernel(
         scales[row] = scale;
     }
 
-    for (int col = tid; col < K; col += BLOCK_THREADS) {
+    const int K4 = K / 4;
+    for (int col4 = tid; col4 < K4; col4 += BLOCK_THREADS) {
+        const int col = col4 * 4;
         const int64_t idx = row_offset + col;
-        const float scaled = quant_div_float_to_float<InputType>(row_buf[col], scale);
-        float quantized;
-        if constexpr (STOCHASTIC) {
-            const InputType noise = stochastic_rng_value<InputType>(idx, seed);
-            quantized = floorf(stochastic_sum_to_float<InputType>(scaled, noise));
-        } else {
-            quantized = nearbyintf(scaled);
-        }
-        quantized = fminf(127.0f, fmaxf(-128.0f, quantized));
-        q[idx] = static_cast<int8_t>(quantized);
+        const char4 quantized = {
+            quantize_convrot_float<InputType, STOCHASTIC>(row_buf[col], scale, idx, seed),
+            quantize_convrot_float<InputType, STOCHASTIC>(row_buf[col + 1], scale, idx + 1, seed),
+            quantize_convrot_float<InputType, STOCHASTIC>(row_buf[col + 2], scale, idx + 2, seed),
+            quantize_convrot_float<InputType, STOCHASTIC>(row_buf[col + 3], scale, idx + 3, seed),
+        };
+        reinterpret_cast<char4*>(q + row_offset)[col4] = quantized;
     }
 }
 
