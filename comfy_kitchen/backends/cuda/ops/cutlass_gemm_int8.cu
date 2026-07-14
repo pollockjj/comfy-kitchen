@@ -649,7 +649,10 @@ bool run_packed_grouped_int8(
         return false;
     }
 
-    constexpr int threadblock_count = 256;
+    static const int threadblock_count = PackedInt8Gemm::sufficient();
+    if (threadblock_count <= 0) {
+        return false;
+    }
     typename PackedInt8Gemm::EpilogueOutputOp::Params epilogue(1, 0);
     typename PackedInt8Gemm::Arguments arguments(
         problem_sizes,
