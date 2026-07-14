@@ -70,7 +70,6 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
-    "restore_weighted_int8_moe_routes",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -1057,17 +1056,6 @@ def grouped_int8_convrot_linear_packed(
         weight_scale,
         convrot_groupsize,
         DTYPE_TO_CODE[out_dtype],
-    )
-
-
-def restore_weighted_int8_moe_routes(
-    routed_output: torch.Tensor,
-    route_dest: torch.Tensor,
-    route_weights: torch.Tensor,
-) -> torch.Tensor:
-    """Restore expert-sorted INT8 MoE rows and apply FP32 route weights."""
-    return _cuda_backend.restore_weighted_int8_moe_routes(
-        routed_output, route_dest, route_weights
     )
 
 
