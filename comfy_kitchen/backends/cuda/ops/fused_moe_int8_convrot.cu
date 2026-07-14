@@ -248,7 +248,7 @@ __global__ void weighted_route_reduction(
          linear += static_cast<int64_t>(blockDim.x) * gridDim.x) {
         const int token = static_cast<int>(linear / hidden_size);
         const int col = static_cast<int>(linear - static_cast<int64_t>(token) * hidden_size);
-        float sum = 0.0f;
+        float products[kTopKMax] = {};
         bool invalid = false;
 #pragma unroll
         for (int position = 0; position < kTopKMax; ++position) {
@@ -263,7 +263,25 @@ __global__ void weighted_route_reduction(
             }
             const float value = lowp_to_float(
                 routed_output[static_cast<size_t>(dest) * hidden_size + col]);
-            sum = fmaf(router_weights[route], value, sum);
+            products[position] = __fmul_rn(router_weights[route], value);
+        }
+        float sum = 0.0f;
+        if (top_k == kTopKMax) {
+            const float even = __fadd_rn(
+                __fadd_rn(products[0], products[4]),
+                __fadd_rn(products[2], products[6]));
+            const float odd = __fadd_rn(
+                __fadd_rn(products[1], products[5]),
+                __fadd_rn(products[3], products[7]));
+            sum = __fadd_rn(even, odd);
+        } else {
+#pragma unroll
+            for (int position = 0; position < kTopKMax; ++position) {
+                if (position >= top_k) {
+                    break;
+                }
+                sum = __fadd_rn(sum, products[position]);
+            }
         }
         output[linear] = float_to_lowp<T>(invalid ? __int_as_float(0x7fc00000) : sum);
     }
