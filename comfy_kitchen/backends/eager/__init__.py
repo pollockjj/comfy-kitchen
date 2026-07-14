@@ -1,5 +1,6 @@
 __all__ = [
     "adaln",
+    "bf16_silu_mul",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -45,6 +46,7 @@ from comfy_kitchen.constraints import (
 from comfy_kitchen.registry import registry
 
 from .adaln import adaln
+from .silu import bf16_silu_mul
 from .awq import gemv_awq_w4a16
 from .convrot_w4a4 import (
     convrot_w4a4_linear,
@@ -91,6 +93,13 @@ def _build_constraints() -> dict:
     scale_values = frozenset({torch.float32, torch.float16, torch.bfloat16, float, str})
 
     out = {
+        "bf16_silu_mul": FunctionConstraints(
+            params={
+                "gate": ParamConstraint(dtypes=standard_floats),
+                "up": ParamConstraint(dtypes=standard_floats),
+            },
+            default_devices=all_devices,
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(dtypes=standard_floats),

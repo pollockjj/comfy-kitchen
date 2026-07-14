@@ -239,6 +239,13 @@ extern "C" {
         float       eps,
         int         dtype_code,
         cudaStream_t stream);
+
+    void launch_bf16_silu_mul_kernel(
+        const void* gate,
+        const void* up,
+        void* out,
+        int64_t numel,
+        cudaStream_t stream);
 }
 
 // Nanobind wrapper for quantize_per_tensor_fp8
@@ -911,6 +918,26 @@ void adaln(
     launch_adaln_kernel(
         x.data(), scale.data(), shift.data(), out.data(),
         N, D, scale_group, shift_group, eps, dtype_code, stream);
+}
+
+void bf16_silu_mul(
+    nb::ndarray<nb::device::cuda> gate,
+    nb::ndarray<nb::device::cuda> up,
+    nb::ndarray<nb::device::cuda> out,
+    int64_t numel,
+    uintptr_t stream_ptr)
+{
+    if (map_dtype_to_code(gate.dtype()) != 2 || map_dtype_to_code(up.dtype()) != 2
+            || map_dtype_to_code(out.dtype()) != 2) {
+        throw std::runtime_error("bf16_silu_mul requires BF16 tensors");
+    }
+    if (gate.size() != up.size() || gate.size() != out.size()
+            || static_cast<int64_t>(gate.size()) != numel) {
+        throw std::runtime_error("bf16_silu_mul requires equal-size tensors");
+    }
+    launch_bf16_silu_mul_kernel(
+        gate.data(), up.data(), out.data(), numel,
+        reinterpret_cast<cudaStream_t>(stream_ptr));
 }
 
 // Python module definition
@@ -2549,6 +2576,14 @@ NB_MODULE(_C, m) {
           nb::arg("shift_group"),
           nb::arg("eps"),
           nb::arg("dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("bf16_silu_mul", &bf16_silu_mul,
+          "BF16 SiLU followed by BF16-rounded multiplication",
+          nb::arg("gate"),
+          nb::arg("up"),
+          nb::arg("out"),
+          nb::arg("numel"),
           nb::arg("stream_ptr"));
 
     // Feature availability flag (computed at module load time)

@@ -28,6 +28,7 @@ __version__ = "0.1.0"
 __all__ = [
     # Normalization
     "adaln",
+    "bf16_silu_mul",
     # Quantization / dequantization
     "quantize_per_tensor_fp8",
     "dequantize_per_tensor_fp8",
@@ -99,6 +100,11 @@ def adaln(
         Normalized and modulated tensor with the same shape as x
     """
     return torch.ops.comfy_kitchen.adaln(x, scale, shift, eps)
+
+
+def bf16_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    """Apply BF16 SiLU, round it to BF16, then multiply by a BF16 tensor."""
+    return torch.ops.comfy_kitchen.bf16_silu_mul(gate, up)
 
 
 def quantize_per_tensor_fp8(

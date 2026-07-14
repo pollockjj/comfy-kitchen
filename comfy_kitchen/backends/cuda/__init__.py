@@ -22,6 +22,7 @@ import torch
 
 __all__ = [
     "adaln",
+    "bf16_silu_mul",
     "apply_rope",
     "apply_rope1",
     "apply_rope_split_half",
@@ -166,6 +167,28 @@ _cutlass_int8_device_cache: dict[int, bool] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
+
+
+def bf16_silu_mul(gate: torch.Tensor, up: torch.Tensor) -> torch.Tensor:
+    if (
+        gate.dtype != torch.bfloat16
+        or up.dtype != torch.bfloat16
+        or gate.shape != up.shape
+        or gate.device != up.device
+        or not gate.is_contiguous()
+        or not up.is_contiguous()
+    ):
+        return torch.nn.functional.silu(gate) * up
+    out = torch.empty_like(gate)
+    stream_ptr = torch.cuda.current_stream(gate.device).cuda_stream
+    _C.bf16_silu_mul(
+        _wrap_for_dlpack(gate),
+        _wrap_for_dlpack(up),
+        _wrap_for_dlpack(out),
+        gate.numel(),
+        stream_ptr,
+    )
+    return out
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -2440,6 +2463,14 @@ def _build_constraints() -> dict:
     cuda_devices = frozenset({"cuda"})
 
     constraints = {
+        "bf16_silu_mul": FunctionConstraints(
+            params={
+                "gate": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+                "up": ParamConstraint(dtypes=frozenset({torch.bfloat16})),
+            },
+            default_devices=cuda_devices,
+            min_compute_capability=(8, 0),
+        ),
         "adaln": FunctionConstraints(
             params={
                 "x": ParamConstraint(
