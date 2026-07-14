@@ -2909,20 +2909,6 @@ def _build_constraints() -> dict:
     }
 
     if _CUBLASLT_AVAILABLE:
-        constraints["bf16_tuned_gate_up_linear"] = FunctionConstraints(
-            params={
-                "x": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
-                    shape_rules=(MinDims(2),),
-                ),
-                "weight": ParamConstraint(
-                    dtypes=frozenset({torch.bfloat16}),
-                    shape_rules=(ExactDims(2),),
-                ),
-            },
-            default_devices=cuda_devices,
-            min_compute_capability=(12, 0),
-        )
         constraints["int8_linear"] = FunctionConstraints(
             params={
                 "x": ParamConstraint(
