@@ -4,6 +4,7 @@ __all__ = [
     "apply_rope1",
     "apply_rope_split_half",
     "apply_rope_split_half1",
+    "bf16_small_m_linear",
     "dequantize_nvfp4",
     "dequantize_per_tensor_fp8",
     "quantize_mxfp8",
@@ -37,6 +38,7 @@ try:
     )
 
     from .adaln import adaln
+    from .linear import bf16_small_m_linear
     from .quantization import (
         dequantize_nvfp4,
         dequantize_per_tensor_fp8,
