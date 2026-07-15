@@ -41,6 +41,110 @@ class CMakeExtension(Extension):
         self.source_dir = os.path.abspath(source_dir) if source_dir else ""
 
 
+def _resolve_executable(value: str) -> pathlib.Path | None:
+    candidate = pathlib.Path(value).expanduser()
+    if candidate.parent != pathlib.Path("."):
+        resolved = candidate.resolve()
+        return resolved if resolved.is_file() and os.access(resolved, os.X_OK) else None
+
+    located = shutil.which(value)
+    return pathlib.Path(located).resolve() if located else None
+
+
+def _probe_cuda_host_compiler(
+    nvcc_bin: pathlib.Path,
+    compiler: pathlib.Path,
+) -> tuple[bool, str]:
+    probe_env = os.environ.copy()
+    probe_env.pop("CUDAHOSTCXX", None)
+    probe_env.pop("NVCC_CCBIN", None)
+    result = subprocess.run(
+        [
+            str(nvcc_bin),
+            "-ccbin",
+            str(compiler),
+            "-E",
+            "-x",
+            "cu",
+            os.devnull,
+            "-o",
+            os.devnull,
+        ],
+        check=False,
+        capture_output=True,
+        env=probe_env,
+        text=True,
+    )
+    diagnostic_lines = (result.stderr or result.stdout).strip().splitlines()
+    diagnostic = next(
+        (line.strip() for line in diagnostic_lines if "error:" in line.lower()),
+        diagnostic_lines[-1].strip() if diagnostic_lines else "no diagnostic",
+    )
+    return result.returncode == 0, diagnostic
+
+
+def get_cuda_host_compiler(nvcc_bin: pathlib.Path) -> pathlib.Path | None:
+    """Select an NVCC-compatible C++ compiler without changing the system toolchain."""
+    if os.name == "nt":
+        return None
+
+    explicit_variables = (
+        "COMFY_KITCHEN_CUDA_HOST_COMPILER",
+        "NVCC_CCBIN",
+        "CUDAHOSTCXX",
+        "CXX",
+    )
+    for variable in explicit_variables:
+        value = os.getenv(variable)
+        if not value:
+            continue
+        compiler = _resolve_executable(value)
+        if compiler is None:
+            raise RuntimeError(f"{variable} does not name an executable compiler: {value}")
+        accepted, diagnostic = _probe_cuda_host_compiler(nvcc_bin, compiler)
+        if not accepted:
+            raise RuntimeError(
+                f"NVCC rejected the compiler selected by {variable}: {compiler}: {diagnostic}"
+            )
+        print(f"Selected CUDA host compiler from {variable}: {compiler}")
+        return compiler
+
+    candidate_names = ["c++", "g++", *(f"g++-{major}" for major in range(30, 4, -1))]
+    candidates: list[pathlib.Path] = []
+    for name in candidate_names:
+        compiler = _resolve_executable(name)
+        if compiler is not None and compiler not in candidates:
+            candidates.append(compiler)
+
+    rejected: list[str] = []
+    for compiler in candidates:
+        accepted, diagnostic = _probe_cuda_host_compiler(nvcc_bin, compiler)
+        if accepted:
+            print(f"Selected NVCC-compatible CUDA host compiler: {compiler}")
+            for entry in rejected:
+                print(f"  Rejected CUDA host compiler: {entry}")
+            return compiler
+        rejected.append(f"{compiler}: {diagnostic}")
+
+    detail = "\n  ".join(rejected) if rejected else "no C++ compiler was found"
+    raise RuntimeError(
+        "No NVCC-compatible host C++ compiler is available. Install a compiler supported "
+        "by the active CUDA toolkit or set COMFY_KITCHEN_CUDA_HOST_COMPILER.\n  " + detail
+    )
+
+
+def _matching_c_compiler(cxx_compiler: pathlib.Path) -> pathlib.Path | None:
+    name = cxx_compiler.name
+    if name.startswith("g++"):
+        c_name = "gcc" + name.removeprefix("g++")
+    elif name.startswith("clang++"):
+        c_name = "clang" + name.removeprefix("clang++")
+    else:
+        return None
+    candidate = cxx_compiler.with_name(c_name)
+    return candidate if candidate.is_file() and os.access(candidate, os.X_OK) else None
+
+
 class CMakeBuildExt(build_ext):
     # Add custom command-line options
     user_options: ClassVar = [
@@ -138,6 +242,18 @@ class CMakeBuildExt(build_ext):
         cmake_args.append(f"-DCUDAToolkit_ROOT={cmake_path(cuda_home)}")
         cmake_args.append(f"-DCMAKE_CUDA_COMPILER={cmake_path(nvcc_bin)}")
 
+        cuda_host_compiler = get_cuda_host_compiler(nvcc_bin)
+        configure_env = os.environ.copy()
+        if cuda_host_compiler is not None:
+            matching_c_compiler = _matching_c_compiler(cuda_host_compiler)
+            cmake_args.append(f"-DCMAKE_CXX_COMPILER={cuda_host_compiler}")
+            cmake_args.append(f"-DCMAKE_CUDA_HOST_COMPILER={cuda_host_compiler}")
+            configure_env["CXX"] = str(cuda_host_compiler)
+            configure_env["CUDAHOSTCXX"] = str(cuda_host_compiler)
+            configure_env["NVCC_CCBIN"] = str(cuda_host_compiler)
+            if matching_c_compiler is not None:
+                configure_env["CC"] = str(matching_c_compiler)
+
         build_args = ["--config", config]
 
         max_jobs = int(os.environ.get("MAX_JOBS", os.cpu_count() or 1))
@@ -153,6 +269,8 @@ class CMakeBuildExt(build_ext):
         print(f"  Build directory: {build_temp}")
         print(f"  Config: {config}")
         print(f"  CUDA architectures: {cuda_archs}")
+        if cuda_host_compiler is not None:
+            print(f"  CUDA host compiler: {cuda_host_compiler}")
         print(f"  Line info: {'enabled' if enable_lineinfo else 'disabled'}")
 
         configure_cmd = ["cmake", source_dir, *cmake_args]
@@ -162,6 +280,7 @@ class CMakeBuildExt(build_ext):
                 cwd=build_temp,
                 check=True,
                 capture_output=False,
+                env=configure_env,
             )
         except subprocess.CalledProcessError as e:
             raise RuntimeError(f"CMake configuration failed for {ext.name}") from e
