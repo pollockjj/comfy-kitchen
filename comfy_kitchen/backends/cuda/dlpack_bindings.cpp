@@ -2074,6 +2074,20 @@ extern "C" {
         int bias_dtype_code,
         cudaStream_t stream);
 
+    void launch_grouped_int4_weight_int8_act_gemv_dequant_kernel(
+        const void* input,
+        const void* weight,
+        const void* x_scales,
+        const void* weight_scales,
+        const void* expert_indptr,
+        void* output,
+        int64_t rows,
+        int64_t experts,
+        int64_t num_cols,
+        int64_t K,
+        int output_dtype_code,
+        cudaStream_t stream);
+
     void launch_int4_weight_int8_act_gemm_dequant_chunked_kernel(
         const void* input,
         const void* weight,
@@ -2669,6 +2683,55 @@ void int4_weight_int8_act_gemv_dequant(
         has_bias,
         output_dtype_code,
         bias_dtype_code,
+        stream);
+}
+
+void grouped_int4_weight_int8_act_gemv_dequant(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> weight,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> x_scales,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> weight_scales,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> expert_indptr,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    int output_dtype_code,
+    uintptr_t stream_ptr) {
+
+    const int64_t rows = input.shape(0);
+    const int64_t K = input.shape(1);
+    const int64_t experts = weight.shape(0);
+    const int64_t N = weight.shape(1);
+    if (weight.shape(2) * 2 != K) {
+        throw std::runtime_error("grouped packed W4A8 weight K mismatch");
+    }
+    if (x_scales.shape(0) != rows || x_scales.shape(1) != 1) {
+        throw std::runtime_error("grouped packed W4A8 activation scale shape mismatch");
+    }
+    if (weight_scales.shape(0) != experts || weight_scales.shape(1) != N) {
+        throw std::runtime_error("grouped packed W4A8 weight scale shape mismatch");
+    }
+    if (expert_indptr.shape(0) != experts + 1) {
+        throw std::runtime_error("grouped packed W4A8 indptr shape mismatch");
+    }
+    if (output.shape(0) != rows || output.shape(1) != N) {
+        throw std::runtime_error("grouped packed W4A8 output shape mismatch");
+    }
+    if (output_dtype_code < 0 || output_dtype_code > 2) {
+        throw std::runtime_error("Invalid grouped packed W4A8 output dtype code");
+    }
+
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_grouped_int4_weight_int8_act_gemv_dequant_kernel(
+        input.data(),
+        weight.data(),
+        x_scales.data(),
+        weight_scales.data(),
+        expert_indptr.data(),
+        output.data(),
+        rows,
+        experts,
+        N,
+        K,
+        output_dtype_code,
         stream);
 }
 
@@ -3704,6 +3767,17 @@ NB_MODULE(_C, m) {
           nb::arg("x_scales"),
           nb::arg("weight_scales"),
           nb::arg("bias"),
+          nb::arg("output"),
+          nb::arg("output_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("grouped_int4_weight_int8_act_gemv_dequant", &grouped_int4_weight_int8_act_gemv_dequant,
+          "Grouped GEMV using INT8 activations and packed row-major INT4 expert weights",
+          nb::arg("input"),
+          nb::arg("weight"),
+          nb::arg("x_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("expert_indptr"),
           nb::arg("output"),
           nb::arg("output_dtype_code"),
           nb::arg("stream_ptr"));

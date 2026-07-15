@@ -1799,6 +1799,68 @@ __global__ void int4_weight_int8_act_gemv_dequant_warp_kernel(
     }
 }
 
+template<int WARPS_PER_BLOCK, typename OutputType>
+__global__ void grouped_int4_weight_int8_act_gemv_dequant_warp_kernel(
+    const int8_t* __restrict__ x,
+    const int8_t* __restrict__ weight,
+    const float* __restrict__ x_scales,
+    const float* __restrict__ weight_scales,
+    const int32_t* __restrict__ expert_indptr,
+    OutputType* __restrict__ output,
+    int rows,
+    int experts,
+    int N,
+    int K)
+{
+    __shared__ int expert;
+    const int row = static_cast<int>(blockIdx.y);
+    if (threadIdx.x == 0) {
+        int low = 0;
+        int high = experts;
+        while (low + 1 < high) {
+            const int middle = (low + high) >> 1;
+            if (expert_indptr[middle] <= row) {
+                low = middle;
+            } else {
+                high = middle;
+            }
+        }
+        expert = low;
+    }
+    __syncthreads();
+
+    const int lane = threadIdx.x & (kThreadsPerWarp - 1);
+    const int warp = threadIdx.x >> 5;
+    const int n = static_cast<int>(blockIdx.x) * WARPS_PER_BLOCK + warp;
+    if (row >= rows || n >= N) {
+        return;
+    }
+
+    const int K4 = K >> 2;
+    const int K_half = K >> 1;
+    const int* __restrict__ x4 = reinterpret_cast<const int*>(x + static_cast<int64_t>(row) * K);
+    const int8_t* __restrict__ w_row =
+        weight + (static_cast<int64_t>(expert) * N + n) * K_half;
+
+    int acc = 0;
+    for (int k4 = lane; k4 < K4; k4 += kThreadsPerWarp) {
+        const uint32_t packed01 = static_cast<uint8_t>(w_row[k4 * 2]);
+        const uint32_t packed23 = static_cast<uint8_t>(w_row[k4 * 2 + 1]);
+        acc = __dp4a(x4[k4], pack_int4_weight4_as_int8_word(packed01, packed23), acc);
+    }
+
+    #pragma unroll
+    for (int offset = kThreadsPerWarp / 2; offset > 0; offset >>= 1) {
+        acc += __shfl_down_sync(0xffffffffu, acc, offset);
+    }
+
+    if (lane == 0) {
+        const float scale = x_scales[row] * weight_scales[static_cast<int64_t>(expert) * N + n];
+        output[static_cast<int64_t>(row) * N + n] =
+            from_float<OutputType>(static_cast<float>(acc) * scale);
+    }
+}
+
 template<typename OutputType, typename BiasType>
 __global__ void dequantize_int4_weight_int8_act_chunk_kernel(
     const int32_t* __restrict__ input,
@@ -2862,6 +2924,56 @@ void launch_int4_weight_int8_act_gemv_dequant_kernel(
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("CUDA packed INT4 weight GEMV failed: ") + cudaGetErrorString(err));
+    }
+}
+
+void launch_grouped_int4_weight_int8_act_gemv_dequant_kernel(
+    const void* input,
+    const void* weight,
+    const void* x_scales,
+    const void* weight_scales,
+    const void* expert_indptr,
+    void* output,
+    int64_t rows,
+    int64_t experts,
+    int64_t num_cols,
+    int64_t K,
+    int output_dtype_code,
+    cudaStream_t stream)
+{
+    if (rows == 0 || num_cols == 0 || K == 0) return;
+    if ((K & 3) != 0) {
+        throw std::runtime_error("grouped packed W4A8 GEMV requires K divisible by 4");
+    }
+    if (rows > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        experts > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        num_cols > static_cast<int64_t>(std::numeric_limits<int>::max()) ||
+        K > static_cast<int64_t>(std::numeric_limits<int>::max())) {
+        throw std::runtime_error("grouped packed W4A8 GEMV only supports dimensions <= INT_MAX");
+    }
+
+    constexpr int kWarpsPerBlock = 8;
+    const dim3 grid(
+        static_cast<unsigned int>((num_cols + kWarpsPerBlock - 1) / kWarpsPerBlock),
+        static_cast<unsigned int>(rows));
+    DISPATCH_FP_DTYPE(output_dtype_code, OutputType, [&] {
+        grouped_int4_weight_int8_act_gemv_dequant_warp_kernel<kWarpsPerBlock, OutputType>
+            <<<grid, kWarpsPerBlock * kThreadsPerWarp, 0, stream>>>(
+                static_cast<const int8_t*>(input),
+                static_cast<const int8_t*>(weight),
+                static_cast<const float*>(x_scales),
+                static_cast<const float*>(weight_scales),
+                static_cast<const int32_t*>(expert_indptr),
+                static_cast<OutputType*>(output),
+                static_cast<int>(rows),
+                static_cast<int>(experts),
+                static_cast<int>(num_cols),
+                static_cast<int>(K));
+    });
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA grouped packed W4A8 GEMV failed: ") + cudaGetErrorString(err));
     }
 }
 

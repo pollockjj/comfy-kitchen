@@ -112,6 +112,33 @@ def test_packed_grouped_convrot_w4a4_matches_expert_rows(seed, backend):
     assert torch.equal(actual, expected)
 
 
+@pytest.mark.parametrize("backend", ["eager", "cuda"])
+def test_packed_grouped_convrot_w4a8_matches_expert_rows(seed, backend):
+    if backend == "cuda" and not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+
+    device = torch.device("cuda" if backend == "cuda" else "cpu")
+    counts = (2, 0, 3, 1)
+    x = torch.randn(sum(counts), 256, device=device, dtype=torch.bfloat16)
+    indptr = torch.tensor([0, 2, 2, 5, 6], device=device, dtype=torch.int32)
+    weights = torch.randn(4, 128, 256, device=device, dtype=torch.bfloat16)
+
+    with ck.registry.use_backend(backend):
+        quantized = [quantize_convrot_w4a4_weight(weight) for weight in weights]
+        qweight = torch.stack([item[0] for item in quantized])
+        scales = torch.stack([item[1] for item in quantized])
+        actual = ck.grouped_convrot_w4a8_linear_packed(x, indptr, qweight, scales, 256)
+        expected = torch.cat([
+            convrot_w4a4_linear(
+                x[start:end], qweight[expert], scales[expert], linear_dtype="int8"
+            )
+            for expert, (start, end) in enumerate(zip(indptr[:-1].tolist(), indptr[1:].tolist()))
+            if start != end
+        ])
+
+    assert torch.equal(actual, expected)
+
+
 @pytest.mark.parametrize(
     ("m", "k", "expected"),
     [
