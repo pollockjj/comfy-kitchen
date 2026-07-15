@@ -4243,8 +4243,6 @@ NB_MODULE(_C, m) {
     m.attr("HAS_CUTLASS") = false;
 #endif
 
-    // Add version info
-    m.attr("__version__") = "0.2.19";
     m.attr("__nanobind__") = true;
     m.attr("__stable_abi__") = true;
 }
