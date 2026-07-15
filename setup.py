@@ -69,8 +69,12 @@ def _probe_cuda_host_compiler(
         env=probe_env,
         text=True,
     )
-    diagnostic = (result.stderr or result.stdout).strip().splitlines()
-    return result.returncode == 0, diagnostic[-1] if diagnostic else "no diagnostic"
+    diagnostic_lines = (result.stderr or result.stdout).strip().splitlines()
+    diagnostic = next(
+        (line.strip() for line in diagnostic_lines if "error:" in line.lower()),
+        diagnostic_lines[-1].strip() if diagnostic_lines else "no diagnostic",
+    )
+    return result.returncode == 0, diagnostic
 
 
 def get_cuda_host_compiler(nvcc_bin: pathlib.Path) -> pathlib.Path | None:
