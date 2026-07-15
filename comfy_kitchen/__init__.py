@@ -70,6 +70,7 @@ __all__ = [
     "int8_linear",
     "grouped_int8_convrot_linear",
     "grouped_int8_convrot_linear_packed",
+    "grouped_convrot_w4a4_linear_packed",
     # Positional encoding
     "apply_rope",
     "apply_rope1",
@@ -1050,6 +1051,26 @@ def grouped_int8_convrot_linear_packed(
     zero, end at ``x.shape[0]``, and contain one interval per weight expert.
     """
     return torch.ops.comfy_kitchen.grouped_int8_convrot_linear_packed(
+        x,
+        expert_indptr,
+        weight,
+        weight_scale,
+        convrot_groupsize,
+        DTYPE_TO_CODE[out_dtype],
+    )
+
+
+def grouped_convrot_w4a4_linear_packed(
+    x: torch.Tensor,
+    expert_indptr: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    convrot_groupsize: int,
+    *,
+    out_dtype: torch.dtype = torch.bfloat16,
+) -> torch.Tensor:
+    """Grouped ConvRot W4A4 linear over packed, expert-sorted rows."""
+    return torch.ops.comfy_kitchen.grouped_convrot_w4a4_linear_packed(
         x,
         expert_indptr,
         weight,
