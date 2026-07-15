@@ -1855,9 +1855,10 @@ __global__ void grouped_int4_weight_int8_act_gemv_dequant_warp_kernel(
     }
 
     if (lane == 0) {
-        const float scale = x_scales[row] * weight_scales[static_cast<int64_t>(expert) * N + n];
         output[static_cast<int64_t>(row) * N + n] =
-            from_float<OutputType>(static_cast<float>(acc) * scale);
+            from_float<OutputType>(
+                static_cast<float>(acc) * x_scales[row] *
+                weight_scales[static_cast<int64_t>(expert) * N + n]);
     }
 }
 
