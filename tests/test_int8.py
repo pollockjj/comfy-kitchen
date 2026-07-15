@@ -14,6 +14,21 @@ from .conftest import (
     get_capable_backends,
 )
 
+COMFYUI_NVIDIA_16_SERIES = (
+    "1660",
+    "1650",
+    "1630",
+    "T500",
+    "T550",
+    "T600",
+    "MX550",
+    "MX450",
+    "CMP 30HX",
+    "T2000",
+    "T1000",
+    "T1200",
+)
+
 
 def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     """CUDA cuBLAS fallback pads Turing skinny N to 32."""
@@ -38,6 +53,55 @@ def test_cuda_int8_cublas_turing_n_alignment(monkeypatch):
     assert cuda._cublas_int8_n_alignment(tensor) == 32
     assert cuda._round_up(17, cuda._cublas_int8_n_alignment(tensor)) == 32
     assert calls == [0]
+
+
+def test_nvidia_16_series_list_matches_comfyui():
+    assert cuda._NVIDIA_16_SERIES == COMFYUI_NVIDIA_16_SERIES
+
+
+@pytest.mark.parametrize("device_name", COMFYUI_NVIDIA_16_SERIES)
+def test_turing_devices_without_tensor_cores_keep_fallback(device_name, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: f"NVIDIA {device_name}")
+
+    assert cuda._cuda_device_is_turing(0)
+    assert cuda._cuda_device_is_nvidia_16_series(0)
+    assert not cuda._cuda_device_should_use_turing_kernels(0)
+
+
+@pytest.mark.parametrize(
+    "device_name",
+    [
+        "NVIDIA GeForce RTX 2060",
+        "NVIDIA GeForce RTX 2080 Ti",
+        "NVIDIA Quadro RTX 5000",
+        "NVIDIA TITAN RTX",
+        "Tesla T4",
+    ],
+)
+def test_turing_tensor_core_devices_use_native_kernels(device_name, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: (7, 5))
+    monkeypatch.setattr(torch.cuda, "get_device_name", lambda _device_index: device_name)
+
+    assert not cuda._cuda_device_is_nvidia_16_series(0)
+    assert cuda._cuda_device_should_use_turing_kernels(0)
+
+
+@pytest.mark.parametrize(
+    "capability",
+    [(8, 0), (8, 6), (8, 9), (9, 0), (10, 0), (12, 0)],
+)
+def test_non_turing_devices_never_use_turing_kernels(capability, monkeypatch):
+    cuda._turing_device_cache.clear()
+    cuda._nvidia_16_series_device_cache.clear()
+    monkeypatch.setattr(torch.cuda, "get_device_capability", lambda _device_index: capability)
+
+    assert not cuda._cuda_device_is_turing(0)
+    assert not cuda._cuda_device_should_use_turing_kernels(0)
 
 
 def test_eager_int8_matmul_turing_n_alignment(monkeypatch):

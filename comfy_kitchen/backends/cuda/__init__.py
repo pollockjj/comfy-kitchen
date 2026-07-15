@@ -186,10 +186,25 @@ _cublas_workspaces: dict[int, torch.Tensor] = {}
 _fused_moe_workspaces: dict[tuple[int, int], torch.Tensor] = {}
 _empty_cuda_tensors: dict[tuple[str, int | None, torch.dtype], torch.Tensor] = {}
 _turing_device_cache: dict[int, bool] = {}
+_nvidia_16_series_device_cache: dict[int, bool] = {}
 _cutlass_int8_device_cache: dict[int, bool] = {}
 _FORCE_INT4_INT8_FALLBACK = os.environ.get("COMFY_KITCHEN_FORCE_INT4_INT8_FALLBACK", "0") == "1"
 _INT4_PACKED_WEIGHT_SMALL_M_MAX = 8
 _INT4_INT8_WEIGHT_CHUNK_N = max(1, int(os.environ.get("COMFY_KITCHEN_INT4_INT8_WEIGHT_CHUNK_N", "4096")))
+_NVIDIA_16_SERIES = (
+    "1660",
+    "1650",
+    "1630",
+    "T500",
+    "T550",
+    "T600",
+    "MX550",
+    "MX450",
+    "CMP 30HX",
+    "T2000",
+    "T1000",
+    "T1200",
+)
 
 
 def _cuda_device_is_turing(device_index: int) -> bool:
@@ -199,6 +214,24 @@ def _cuda_device_is_turing(device_index: int) -> bool:
     is_turing = torch.cuda.get_device_capability(device_index) == (7, 5)
     _turing_device_cache[device_index] = is_turing
     return is_turing
+
+
+def _cuda_device_is_nvidia_16_series(device_index: int) -> bool:
+    cached = _nvidia_16_series_device_cache.get(device_index)
+    if cached is not None:
+        return cached
+    is_16_series = False
+    if _cuda_device_is_turing(device_index):
+        device_name = torch.cuda.get_device_name(device_index)
+        is_16_series = any(model in device_name for model in _NVIDIA_16_SERIES)
+    _nvidia_16_series_device_cache[device_index] = is_16_series
+    return is_16_series
+
+
+def _cuda_device_should_use_turing_kernels(device_index: int) -> bool:
+    return _cuda_device_is_turing(device_index) and not _cuda_device_is_nvidia_16_series(
+        device_index
+    )
 
 
 def _prefer_turing_fused_int8(m: int, n: int, k: int) -> bool:
@@ -234,7 +267,7 @@ def _should_use_turing_int4(tensor: torch.Tensor) -> bool:
         tensor.is_cuda
         and not _FORCE_INT4_INT8_FALLBACK
         and tensor.shape[0] > _INT4_PACKED_WEIGHT_SMALL_M_MAX
-        and _cuda_device_is_turing(tensor.get_device())
+        and _cuda_device_should_use_turing_kernels(tensor.get_device())
         and hasattr(_C, "cutlass_turing_int4_dequant")
     )
 
@@ -1052,7 +1085,7 @@ def _int4_linear_via_int8_values(
 
     if (
         _prefer_turing_fused_int8(m, n, k)
-        and _cuda_device_is_turing(x_int8.get_device())
+        and _cuda_device_should_use_turing_kernels(x_int8.get_device())
         and hasattr(_C, "cutlass_turing_int8_dequant")
     ):
         turing_output = _int8_linear_turing_quantized(
@@ -2466,7 +2499,7 @@ def int8_linear(
 
     if (
         _prefer_turing_fused_int8(m, n, k)
-        and _cuda_device_is_turing(x_qdata.get_device())
+        and _cuda_device_should_use_turing_kernels(x_qdata.get_device())
         and hasattr(_C, "cutlass_turing_int8_dequant")
     ):
         turing_out = _int8_linear_turing_quantized(
