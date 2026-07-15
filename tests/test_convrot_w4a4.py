@@ -113,14 +113,17 @@ def test_packed_grouped_convrot_w4a4_matches_expert_rows(seed, backend):
 
 
 @pytest.mark.parametrize("backend", ["eager", "cuda"])
-def test_packed_grouped_convrot_w4a8_matches_expert_rows(seed, backend):
+@pytest.mark.parametrize("counts", [(2, 0, 3, 1), (16, 0, 24, 8)])
+def test_packed_grouped_convrot_w4a8_matches_expert_rows(seed, backend, counts):
     if backend == "cuda" and not torch.cuda.is_available():
         pytest.skip("CUDA required")
 
     device = torch.device("cuda" if backend == "cuda" else "cpu")
-    counts = (2, 0, 3, 1)
     x = torch.randn(sum(counts), 256, device=device, dtype=torch.bfloat16)
-    indptr = torch.tensor([0, 2, 2, 5, 6], device=device, dtype=torch.int32)
+    offsets = [0]
+    for count in counts:
+        offsets.append(offsets[-1] + count)
+    indptr = torch.tensor(offsets, device=device, dtype=torch.int32)
     weights = torch.randn(4, 128, 256, device=device, dtype=torch.bfloat16)
 
     with ck.registry.use_backend(backend):

@@ -2788,16 +2788,41 @@ def grouped_convrot_w4a8_linear_packed(
         0,
         stream_ptr,
     )
-    _C.grouped_int4_weight_int8_act_gemv_dequant(
+    if rows <= _INT4_PACKED_WEIGHT_SMALL_M_MAX:
+        _C.grouped_int4_weight_int8_act_gemv_dequant(
+            _wrap_for_dlpack(qdata),
+            _wrap_for_dlpack(weights),
+            _wrap_for_dlpack(activation_scales),
+            _wrap_for_dlpack(weight_scales),
+            _wrap_for_dlpack(indptr),
+            _wrap_for_dlpack(output),
+            DTYPE_TO_CODE[out_dtype],
+            stream_ptr,
+        )
+        return output
+
+    packed_activations = torch.empty((3, rows, k_packed), dtype=torch.int8, device=x.device)
+    accumulator = torch.empty((rows, n), dtype=torch.int32, device=x.device)
+    workspace_bytes = _C.cutlass_grouped_int4_dequant_packed_workspace_bytes(experts, rows)
+    workspace = torch.empty(max(1, workspace_bytes), dtype=torch.uint8, device=x.device)
+    _C.decompose_int8_to_packed_int4_base8(
         _wrap_for_dlpack(qdata),
+        _wrap_for_dlpack(packed_activations),
+        stream_ptr,
+    )
+    if not _C.cutlass_grouped_w4a8_dequant_packed(
+        _wrap_for_dlpack(packed_activations),
         _wrap_for_dlpack(weights),
         _wrap_for_dlpack(activation_scales),
         _wrap_for_dlpack(weight_scales),
         _wrap_for_dlpack(indptr),
+        _wrap_for_dlpack(accumulator),
         _wrap_for_dlpack(output),
+        _wrap_for_dlpack(workspace),
         DTYPE_TO_CODE[out_dtype],
         stream_ptr,
-    )
+    ):
+        raise RuntimeError("Native packed grouped W4A8 tensor-core GEMM is unavailable")
     return output
 
 

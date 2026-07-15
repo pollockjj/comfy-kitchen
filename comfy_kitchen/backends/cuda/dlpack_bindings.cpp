@@ -2058,6 +2058,13 @@ extern "C" {
         int64_t K_half,
         cudaStream_t stream);
 
+    void launch_decompose_int8_to_packed_int4_base8_kernel(
+        const void* input,
+        void* output,
+        int64_t rows,
+        int64_t K,
+        cudaStream_t stream);
+
     void launch_int4_weight_int8_act_gemv_dequant_kernel(
         const void* input,
         const void* weight,
@@ -2176,6 +2183,23 @@ extern "C" {
         int64_t rows);
 
     bool launch_cutlass_grouped_int4_dequant_packed(
+        const void* activations,
+        const void* weights,
+        const void* activation_scales,
+        const void* weight_scales,
+        const int32_t* expert_indptr,
+        void* accumulator,
+        void* output,
+        int64_t groups,
+        int64_t rows,
+        int64_t n,
+        int64_t k,
+        void* workspace,
+        size_t workspace_size,
+        int out_dtype_code,
+        cudaStream_t stream);
+
+    bool launch_cutlass_grouped_w4a8_dequant_packed(
         const void* activations,
         const void* weights,
         const void* activation_scales,
@@ -2630,6 +2654,21 @@ void unpack_int4_to_int8(
     launch_unpack_int4_to_int8_kernel(input.data(), output.data(), rows, K_half, stream);
 }
 
+void decompose_int8_to_packed_int4_base8(
+    nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> output,
+    uintptr_t stream_ptr) {
+
+    const int64_t rows = input.shape(0);
+    const int64_t K = input.shape(1);
+    if (output.shape(0) != 3 || output.shape(1) != rows || output.shape(2) * 2 != K) {
+        throw std::runtime_error("signed base-8 packed output shape mismatch");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    launch_decompose_int8_to_packed_int4_base8_kernel(
+        input.data(), output.data(), rows, K, stream);
+}
+
 void int4_weight_int8_act_gemv_dequant(
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> input,
     nb::ndarray<int8_t, nb::ndim<2>, nb::device::cuda> weight,
@@ -3006,6 +3045,66 @@ bool cutlass_grouped_int4_dequant_packed(
     }
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     return launch_cutlass_grouped_int4_dequant_packed(
+        activations.data(),
+        weights.data(),
+        activation_scales.data(),
+        weight_scales.data(),
+        expert_indptr.data(),
+        accumulator.data(),
+        output.data(),
+        groups,
+        rows,
+        n,
+        k,
+        workspace.data(),
+        workspace.size(),
+        out_dtype_code,
+        stream);
+}
+
+bool cutlass_grouped_w4a8_dequant_packed(
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> activations,
+    nb::ndarray<int8_t, nb::ndim<3>, nb::device::cuda> weights,
+    nb::ndarray<float, nb::device::cuda> activation_scales,
+    nb::ndarray<float, nb::ndim<2>, nb::device::cuda> weight_scales,
+    nb::ndarray<int32_t, nb::ndim<1>, nb::device::cuda> expert_indptr,
+    nb::ndarray<int32_t, nb::ndim<2>, nb::device::cuda> accumulator,
+    nb::ndarray<nb::ndim<2>, nb::device::cuda> output,
+    nb::ndarray<uint8_t, nb::ndim<1>, nb::device::cuda> workspace,
+    int out_dtype_code,
+    uintptr_t stream_ptr) {
+    const int64_t rows = activations.shape(1);
+    const int64_t k_packed = activations.shape(2);
+    const int64_t k = k_packed * 2;
+    const int64_t groups = weights.shape(0);
+    const int64_t n = weights.shape(1);
+    if (activations.shape(0) != 3) {
+        throw std::runtime_error("packed grouped W4A8 activations require three base-8 planes");
+    }
+    if (weights.shape(2) != k_packed) {
+        throw std::runtime_error("packed grouped W4A8 weight shape mismatch");
+    }
+    if (activation_scales.size() != static_cast<size_t>(rows)) {
+        throw std::runtime_error("packed grouped W4A8 activation scale shape mismatch");
+    }
+    if (weight_scales.shape(0) != groups || weight_scales.shape(1) != n) {
+        throw std::runtime_error("packed grouped W4A8 weight scale shape mismatch");
+    }
+    if (expert_indptr.shape(0) != groups + 1) {
+        throw std::runtime_error("packed grouped W4A8 indptr shape mismatch");
+    }
+    if (accumulator.shape(0) != rows || accumulator.shape(1) != n) {
+        throw std::runtime_error("packed grouped W4A8 accumulator shape mismatch");
+    }
+    if (output.shape(0) != rows || output.shape(1) != n) {
+        throw std::runtime_error("packed grouped W4A8 output shape mismatch");
+    }
+    if (out_dtype_code < 0 || out_dtype_code > 2 ||
+        map_dtype_to_code(output.dtype()) != out_dtype_code) {
+        throw std::runtime_error("packed grouped W4A8 output dtype mismatch");
+    }
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    return launch_cutlass_grouped_w4a8_dequant_packed(
         activations.data(),
         weights.data(),
         activation_scales.data(),
@@ -3760,6 +3859,12 @@ NB_MODULE(_C, m) {
           nb::arg("output"),
           nb::arg("stream_ptr"));
 
+    m.def("decompose_int8_to_packed_int4_base8", &decompose_int8_to_packed_int4_base8,
+          "Exactly decompose signed INT8 rows into three packed signed INT4 base-8 planes",
+          nb::arg("input"),
+          nb::arg("output"),
+          nb::arg("stream_ptr"));
+
     m.def("int4_weight_int8_act_gemv_dequant", &int4_weight_int8_act_gemv_dequant,
           "M=1 GEMV using INT8 activation and packed row-major INT4 weight with fused dequant",
           nb::arg("input"),
@@ -3857,6 +3962,19 @@ NB_MODULE(_C, m) {
 
     m.def("cutlass_grouped_int4_dequant_packed", &cutlass_grouped_int4_dequant_packed,
           "Packed variable-M expert INT4 GEMM followed by output dequantization",
+          nb::arg("activations"),
+          nb::arg("weights"),
+          nb::arg("activation_scales"),
+          nb::arg("weight_scales"),
+          nb::arg("expert_indptr"),
+          nb::arg("accumulator"),
+          nb::arg("output"),
+          nb::arg("workspace"),
+          nb::arg("out_dtype_code"),
+          nb::arg("stream_ptr"));
+
+    m.def("cutlass_grouped_w4a8_dequant_packed", &cutlass_grouped_w4a8_dequant_packed,
+          "Exact packed variable-M expert W4A8 GEMM through three signed INT4 tensor-core passes",
           nb::arg("activations"),
           nb::arg("weights"),
           nb::arg("activation_scales"),

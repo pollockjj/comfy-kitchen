@@ -1925,6 +1925,44 @@ __global__ void unpack_int4_to_int8_vec8_kernel(
     }
 }
 
+__device__ __forceinline__ int balanced_base8_digit(int value) {
+    int digit = value % 8;
+    if (digit > 3) digit -= 8;
+    if (digit < -4) digit += 8;
+    return digit;
+}
+
+__global__ void decompose_int8_to_packed_int4_base8_kernel(
+    const int8_t* __restrict__ input,
+    int8_t* __restrict__ output,
+    int64_t pairs)
+{
+    const int64_t pair = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (pair >= pairs) {
+        return;
+    }
+
+    int values[2] = {
+        static_cast<int>(input[pair * 2]),
+        static_cast<int>(input[pair * 2 + 1]),
+    };
+    int digits[3][2];
+    #pragma unroll
+    for (int item = 0; item < 2; ++item) {
+        digits[0][item] = balanced_base8_digit(values[item]);
+        const int quotient0 = (values[item] - digits[0][item]) / 8;
+        digits[1][item] = balanced_base8_digit(quotient0);
+        digits[2][item] = (quotient0 - digits[1][item]) / 8;
+    }
+    #pragma unroll
+    for (int plane = 0; plane < 3; ++plane) {
+        const uint8_t low = static_cast<uint8_t>(digits[plane][0]) & 0x0f;
+        const uint8_t high = static_cast<uint8_t>(digits[plane][1]) & 0x0f;
+        output[static_cast<int64_t>(plane) * pairs + pair] =
+            static_cast<int8_t>(low | (high << 4));
+    }
+}
+
 } // namespace
 
 extern "C" {
@@ -2851,6 +2889,31 @@ void launch_unpack_int4_to_int8_kernel(
         reinterpret_cast<const int8_t*>(input),
         reinterpret_cast<int8_t*>(output),
         total_packed);
+}
+
+void launch_decompose_int8_to_packed_int4_base8_kernel(
+    const void* input,
+    void* output,
+    int64_t rows,
+    int64_t K,
+    cudaStream_t stream)
+{
+    if (rows == 0 || K == 0) return;
+    if ((K & 1) != 0) {
+        throw std::runtime_error("signed base-8 decomposition requires even K");
+    }
+    const int64_t pairs = rows * (K / 2);
+    constexpr int threads = 256;
+    const int64_t blocks = (pairs + threads - 1) / threads;
+    decompose_int8_to_packed_int4_base8_kernel
+        <<<static_cast<unsigned int>(blocks), threads, 0, stream>>>(
+            static_cast<const int8_t*>(input),
+            static_cast<int8_t*>(output),
+            pairs);
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        throw std::runtime_error(std::string("CUDA signed base-8 decomposition failed: ") + cudaGetErrorString(err));
+    }
 }
 
 void launch_int4_weight_int8_act_gemv_dequant_kernel(
